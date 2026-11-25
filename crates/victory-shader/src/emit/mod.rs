@@ -29,7 +29,7 @@
 //!   `b<i>` / `t<i>` in [`ROOT_CBV_SPACE`], `i` the title's root parameter
 //!   index ([`HostShader::root_cbvs`], [`HostShader::root_srvs`]); the
 //!   address the title sets is the buffer's.
-//! * **Vertex fetch** (added 2026-11-23). The title's mesh and
+//! * **Vertex fetch** (added 2026-11-23). Grand Theft Auto VI's mesh and
 //!   vertex programs fetch vertices themselves with typed-format loads
 //!   (`tbuffer_load_format_*`): the format (8_8_8_8 unorm, 16_16 snorm,
 //!   2_10_10_10 unorm, 8_8_8_8 and 16_16_16_16 uint...) is in the
@@ -461,6 +461,23 @@ pub fn emit(
                 }
             }
         }
+        // Last of all, for a program every form above leaves at 64 lanes (the host would
+        // refuse it, and the title goes without the pass): the wave-wide branches after all,
+        // unless `VICTORY_WAVE_WIDE=0`. Exact, at two group barriers per such branch. In the
+        // world on an RTX 5070 that is `CS_Visibility`, `CS_Tiling_Generate_Opaque` and the
+        // two `CS_TransmissionVolumetrics_Tiled` passes, refused every frame before (walls
+        // and objects missing). Asked for first (`=1`), it ran above already.
+        let wide_last = std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0");
+        if wide_last && !wide_on {
+            let bases = [forms[1].1.as_ref().map(|f| &f.0), forms[0].1.as_ref().map(|f| &f.0), Some(p)];
+            if let Some(base) = bases.into_iter().flatten().next() {
+                let again = widen(c, native, base, why);
+                report("wave-wide branches (last)", &again);
+                if done(&again) {
+                    return again.map(|(shader, _)| shader);
+                }
+            }
+        }
     }
     // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
     // trace programs): right once the wave takes that skip together ([`widen`]; the
@@ -612,7 +629,7 @@ fn emit_program(
     // primitives) (the code divides by that); the thread count is in PSV0
     // from runtime info version 2 on.
     // shortcut: older containers fall back to the group's lane count, right
-    // when the HLSL group fills its waves (the title's do).
+    // when the HLSL group fills its waves (Grand Theft Auto VI's do).
     let mesh_stride = match &native.io {
         crate::native::StageIo::Ms(ms) => {
             let psv = c.part(FourCC::PSV0).map(|p| p.data);

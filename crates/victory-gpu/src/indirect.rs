@@ -85,7 +85,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         // Mesh dispatches: the console's are one-dimensional.
         uint3 g = src_args.Load3(src_at);
         // Ahead of its draw, a record over the most a dispatch runs is a
-        // slot the title has not filled (the title leaves all
+        // slot the title has not filled (Grand Theft Auto VI leaves all
         // ones there): empty, and not counted below either.
         if (ahead && g.x > 65535u) {
             g = uint3(0, 0, 0);
@@ -252,7 +252,26 @@ pub(crate) fn bound(
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    record_clamp(c, &list.list, &dst, budget, src, count, spec).then_some(dst)
+    let wait = wait_first(list);
+    record_clamp_as(c, &list.list, &dst, budget, src, count, spec, false, wait).then_some(dst)
+}
+
+/// Whether the clamp first waits for every earlier shader write: only when
+/// shaders may have written since the list's last such wait. The title puts
+/// a barrier between the pass that writes arguments and the indirect call
+/// that reads them (the console's command processor needs it as well), and
+/// that barrier is such a wait. The clamp waited every time, 4,600 to 6,800
+/// times a frame in the world (each a drain of the whole card between two
+/// small pieces of work): "the card about 38% busy". `VICTORY_INDIRECT_WAITS=1`
+/// waits every time, as before.
+fn wait_first(list: &HostList) -> bool {
+    static ALWAYS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let always = *ALWAYS.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WAITS").is_some_and(|v| v == "1"));
+    let wait = always || list.wrote.load(std::sync::atomic::Ordering::Relaxed);
+    if wait {
+        list.note_waited();
+    }
+    wait
 }
 
 /// [`bound`] for a window of records clamped ahead of the draws that will
@@ -272,9 +291,11 @@ pub(crate) fn bound_ahead(
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, None)?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    record_clamp_as(c, &list.list, &dst, budget, src, None, spec, true).then_some(dst)
+    let wait = wait_first(list);
+    record_clamp_as(c, &list.list, &dst, budget, src, None, spec, true, wait).then_some(dst)
 }
 
+#[cfg(test)]
 fn record_clamp(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
@@ -284,11 +305,12 @@ fn record_clamp(
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
 ) -> bool {
-    record_clamp_as(c, l, dst, budget, src, count, spec, false)
+    record_clamp_as(c, l, dst, budget, src, count, spec, false, true)
 }
 
 /// [`record_clamp`]; `ahead`: the records are a window clamped ahead of
-/// their draws ([`bound_ahead`]).
+/// their draws ([`bound_ahead`]); `wait`: earlier shader writes are waited
+/// for first ([`wait_first`]).
 #[allow(clippy::too_many_arguments)]
 fn record_clamp_as(
     c: &Clamp,
@@ -299,6 +321,7 @@ fn record_clamp_as(
     count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, records): (u32, u32, u32),
     ahead: bool,
+    wait: bool,
 ) -> bool {
     let Some(bytes) = validate_layout(
         (kind, stride, records),
@@ -353,9 +376,9 @@ fn record_clamp_as(
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
     #[cfg(feature = "diagnostics")]
-    let waits = crate::copystat::barrier_test() & 2 == 0;
+    let waits = wait && crate::copystat::barrier_test() & 2 == 0;
     #[cfg(not(feature = "diagnostics"))]
-    let waits = true;
+    let waits = wait;
     let first = [
         uav_barrier(),
         transition(
@@ -364,14 +387,15 @@ fn record_clamp_as(
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
         ),
     ];
-    let second = [
-        uav_barrier(),
-        transition(
-            dst,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-        ),
-    ];
+    // The clamp's own writes are ordered before the indirect call's reads by
+    // the scratch buffer's transition out of UNORDERED_ACCESS; a wait for
+    // every shader write there (as before) drained the card a second time.
+    // The budget buffer is only touched by the clamps' atomics.
+    let second = [transition(
+        dst,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+    )];
     let skip = usize::from(!waits);
     unsafe {
         // Earlier shader writes (the title's argument and count passes) first.
@@ -386,7 +410,7 @@ fn record_clamp_as(
             l.SetComputeRootUnorderedAccessView(4, budget);
             l.Dispatch(records.div_ceil(64), 1, 1);
         }
-        l.ResourceBarrier(&second[skip..]);
+        l.ResourceBarrier(&second);
     }
     true
 }
@@ -690,7 +714,8 @@ void main() {
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
-                warp.list.Dispatch(PIECES.div_ceil(64), 1, 1);
+                let (x, y) = crate::host::card_piece_groups(PIECES);
+                warp.list.Dispatch(x, y, 1);
             }
             warp.submit_and_wait();
             // SAFETY: as above.
@@ -1004,6 +1029,7 @@ void main() {
                 None,
                 (KIND_MESH, STRIDE, RECORDS),
                 ahead,
+                true,
             ));
             done_on(&warp.list, &dst_buf);
             // SAFETY: an open list; the scratch buffer is copied for the check.

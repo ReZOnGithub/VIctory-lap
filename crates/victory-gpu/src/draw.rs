@@ -25,7 +25,7 @@ use crate::object::This;
 use crate::pipeline::host::HostPipeline;
 
 /// A root argument as the title set it.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 enum Root {
     #[default]
     None,
@@ -137,11 +137,20 @@ struct Window {
 }
 
 /// The most records clamped in one pass ([`windows`]).
-const WINDOW_MOST: u64 = 64;
+/// 256: the title's 1,024-record walks (one mesh pipeline's per frame) took
+/// sixteen passes at 64. (Larger windows charge the list's budget for more
+/// tail records that look real, which can leave later draws empty.)
+const WINDOW_MOST: u64 = 256;
 
 /// Whether indirect draws that read record after record of one argument
-/// buffer are clamped a window at a time (`VICTORY_INDIRECT_WINDOW=1`; off
-/// by default).
+/// buffer are clamped a window at a time (on by default;
+/// `VICTORY_INDIRECT_WINDOW=0` clamps each record alone). Alone it did not
+/// pay: every draw still moved the scratch buffer out of INDIRECT_ARGUMENT
+/// and back, a barrier between every two draws; the window's draws now leave
+/// it there (`HostList::hold_window`). Alone, on an RTX
+/// 5070, it halved the clamps (6,457 to 3,080 a frame) but the frame was no
+/// faster: the calls themselves cost 10-30 us each. With it the calls that
+/// read one window record after record are issued as one ([`merge`]).
 ///
 /// The title issues its mesh draws one record per call, each from the next
 /// slot of the same argument buffer: 3,460 a frame in gameplay, and before
@@ -162,7 +171,7 @@ const WINDOW_MOST: u64 = 64;
 ///
 /// The step is the one the title is seen to take, not the stride its
 /// command signature names: it draws one record a call, for which the
-/// stride means nothing, and the title names 12 bytes (the three
+/// stride means nothing, and Grand Theft Auto VI names 12 bytes (the three
 /// words of a mesh dispatch) for records it keeps 32 bytes apart (2,173 of
 /// a frame's 3,349 mesh records in run 87's listed frame; 283 are 16
 /// apart, which ends a window). Walked by the named stride the window
@@ -179,9 +188,34 @@ const WINDOW_MOST: u64 = 64;
 /// (`crate::indirect::bound_ahead`); a tail record that looks real is
 /// charged what it asks, a few thousand of 2^27. And arguments the title's CPU side changes are seen as
 /// before, at the next submission.
+/// Whether consecutive mesh indirect calls that read consecutive records of
+/// one clamped window, with nothing recorded between them, are issued as one
+/// `ExecuteIndirect` of that many records ([`merge_asked`]). The title draws its meshlets one record a call,
+/// 6,400 calls a frame in the world, up to 1,024 a pipeline; the timing run
+/// put 112 of the card's 227 ms a frame in those calls, 10-30 us each,
+/// nearly all of it the cost of a call rather than of its work.
+///
+/// Nothing between them is the condition: every other call of the title's
+/// on the list issues the held-back calls first (`crate::list::host_list`),
+/// so the pipeline, root arguments and tables are those the first of them
+/// was prepared with, and so are the targets.
+fn merge() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| windows() && merge_asked())
+}
+
+/// `VICTORY_INDIRECT_MERGE=1` (off by default; it turns [`windows`] on).
+/// Measured 2026-11-24 in the world: no two calls merged. The title binds
+/// another descriptor table for nearly every meshlet draw (2,200 changes a
+/// frame), which one `ExecuteIndirect` cannot carry; merging needs the
+/// translated shaders to find their table by a root constant first.
+fn merge_asked() -> bool {
+    std::env::var_os("VICTORY_INDIRECT_MERGE").is_some_and(|v| v == "1")
+}
+
 fn windows() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| merge_asked() || std::env::var_os("VICTORY_INDIRECT_WINDOW").is_none_or(|v| v != "0"))
 }
 
 /// What one title list has set, and what its host list was last given.
@@ -274,7 +308,7 @@ impl State {
 }
 
 /// An experiment on the title's scissor rectangles (`VICTORY_SCISSOR_TEST=full`):
-/// they are all widened to the whole target. The title's room at
+/// they are all widened to the whole target. Grand Theft Auto VI's room at
 /// the start of the prologue lost its walls in five runs of seven, and in
 /// those runs the player's body and the world outside were cut by one
 /// rectangle around the window (run 85, frame 2046): one run with this on
@@ -446,6 +480,14 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         shadow.refresh(list, address, len);
         return Some(gpu);
     }
+    // Not aligned: staged by the card before the list if the copy is in the
+    // card's memory (`HostList::stage_constant`).
+    if shadow.carded() {
+        shadow.refresh(list, address, len);
+        if let Some(gpu) = list.stage_constant(&shadow.buffer, shadow.offset(address), len) {
+            return Some(gpu);
+        }
+    }
     let (gpu, to) = list.scratch(len)?;
     list.defer_fill(to, address as *const u8, len as usize);
     Some(gpu)
@@ -458,12 +500,17 @@ macro_rules! once {
     }};
 }
 
-fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
+/// Sets a root argument; whether it changed.
+fn set(roots: &mut Vec<Root>, slot: u32, root: Root) -> bool {
     let slot = slot as usize;
+    if roots.get(slot) == Some(&root) {
+        return false;
+    }
     if roots.len() <= slot {
         roots.resize(slot + 1, Root::None);
     }
     roots[slot] = root;
+    true
 }
 
 impl State {
@@ -492,8 +539,12 @@ impl State {
         };
     }
 
-    pub(crate) fn set_pipeline(&mut self, pipeline: This) {
+    /// Whether it changed (the same pipeline set again lets held-back
+    /// indirect calls merge on: `merge`).
+    pub(crate) fn set_pipeline(&mut self, pipeline: This) -> bool {
+        let changed = self.pipeline != pipeline as usize;
         self.pipeline = pipeline as usize;
+        changed
     }
 
     pub(crate) fn set_heaps(&mut self, heaps: &[This]) {
@@ -514,27 +565,35 @@ impl State {
         }
     }
 
-    pub(crate) fn set_table(&mut self, compute: bool, slot: u32, handle: u64) {
-        set(self.roots(compute), slot, Root::Table(handle));
+    /// The root setters say whether the argument changed.
+    pub(crate) fn set_table(&mut self, compute: bool, slot: u32, handle: u64) -> bool {
+        set(self.roots(compute), slot, Root::Table(handle))
     }
 
-    pub(crate) fn set_view(&mut self, compute: bool, slot: u32, address: u64) {
-        set(self.roots(compute), slot, Root::View(address));
+    pub(crate) fn set_view(&mut self, compute: bool, slot: u32, address: u64) -> bool {
+        set(self.roots(compute), slot, Root::View(address))
     }
 
-    pub(crate) fn set_constants(&mut self, compute: bool, slot: u32, values: &[u32], offset: u32) {
+    pub(crate) fn set_constants(&mut self, compute: bool, slot: u32, values: &[u32], offset: u32) -> bool {
         let roots = self.roots(compute);
         let s = slot as usize;
+        let mut changed = false;
         if !matches!(roots.get(s), Some(Root::Constants(_))) {
             set(roots, slot, Root::Constants(Vec::new()));
+            changed = true;
         }
         if let Root::Constants(c) = &mut roots[s] {
             let end = offset as usize + values.len();
             if c.len() < end {
                 c.resize(end, 0);
+                changed = true;
             }
-            c[offset as usize..end].copy_from_slice(values);
+            if c[offset as usize..end] != *values {
+                c[offset as usize..end].copy_from_slice(values);
+                changed = true;
+            }
         }
+        changed
     }
 
     pub(crate) fn set_vertex_buffers(&mut self, start: u32, views: &[VertexView]) {
@@ -962,6 +1021,11 @@ impl State {
         }
         for stage in &p.stages {
             let t = stage.translated();
+            // What it records may write buffers an indirect call reads next
+            // (`crate::indirect`'s clamp then waits for it).
+            if compute || t.stores {
+                list.note_writes();
+            }
             STORES.set(t.stores);
             let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
             STORES.set(true);
@@ -1936,7 +2000,7 @@ impl State {
             let targets: Vec<String> = self.targets.iter().filter_map(|&t| described(t)).collect();
             let _ = write!(text, " targets {targets:?} depth {:?} state [{}]", described(self.depth), p.state);
             // The title's scissor and viewport at this draw (the first of
-            // each): the title draws what it sees through a
+            // each): Grand Theft Auto VI draws what it sees through a
             // portal (a window, from inside a room) under the portal's
             // rectangle, and the listing did not say which draws those are.
             if let Some(r) = self.scissors.first() {
@@ -2203,6 +2267,42 @@ impl State {
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
+                        // In place, as an aligned root view is: the copy's own
+                        // bytes, brought up to date, with GPU writes to them
+                        // ordered on the card. Every table constant view was
+                        // copied into upload memory at submission, and one of
+                        // them in the world reads the 174 MB buffer that
+                        // compute passes write: each frame waited for every
+                        // submission in the air before preparing it (55 ms).
+                        // `VICTORY_CONSTANTS_IN_PLACE=1`; off by default: with it
+                        // (and the staged constants) hair stretched and objects
+                        // warped, constants read at another time than the copy's.
+                        static IN_PLACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                        let in_place = *IN_PLACE.get_or_init(|| {
+                            std::env::var_os("VICTORY_CONSTANTS_IN_PLACE").is_some_and(|v| v == "1")
+                        });
+                        let rounded = u64::from(size).next_multiple_of(256);
+                        if in_place
+                            && let Some(copy) = crate::shadow::find(address, u64::from(size).max(1))
+                            && copy.gpu(address) % 256 == 0
+                            && copy.left(address) >= rounded
+                        {
+                            copy.refresh(list, address, rounded);
+                            host.constant_at(index, copy.gpu(address), size);
+                            continue;
+                        }
+                        // Not aligned, in a copy in the card's memory: staged
+                        // by the card before the list (`HostList::stage_constant`).
+                        if let Some(copy) = crate::shadow::find(address, u64::from(size).max(1))
+                            && copy.carded()
+                            && copy.left(address) >= u64::from(size)
+                        {
+                            copy.refresh(list, address, u64::from(size));
+                            if let Some(gpu) = list.stage_constant(&copy.buffer, copy.offset(address), u64::from(size)) {
+                                host.constant_at(index, gpu, size);
+                                continue;
+                            }
+                        }
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
                             host.make_null(index);
                             continue;
@@ -2479,6 +2579,14 @@ impl State {
         const INDEXED: u32 = 1;
         const DISPATCH: u32 = 2;
         const MESH: u32 = 10;
+        // Only a mesh call can join the held-back ones ([`merge`]).
+        if kind != MESH || !merge() {
+            #[cfg(feature = "diagnostics")]
+            if list.merged().is_some() {
+                crate::host::note_flush_cause(900_000 + kind);
+            }
+            list.flush_merged();
+        }
         #[cfg(feature = "diagnostics")]
         let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
         #[cfg(not(feature = "diagnostics"))]
@@ -2488,7 +2596,7 @@ impl State {
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
         };
-        // Indirect rectangles (the title's tiled lighting, 256
+        // Indirect rectangles (Grand Theft Auto VI's tiled lighting, 256
         // indirect draws a frame, makes their corners from the vertex
         // number) are completed by the pipeline's geometry stage: the
         // arguments stay the title's, three vertices a rectangle. They
@@ -2570,6 +2678,14 @@ impl State {
         let (bounded, at) = match hit {
             Some(hit) => hit,
             None => {
+                // The clamp below is recorded: after the held-back calls.
+                #[cfg(feature = "diagnostics")]
+                if list.merged().is_some() {
+                    crate::host::note_flush_cause(900_100 + u32::from(windowed));
+                }
+                list.flush_merged();
+                // It writes the scratch buffer a held window's draws read.
+                list.release_window();
                 // A record a short step after the last window's last one
                 // (the same step as that window's, if it had one): the
                 // title walks the buffer, so the ones that step apart
@@ -2625,6 +2741,40 @@ impl State {
                 (bounded, 0)
             }
         };
+        // Joins the held-back calls: the next record of their window, by the
+        // same pipeline, with nothing recorded since ([`merge`]).
+        let mergeable = kind == MESH && merge() && windowed && max == 1 && mesh_test() == 0;
+        let step = self.window.as_ref().map(|w| w.step);
+        if mergeable && let Some(step) = step {
+            let pso = p.pso.as_raw() as usize;
+            let mut held = list.merged();
+            if let Some(m) = held.as_mut()
+                && m.pso == pso
+                && m.step == step
+                && m.scratch == bounded
+                && m.at + u64::from(m.count) * u64::from(step) == at
+            {
+                m.count += 1;
+                drop(held);
+                DRAWN.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+            #[cfg(feature = "diagnostics")]
+            if let Some(m) = held.as_ref() {
+                let why = if m.pso != pso {
+                    1
+                } else if m.step != step {
+                    2
+                } else if m.scratch != bounded {
+                    3
+                } else {
+                    4
+                };
+                crate::host::note_flush_cause(900_200 + why);
+            }
+            drop(held);
+        }
+        list.flush_merged();
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
@@ -2632,7 +2782,9 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &bounded);
+            if !list.holds_window(&bounded) {
+                crate::indirect::done(list, &bounded);
+            }
             why("prepare failed");
             return false;
         }
@@ -2640,6 +2792,23 @@ impl State {
         list.note_op(|| {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
         });
+        // Held back: later calls may join it ([`merge`]).
+        if mergeable
+            && let Some(step) = step
+            && let Some(signature) = host_signature(kind, step)
+        {
+            *list.merged() = Some(crate::host::MergedIndirect {
+                signature,
+                scratch: bounded,
+                at,
+                step,
+                count: 1,
+                pso: p.pso.as_raw() as usize,
+            });
+            list.note_merging();
+            DRAWN.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
         if kind == MESH {
             self.mesh_scissor(list, true);
         }
@@ -2658,7 +2827,13 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
-        crate::indirect::done(list, &bounded);
+        // A window's later draws read other records of the same scratch:
+        // it stays readable for them (`HostList::hold_window`).
+        if windowed && self.window.is_some() {
+            list.hold_window(&bounded);
+        } else if !list.holds_window(&bounded) {
+            crate::indirect::done(list, &bounded);
+        }
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {

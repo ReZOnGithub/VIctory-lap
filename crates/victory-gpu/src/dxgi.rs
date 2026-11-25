@@ -221,9 +221,13 @@ const _: () = assert!(size_of::<Mode>() == 32);
 
 /// The size of the display the console reports: `VICTORY_DISPLAY_MODE=WxH`
 /// if set (as a console reports the television it is plugged into: a
-/// Series X on a 1080p set lists a 1080p mode), else 3840x2160.
-/// shortcut: not yet the host display's own size by default; make it so
-/// once a title is seen to render for the mode it is given.
+/// Series X on a 1080p set lists a 1080p mode), else the largest of the
+/// console's modes (3840x2160, 2560x1440, 1920x1080, 1280x720) that fits the
+/// host's primary display ([`host_display`]).
+///
+/// It was 3840x2160 whatever the display: on a 1920x1080 monitor the title
+/// rendered every full-screen pass at four times the pixels shown, and with
+/// the card the limit (87% busy in the world) that is the card's time.
 fn display_size() -> (u32, u32) {
     static SIZE: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
     *SIZE.get_or_init(|| {
@@ -233,14 +237,34 @@ fn display_size() -> (u32, u32) {
         });
         let size = match asked {
             Some((w, h)) if (640..=7680).contains(&w) && (360..=4320).contains(&h) => (w, h),
-            _ => (3840, 2160),
+            _ => {
+                let (dw, dh) = host_display().unwrap_or((3840, 2160));
+                [(3840, 2160), (2560, 1440), (1920, 1080), (1280, 720)]
+                    .into_iter()
+                    .find(|&(w, h)| w <= dw && h <= dh)
+                    .unwrap_or((1280, 720))
+            }
         };
         tracing::info!(width = size.0, height = size.1, "display mode reported to the title");
         size
     })
 }
 
-/// The console's mode list: one 4K mode at 60 Hz (the title looks
+/// The host's primary display mode in pixels (not scaled by DPI).
+fn host_display() -> Option<(u32, u32)> {
+    use windows::Win32::Graphics::Gdi::{DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW};
+    let mut mode = DEVMODEW {
+        dmSize: size_of::<DEVMODEW>() as u16,
+        ..Default::default()
+    };
+    // SAFETY: a mode structure of its own size; the primary display.
+    unsafe { EnumDisplaySettingsW(None, ENUM_CURRENT_SETTINGS, &mut mode) }
+        .as_bool()
+        .then_some((mode.dmPelsWidth, mode.dmPelsHeight))
+        .filter(|&(w, h)| w >= 640 && h >= 360)
+}
+
+/// The console's mode list: one 4K mode at 60 Hz (Grand Theft Auto VI looks
 /// for a 120 Hz one to allow 120 Hz frame intervals).
 /// shortcut: fixed mode, not the host display's; report the host's rates if
 /// a title paces by them.

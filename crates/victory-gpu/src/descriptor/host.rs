@@ -76,7 +76,7 @@ pub(crate) struct HostHeap {
     /// the last [`TABLED_FRAMES`] frames is due only [`TABLED_GRACE`]
     /// frames later, by when its draw has read it. A title that builds a
     /// table per draw writes thousands of texture views a frame into slots
-    /// only tables read (the title: some 2,500 a frame in its
+    /// only tables read (Grand Theft Auto VI: some 2,500 a frame in its
     /// opening cutscene, a few hundred textures over and over), and every
     /// one of them stood in the queue of textures picked by index, ahead
     /// of or behind the ones shaders do pick by index.
@@ -252,7 +252,7 @@ const TABLED_FRAMES: u64 = 240;
 /// Frames a write of a table's slot waits in the queue for the draw that
 /// reads it, before the slot is taken for one shaders pick by index.
 /// Frames as `crate::frame::current` counts them: in its opening cutscene
-/// The title begins two or three of them per frame it presents
+/// Grand Theft Auto VI begins two or three of them per frame it presents
 /// (435 begun in the 353 s of run 52's, for some 140 presented).
 const TABLED_GRACE: u64 = 8;
 
@@ -532,52 +532,34 @@ pub(crate) fn near_heaps(va: u64) -> String {
 /// tiers 1 and 2; tier 3 hardware may take more.
 const PORTABLE_VIEWS: u32 = 1_000_000;
 
-/// The size of every host view heap on a host that takes more than
-/// [`PORTABLE_VIEWS`] (AMD): the title's heap (a little over 1,000,000
-/// views in the retail game) plus [`DYNAMIC`] fits with room to spare, and
-/// the last slot is the null slot every view index at or past it reads.
-const UNCAPPED_VIEWS: u32 = 1 << 21;
-
-/// Picks, once, the null slot at the end of every host view heap and tells
-/// the translator now (`set_view_heap_limit`) instead of when the title's
-/// heap is made: a shader keeps the limit it was translated with, and the
-/// title makes 25 pipelines (their shaders translated at once) before it
-/// makes its view heap. Called before a shader is translated and before a
-/// view heap is made.
-///
-/// Every host clamps. A host that caps view heaps at [`PORTABLE_VIEWS`]
-/// (NVIDIA) hung on a view index past the heap; one that does not (AMD
-/// RDNA3, RX 7900 XT) took a page fault and removed the device on entering
-/// the world: a compute program read view slot 16,777,088 (0xffff80) of a
-/// heap of 1,507,328, past its end. Unclamped, that index is undefined on
-/// any host.
+/// Asks the host, once, whether it caps view heaps at [`PORTABLE_VIEWS`],
+/// and if so tells the translator now (`set_view_heap_limit`) instead of
+/// when the title's heap is made: a shader keeps the limit it was
+/// translated with, and Grand Theft Auto VI makes 25 pipelines (their
+/// shaders translated at once) before it makes its view heap. Those would
+/// read a view index past the heap unclamped, the read that hangs NVIDIA.
+/// Called before a shader is translated.
+/// shortcut: the limit is the capped heap's last slot whatever size the
+/// title's heap turns out to have; a heap that fits is not capped and
+/// keeps no null slot there (an index past it is as undefined as before).
 pub(crate) fn probe_view_limit() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let Some(host) = host() else { return };
-        let fits = |count: u32| {
-            // SAFETY: plain heap creation; the heap is released at once.
-            let made: windows::core::Result<ID3D12DescriptorHeap> = unsafe {
-                host.device
-                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                        NumDescriptors: count,
-                        Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-                        NodeMask: 0,
-                    })
-            };
-            made.is_ok()
+        // SAFETY: plain heap creation; the heap is released at once.
+        let made: windows::core::Result<ID3D12DescriptorHeap> = unsafe {
+            host.device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: PORTABLE_VIEWS + 1,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
         };
-        let views = if fits(UNCAPPED_VIEWS) {
-            UNCAPPED_VIEWS
-        } else {
-            PORTABLE_VIEWS
-        };
-        tracing::info!(
-            views,
-            "host view heaps hold {views} views; view indices are clamped to the null slot at the end from the first shader on"
-        );
-        victory_shader::emit::set_view_heap_limit(views - 1);
+        if made.is_err() {
+            tracing::info!("the host caps view heaps at {PORTABLE_VIEWS}: view indices are clamped from the first shader on");
+            victory_shader::emit::set_view_heap_limit(PORTABLE_VIEWS - 1);
+        }
     });
 }
 

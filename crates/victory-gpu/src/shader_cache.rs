@@ -1,7 +1,9 @@
 //! Translated shaders kept on disk (decision 0003): under the configured
-//! cache folder, keyed by the container's content and by the VIctory build
-//! that translated it (the BLAKE3 of our executable), so a rebuilt
-//! translator never serves an old translation. Entries go through
+//! cache folder, keyed by the container's content and by the translator
+//! that made it (a fingerprint of `victory-shader`'s sources and the lock
+//! file, and of this file's entry encoding), so a changed translator never
+//! serves an old translation, and a rebuild for a change elsewhere keeps
+//! them all. Entries go through
 //! `victory-pipeline`'s content-addressed cache, which writes them
 //! atomically; an entry that does not read back is translated again.
 //!
@@ -37,13 +39,16 @@ pub(crate) fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
 }
 
-/// What identifies this build: the BLAKE3 of our executable file and of
-/// the translation settings it runs with (the loop limit, which a
+/// What identifies this translator: its source fingerprint and the
+/// translation settings it runs with (the loop limit, which a
 /// diagnostics build can change at run time).
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
-        let exe = std::env::current_exe().and_then(std::fs::read);
+        // The translator's own sources, not the whole executable: a rebuild
+        // for a change elsewhere (this crate's other files, the front end)
+        // kept throwing away every cached translation, and with them some
+        // ten minutes of the first run's work.
         let limit = victory_shader::emit::loop_limit();
         if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
             tracing::warn!(
@@ -51,6 +56,12 @@ fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
+        let exe: Result<Vec<u8>, std::io::Error> = Ok({
+            let mut bytes = victory_shader::SOURCE_HASH.as_bytes().to_vec();
+            // The entry's own encoding (`encode`, `decode`) is in this file.
+            bytes.extend_from_slice(include_bytes!("shader_cache.rs"));
+            bytes
+        });
         match exe {
             Ok(mut bytes) => {
                 bytes.extend_from_slice(&limit.to_le_bytes());

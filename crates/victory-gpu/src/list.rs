@@ -32,7 +32,7 @@ const ALLOCATOR_IIDS: [Iid; 4] = [
 
 /// The list interfaces up to `ID3D12GraphicsCommandList6` (the table has
 /// all their slots): those whose ids are the same as on PC, the console's
-/// own List5 and List6 (the title asks for List6), then the
+/// own List5 and List6 (Grand Theft Auto VI asks for List6), then the
 /// device child's.
 const LIST_IIDS: [Iid; 10] = [
     guid(
@@ -106,7 +106,7 @@ struct List {
     graphics_root_headers: [u32; 128],
     compute_root_headers: [u32; 128],
     pipeline_shadow: [u32; 8],
-    /// Newer titles' lists are larger: the title's state flush
+    /// Newer titles' lists are larger: Grand Theft Auto VI's state flush
     /// (title+0x32786) copies a pipeline's 32 bytes to +0x544..+0x564 and
     /// tests +0x548, so its layout runs past 0x560. Its size is unknown;
     /// this keeps our fields clear of whatever the title writes there.
@@ -142,8 +142,26 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 /// Runs `f` with the host list and draw state of a title list, if there
 /// is a host GPU.
 #[cfg(windows)]
+#[track_caller]
 fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
     let Some(list) = host_list(this) else { return };
+    with_list_state(this, list, f);
+}
+
+/// [`with_state`] without issuing the held-back indirect calls first: for
+/// the indirect call, which may add to them.
+#[cfg(windows)]
+fn with_state_merging(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
+    let Some(list) = host_list_merging(this) else { return };
+    with_list_state(this, list, f);
+}
+
+#[cfg(windows)]
+fn with_list_state(
+    this: This,
+    list: &crate::host::HostList,
+    f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State),
+) {
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     // SAFETY: the title passes one of our lists.
@@ -172,7 +190,21 @@ pub(crate) fn tables_done(lists: &[This]) {
 
 /// The host list behind a title list, if there is a host GPU.
 #[cfg(windows)]
+#[track_caller]
 pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
+    let list = host_list_merging(this)?;
+    // Whatever is recorded next comes after the held-back indirect calls.
+    #[cfg(feature = "diagnostics")]
+    if list.merged().is_some() {
+        crate::host::note_flush_cause(std::panic::Location::caller().line());
+    }
+    list.flush_merged();
+    Some(list)
+}
+
+/// [`host_list`], leaving held-back indirect calls held back.
+#[cfg(windows)]
+fn host_list_merging<'a>(this: This) -> Option<&'a crate::host::HostList> {
     if this.is_null() {
         return None;
     }
@@ -750,9 +782,10 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
             .collect();
         // Buffers have host copies, not resources the barrier can name:
         // a barrier on one waits for every shader write before it.
-        if barriers.iter().any(|b| {
+        let waits_all = barriers.iter().any(|b| {
             b.kind != 1 && !b.first.is_null() && crate::resource::buffer_bytes(b.first).is_some()
-        }) {
+        });
+        if waits_all {
             host.push(UAV_BARRIER);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::WaitsForBuffers, 1);
@@ -770,6 +803,9 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
             };
             // SAFETY: an open list and live resources.
             unsafe { list.list.ResourceBarrier(host) };
+            if waits_all {
+                list.note_waited();
+            }
         }
     }
     0
@@ -819,10 +855,66 @@ extern "system" fn copy_buffer_region(
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
     {
-        list.defer_copy(to, from, len as usize);
+        if !gpu_copy(list, to as u64, from as u64, len) {
+            list.defer_copy(to, from, len as usize);
+        }
     }
     #[cfg(not(windows))]
     let _ = (this, dst, dst_offset, src, src_offset, len);
+}
+
+/// A title buffer copy between two buffers whose host copies are in the
+/// card's memory, done by the card in the list's order, as on the console
+/// (`VICTORY_GPU_COPIES=1`; off by default: the copy is fenced by UAV barriers
+/// only, which do not order a copy's writes before later shader reads, and
+/// objects were drawn out of place). The
+/// destination is declared written, as a shader's write is: what the copy
+/// put there goes back into title memory when the list has run.
+///
+/// Done on the CPU at submission, a copy reading memory that submissions
+/// still on the card may write made the CPU wait for all of them before
+/// preparing the next (`crate::host::late`): with the card busy, up to
+/// 160 ms a frame in the world.
+#[cfg(windows)]
+fn gpu_copy(list: &crate::host::HostList, to: u64, from: u64, len: u64) -> bool {
+    use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_GPU_COPIES").is_some_and(|v| v == "1")) || len == 0 {
+        return false;
+    }
+    if !crate::host::late() {
+        return false;
+    }
+    let (Some(d), Some(s)) = (crate::shadow::find(to, len), crate::shadow::find(from, len)) else {
+        return false;
+    };
+    // Copies in the card's memory only: with copies in PC memory too (the
+    // title's small read-back buffers among them) the title faulted in its
+    // menus, reading what the copy-back had not put there yet.
+    if !d.carded() || !s.carded() || d.left(to) < len || s.left(from) < len {
+        return false;
+    }
+    // One buffer: the host copies a region only if source and destination
+    // do not overlap.
+    if std::sync::Arc::ptr_eq(&d, &s) && to < from + len && from < to + len {
+        return false;
+    }
+    s.refresh(list, from, len);
+    d.refresh(list, to, len);
+    d.gpu_writes(list, to, len);
+    // SAFETY: the same layout; no resource named (every shader write).
+    let wait = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
+    // SAFETY: an open list; both host copies live (the refreshes and the
+    // declared write hold them until the list is reset); regions inside
+    // them, not overlapping.
+    unsafe {
+        list.list.ResourceBarrier(&[wait.clone()]);
+        list.list.CopyBufferRegion(&d.buffer, d.offset(to), &s.buffer, s.offset(from), len);
+        list.list.ResourceBarrier(&[wait]);
+    }
+    // An indirect call may read what it wrote.
+    list.note_writes();
+    true
 }
 
 /// Whether one of two resources is a target in a stand-in format and the
@@ -921,8 +1013,8 @@ extern "system" fn copy_texture_region(
         let Some(to) = crate::resource::host_resource(dst.resource) else {
             // Texture to buffer: a read back. The list copies the texels
             // into a host buffer of ours; once it has run they go to the
-            // title's buffer (`HostList::defer_read_back`).
-            // The title reads two tiny float targets back every frame (5x1
+            // title's buffer (`HostList::defer_read_back`). Grand Theft
+            // Auto VI reads two tiny float targets back every frame (5x1
             // and 1x1 RGBA32F, 80 and 16 bytes: run 90), and read a buffer
             // nobody wrote. `VICTORY_READ_BACK=0` leaves them unmade, as
             // before.
@@ -1387,7 +1479,12 @@ static ALLOCATOR_FUNCTIONS: Table<24> = {
 extern "system" fn set_pipeline(this: This, pipeline: This) {
     crate::pipeline::bound(pipeline);
     #[cfg(windows)]
-    with_state(this, |_, state| state.set_pipeline(pipeline));
+    // Recorded nothing: held-back indirect calls go on unless it changed.
+    with_state_merging(this, |list, state| {
+        if state.set_pipeline(pipeline) {
+            list.flush_merged();
+        }
+    });
     #[cfg(not(windows))]
     let _ = this;
 }
@@ -1406,7 +1503,7 @@ extern "system" fn reset_x(this: This, allocator: This, pipeline: This, _flags: 
 
 /// Newer lists' 0x4a0 `(size, alignment) -> pointer`: memory the list
 /// owns until it is reset, which the CPU writes and the GPU reads at the
-/// same address; null on failure. The title's BVH builder puts
+/// same address; null on failure. Grand Theft Auto VI's BVH builder puts
 /// its instance descriptions there (and wrote through our old
 /// `E_NOTIMPL` as a pointer).
 extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mut u8 {
@@ -1481,14 +1578,25 @@ mod state {
     pub(super) extern "system" fn heaps(this: This, count: u32, heaps: *const This) {
         with_state(this, |_, s| s.set_heaps(items(heaps, count)));
     }
+    // The root setters record nothing: compute ones leave held-back mesh
+    // indirect calls held back, graphics ones issue them if they change
+    // an argument (`crate::draw::State::execute_indirect`'s merging).
     pub(super) extern "system" fn compute_table(this: This, slot: u32, handle: u64) {
-        with_state(this, |_, s| s.set_table(true, slot, handle));
+        super::with_state_merging(this, |_, s| {
+            s.set_table(true, slot, handle);
+        });
     }
     pub(super) extern "system" fn graphics_table(this: This, slot: u32, handle: u64) {
-        with_state(this, |_, s| s.set_table(false, slot, handle));
+        super::with_state_merging(this, |list, s| {
+            if s.set_table(false, slot, handle) {
+                list.flush_merged();
+            }
+        });
     }
     pub(super) extern "system" fn compute_constant(this: This, slot: u32, value: u32, offset: u32) {
-        with_state(this, |_, s| s.set_constants(true, slot, &[value], offset));
+        super::with_state_merging(this, |_, s| {
+            s.set_constants(true, slot, &[value], offset);
+        });
     }
     pub(super) extern "system" fn graphics_constant(
         this: This,
@@ -1496,7 +1604,11 @@ mod state {
         value: u32,
         offset: u32,
     ) {
-        with_state(this, |_, s| s.set_constants(false, slot, &[value], offset));
+        super::with_state_merging(this, |list, s| {
+            if s.set_constants(false, slot, &[value], offset) {
+                list.flush_merged();
+            }
+        });
     }
     pub(super) extern "system" fn compute_constants(
         this: This,
@@ -1505,8 +1617,8 @@ mod state {
         values: *const u32,
         offset: u32,
     ) {
-        with_state(this, |_, s| {
-            s.set_constants(true, slot, items(values, count), offset)
+        super::with_state_merging(this, |_, s| {
+            s.set_constants(true, slot, items(values, count), offset);
         });
     }
     pub(super) extern "system" fn graphics_constants(
@@ -1516,16 +1628,24 @@ mod state {
         values: *const u32,
         offset: u32,
     ) {
-        with_state(this, |_, s| {
-            s.set_constants(false, slot, items(values, count), offset)
+        super::with_state_merging(this, |list, s| {
+            if s.set_constants(false, slot, items(values, count), offset) {
+                list.flush_merged();
+            }
         });
     }
     /// Root constant buffer, shader resource and unordered access views.
     pub(super) extern "system" fn compute_view(this: This, slot: u32, address: u64) {
-        with_state(this, |_, s| s.set_view(true, slot, address));
+        super::with_state_merging(this, |_, s| {
+            s.set_view(true, slot, address);
+        });
     }
     pub(super) extern "system" fn graphics_view(this: This, slot: u32, address: u64) {
-        with_state(this, |_, s| s.set_view(false, slot, address));
+        super::with_state_merging(this, |list, s| {
+            if s.set_view(false, slot, address) {
+                list.flush_merged();
+            }
+        });
     }
     pub(super) extern "system" fn index_buffer(this: This, view: *const IndexView) {
         // SAFETY: the title passes a view or null.
@@ -1665,7 +1785,7 @@ extern "system" fn draw(_: This) {
 }
 
 /// `ExecuteIndirect(signature, max count, arguments, offset, count buffer,
-/// offset)`. The title's signatures (title+0x2479466, 2026-11-24)
+/// offset)`. Grand Theft Auto VI's signatures (title+0x2479466, 2026-11-24)
 /// hold one argument each: draw (stride 16), indexed draw (20), dispatch
 /// (12), mesh dispatch (12), and the console's single-pass dispatch, type
 /// 105 (stride 12: the three group counts; its flags live in the
@@ -1696,7 +1816,7 @@ extern "system" fn execute_indirect(
         const DISPATCH: u32 = 2;
         const DISPATCH_SINGLE: u32 = 105;
         let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
-        with_state(this, |list, s| {
+        with_state_merging(this, |list, s| {
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
         });
     } else {
@@ -1771,7 +1891,7 @@ impl ValueWait {
     /// end of the region: the title keeps these values in a 1.1 GB
     /// allocation (0xd00000000), where one question took about 8 ms, and a
     /// queue asks at every submission and every signal, for each queue that
-    /// stands at a wait (the title has five queues). That was
+    /// stands at a wait (Grand Theft Auto VI has five queues). That was
     /// 1.0-2.2 s of every cutscene frame on the thread that submits (runs
     /// 36-49: "between its submissions ... kernel"; 47 of 110 looks at
     /// that thread in run 49 found it in this question).
@@ -1840,7 +1960,7 @@ static VALUE_WAITS: std::sync::Mutex<Vec<(usize, ValueWait)>> = std::sync::Mutex
 
 /// The waits of the submitted `lists` that are not met yet (taken from
 /// them): what the console's GPU would stop at. The title orders work
-/// between its queues this way (the title: the compute queue's
+/// between its queues this way (Grand Theft Auto VI: the compute queue's
 /// lighting passes wait for a value the graphics queue's depth pass writes
 /// at the bottom of the pipe; run at once, they read a cleared depth
 /// buffer and nothing was lit).
@@ -1947,6 +2067,7 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
         let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
         // SAFETY: an open list.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
+        list.note_waited();
     }
     #[cfg(not(windows))]
     let _ = (this, count);
@@ -1978,7 +2099,7 @@ extern "system" fn write64(this: This, address: u64, value: u64, _flush: u32, fl
 /// the host list is cut right behind it, so that the value is stored when
 /// the card has run the list up to there, as on the console, and not when
 /// the whole list has run. Lists of other queues wait for these values
-/// (the title: the compute list that builds the depth pyramid
+/// (Grand Theft Auto VI: the compute list that builds the depth pyramid
 /// waits for one, and the meshlet culling of the same frame reads that
 /// pyramid). Off by default: every such write then ends a host list, and
 /// each part is a submission of its own.
@@ -2119,7 +2240,7 @@ const MORE_METHODS: [(usize, *const ()); 9] = [
 /// base list, after the clears (0x198/0x1a0 as before) and before
 /// ExecuteIndirect, which moved from 0x1d8 to 0x1e8: every slot from 0x1d8
 /// on is two later (taken here as starting exactly at 0x1d8). Inferred from
-/// The title's call shapes: ExecuteIndirect 0x1e8, bottom-of-pipe
+/// Grand Theft Auto VI's call shapes: ExecuteIndirect 0x1e8, bottom-of-pipe
 /// writes 0x238/0x240, waits 0x248/0x250, depth bounds 0x230, shading rate
 /// 0x3f0/0x400, syncs 0x418/0x420, ResetX 0x458 (asserts on failure).
 const fn newer_slot(slot: usize) -> usize {
@@ -2129,7 +2250,7 @@ const fn newer_slot(slot: usize) -> usize {
 /// Methods only newer titles' lists have. 0x490: the enhanced barrier
 /// `(group count, groups)`, with 16-byte groups `(type, count, barriers)`
 /// and 40-byte buffer barriers (title+0x95e0 builds them). 0x470 `(u64)`,
-/// called from the title's state flush with its result unused.
+/// called from Grand Theft Auto VI's state flush with its result unused.
 /// shortcut: 0x470's purpose is unknown; ignored until a title shows it
 /// matters.
 const NEWER_METHODS: [(usize, *const ()); 3] = [
@@ -2186,7 +2307,7 @@ mod tests {
             (at(0x18), at(0x28), at(0x30))
         };
         assert!(put >= draw_limit && put >= api_limit);
-        // The console's ID3D12GraphicsCommandList6, as the title asks.
+        // The console's ID3D12GraphicsCommandList6, as Grand Theft Auto VI asks.
         let mut same = null;
         assert_eq!(list_query(list, &LIST_IIDS[7], &mut same), S_OK);
         assert_eq!(same, list);

@@ -92,6 +92,37 @@ impl Default for GraphicsState {
 }
 
 impl GraphicsState {
+    /// The blend description as the host takes it: blending off on render
+    /// targets of integer formats, where the host refuses it and the
+    /// console's blender ignores it (it passes integer outputs through).
+    /// Refused, the whole pipeline was missing: in the world a mesh pass
+    /// with an `R8_UINT` target at slot 2 (debug layer: "This format does
+    /// not support blending").
+    pub(crate) fn host_blend(&self) -> D3D12_BLEND_DESC {
+        // DXGI's integer render target formats (UINT and SINT).
+        const INTEGER: [i32; 21] = [3, 4, 7, 8, 12, 14, 17, 18, 25, 30, 32, 36, 38, 42, 43, 50, 52, 57, 59, 62, 64];
+        let mut blend = self.blend;
+        let count = (self.targets.NumRenderTargets as usize).min(8);
+        let integer = |i: usize| INTEGER.contains(&self.targets.RTFormats[i].0);
+        let enabled = |b: &D3D12_BLEND_DESC, i: usize| {
+            let t = if b.IndependentBlendEnable.as_bool() { &b.RenderTarget[i] } else { &b.RenderTarget[0] };
+            t.BlendEnable.as_bool() || t.LogicOpEnable.as_bool()
+        };
+        if !(0..count).any(|i| integer(i) && enabled(&blend, i)) {
+            return blend;
+        }
+        if !blend.IndependentBlendEnable.as_bool() {
+            let first = blend.RenderTarget[0];
+            blend.RenderTarget = [first; 8];
+            blend.IndependentBlendEnable = true.into();
+        }
+        for i in (0..count).filter(|&i| integer(i)) {
+            blend.RenderTarget[i].BlendEnable = false.into();
+            blend.RenderTarget[i].LogicOpEnable = false.into();
+        }
+        blend
+    }
+
     /// Takes in one subobject of a stream: its type, then its data at +4
     /// (+8 for those holding pointers).
     ///
@@ -505,7 +536,53 @@ impl HostPipeline {
         let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
             Ok(root) => root,
             Err(e) => {
-                tracing::warn!(error = %e, ?shaders, "host root signature refused");
+                // A root signature is 64 dwords at most: a constants
+                // parameter costs its size, a descriptor two, a table one.
+                let (mut dwords, mut constants, mut descriptors, mut tables) = (0u32, 0, 0, 0);
+                for p in &params {
+                    // SAFETY: each parameter's union member is the one its
+                    // type names.
+                    dwords += unsafe {
+                        match p.ParameterType {
+                            D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS => {
+                                constants += 1;
+                                p.Anonymous.Constants.Num32BitValues
+                            }
+                            D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE => {
+                                tables += 1;
+                                1
+                            }
+                            _ => {
+                                descriptors += 1;
+                                2
+                            }
+                        }
+                    };
+                }
+                tracing::warn!(
+                    error = %e,
+                    ?shaders,
+                    dwords,
+                    over_budget = dwords > 64,
+                    constants,
+                    descriptors,
+                    tables,
+                    samplers = samplers.len(),
+                    "host root signature refused"
+                );
+                for s in &samplers {
+                    tracing::warn!(
+                        filter = s.Filter.0,
+                        address = ?[s.AddressU.0, s.AddressV.0, s.AddressW.0],
+                        bias = s.MipLODBias,
+                        aniso = s.MaxAnisotropy,
+                        comparison = s.ComparisonFunc.0,
+                        border = s.BorderColor.0,
+                        lod = ?[s.MinLOD, s.MaxLOD],
+                        "refused root signature's static sampler"
+                    );
+                }
+                host.log_messages();
                 return None;
             }
         };
@@ -634,7 +711,7 @@ impl HostPipeline {
                     BytecodeLength: gs.len(),
                 }
             }),
-            BlendState: g.blend,
+            BlendState: g.host_blend(),
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
             DepthStencilState: g.depth,
@@ -881,7 +958,7 @@ fn mesh_pipeline(
             root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
             ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
             ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.host_blend()),
             mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
             raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
             depth,
@@ -900,7 +977,7 @@ fn mesh_pipeline(
             root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
             ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
             ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.host_blend()),
             mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
             raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
             depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, g.depth1()),
@@ -1033,10 +1110,6 @@ mod tests {
         let Some(host) = host() else {
             return; // no host GPU here
         };
-        if !host.mesh_shaders() {
-            eprintln!("no host mesh shader support; skipped");
-            return;
-        }
         let Some(dxc) = dxc() else {
             eprintln!("no PC dxc.exe; skipped");
             return;
@@ -1046,8 +1119,6 @@ mod tests {
         let ps = compile(&dxc, dir.path(), PS, "ps_6_5");
         let (root, root_blob) = root_signature(&host.device, &[], &[], false).unwrap();
         let mut g = GraphicsState::default();
-        // This pipeline has only a color target, with no depth buffer.
-        g.depth.DepthEnable = false.into();
         g.targets.NumRenderTargets = 1;
         g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
         let name = super::super::library::name("mesh test", &root_blob, &[&ms, &ps], &g.describe());
@@ -1115,7 +1186,7 @@ mod tests {
             pRootSignature: unsafe { std::mem::transmute_copy(&root) },
             VS: code(&vs),
             PS: code(&ps),
-            BlendState: g.blend,
+            BlendState: g.host_blend(),
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
             DepthStencilState: g.depth,

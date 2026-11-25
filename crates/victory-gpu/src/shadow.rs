@@ -26,6 +26,9 @@ use crate::watch::PAGE;
 
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
+    /// Whether the title memory behind it is written back with plain stores
+    /// ([`Shadow::write_title`]); asked once.
+    plain: std::sync::OnceLock<bool>,
     pub(crate) buffer: ID3D12Resource,
     data: *mut u8,
     gpu: u64,
@@ -142,7 +145,13 @@ pub(crate) fn cards() -> bool {
 /// The smallest title buffer whose copy goes to the card's memory, and the
 /// most bytes of such copies (their "before" twins not counted: a copy
 /// shaders write takes its size twice), both in bytes:
-/// `VICTORY_CARD_BUFFERS_MIN_MB` (16) and `VICTORY_CARD_BUFFERS_MB` (512).
+/// `VICTORY_CARD_BUFFERS_MIN_MB` (1) and `VICTORY_CARD_BUFFERS_MB` (1024).
+///
+/// The defaults were 16 and 512. In the world on an RTX 5070 (12 GB),
+/// 2026-11-24, same scripted route: with 16 MiB the CPU snapshotted and
+/// compared 424 MB a frame (374 MB of it in copies of 1-16 MiB), 1.4-1.7
+/// fps; with 1 MiB and 1,024 MB, and [`wide_back`], 30 MB, 2.6-2.7 fps
+/// (prepare 180 to 105 ms, copy-back 90 to 49, card wait 280 to 205).
 /// Run 69's gameplay has ten title buffers of 16 MiB or more, 494 MB, and
 /// 1,650 MB of the card's budget free.
 fn card_limits() -> (u64, u64) {
@@ -151,10 +160,6 @@ fn card_limits() -> (u64, u64) {
         let mb = |name: &str, default: u64| {
             std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default) << 20
         };
-        // From 1 MiB up and 1,024 MB in all by default (it was 16 and 512):
-        // the shader writes of the smaller buffers are then found by the
-        // card's hashes too, and with that the first room's walls were
-        // drawn in every run.
         (mb("VICTORY_CARD_BUFFERS_MIN_MB", 1).max(1 << 20), mb("VICTORY_CARD_BUFFERS_MB", 1024))
     })
 }
@@ -475,7 +480,9 @@ mod card_tests {
 pub(crate) fn relay() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // On by default (stage 2, `crate::host::relay_exact`); `VICTORY_RELAY=0`
-    // turns it off, `=1` asks for the first stage.
+    // turns it off, `=1` asks for the first stage. (Off, with the texture
+    // changes of upstream's c96b4f2, the title faulted at its start screen
+    // in two runs of two on an RTX 5070; on, it did not.)
     // The crate's own tests run without it unless they ask: several of
     // them look at title memory right after a submission, which the
     // relay's landing thread may still be writing.
@@ -946,7 +953,8 @@ unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize) {
 
 /// Whether the snapshots of a submission's shader-written ranges, and the
 /// compare that finds what the shaders wrote, run on several threads
-/// across ranges (`VICTORY_WIDE_BACK=1`; off by default).
+/// across ranges (on by default since 2026-11-24, with the card copies'
+/// smaller minimum, [`card_limits`]; `VICTORY_WIDE_BACK=0`: one thread).
 ///
 /// Both ran range by range on the submitting thread, a range on several
 /// threads only if it was 16 MiB or more. The ranges left on the CPU's side
@@ -967,7 +975,6 @@ unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize) {
 /// lists only afterwards).
 pub(crate) fn wide_back() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    // On by default; `VICTORY_WIDE_BACK=0` turns it off.
     *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_BACK").is_none_or(|v| v != "0"))
 }
 
@@ -1733,6 +1740,32 @@ impl Shadow {
             card: None,
             window: false,
             place: None,
+            plain: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Puts `bytes` into title memory at `at` (inside the buffer): with plain
+    /// stores if the buffer's memory is private, committed and read-write
+    /// all through and no view of the runtime's (asked of Windows once per
+    /// copy: a millisecond in the title's big blocks), else through the
+    /// kernel (`crate::host::write_mapped`). Each byte the GPU wrote was put
+    /// back with a kernel copy, after a kernel read of the title's bytes
+    /// around it (`VICTORY_PLAIN_WRITES=0`: always the kernel, as before).
+    fn write_title(&self, at: usize, bytes: &[u8]) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let on = *ON.get_or_init(|| std::env::var_os("VICTORY_PLAIN_WRITES").is_none_or(|v| v != "0"));
+        let plain = on
+            && *self.plain.get_or_init(|| {
+                let (start, len) = (self.start as usize, self.len as usize);
+                crate::inplace::private_whole(start, len) && !crate::inplace::touches_view(start, len)
+            });
+        let inside = at >= self.start as usize && at + bytes.len() <= (self.start + self.len) as usize;
+        if plain && inside {
+            // SAFETY: inside the buffer's memory, private, committed and
+            // read-write when asked; the title keeps its GPU heaps.
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), at as *mut u8, bytes.len()) };
+        } else {
+            crate::host::write_mapped(at as *mut u8, bytes.as_ptr(), bytes.len());
         }
     }
 
@@ -1963,7 +1996,7 @@ impl Shadow {
                 }
                 if differs != 0 {
                     crate::watch::writing(start + at, n);
-                    crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                    self.write_title(start + at, &title[..n]);
                     written += n;
                 }
             }
@@ -2052,7 +2085,7 @@ impl Shadow {
             return 0;
         }
         crate::watch::writing(start + at, n);
-        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        self.write_title(start + at, &title[..n]);
         n
     }
 
@@ -2580,7 +2613,7 @@ impl Shadow {
             }
             if differs != 0 {
                 crate::watch::writing(start + at, n);
-                crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                self.write_title(start + at, &title[..n]);
                 written = n;
             }
         } else {
@@ -2655,7 +2688,7 @@ impl Shadow {
             return 0;
         }
         crate::watch::writing(start + at, n);
-        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        self.write_title(start + at, &title[..n]);
         n
     }
 }
@@ -2851,8 +2884,8 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     entry.shadow.clone()
 }
 
-/// Titles also use memory outside any buffer object as GPU memory (
-/// the title's interface vertices, from its own allocator). Such memory
+/// Titles also use memory outside any buffer object as GPU memory (Grand
+/// Theft Auto VI's interface vertices, from its own allocator). Such memory
 /// gets copies of the aligned windows it touches.
 /// A window nothing names any more is let go ([`let_go_idle`]).
 /// shortcut: a window is 4 MiB however little of it is read (the memory

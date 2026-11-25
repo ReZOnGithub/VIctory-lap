@@ -1,8 +1,8 @@
 //! Host pipelines are made by workers, not by the title thread that first
 //! records a draw with them. Translating a shader and the host driver's
 //! compile take from milliseconds to seconds each (structurisation of the
-//! biggest compute programs ~0.4 s, some driver compiles 3.4 s), and
-//! the title's first world frame wants over 1,200 new pipelines: made
+//! biggest compute programs ~0.4 s, some driver compiles 3.4 s), and Grand
+//! Theft Auto VI's first world frame wants over 1,200 new pipelines: made
 //! on its recording threads, that frame took more than 30 s and the
 //! title's GPU watchdog ended the run (decision 0007, "Pipelines made off
 //! the title's threads").
@@ -60,8 +60,18 @@ impl Pending {
     }
 
     fn make(&self) {
-        self.made
-            .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+        self.made.get_or_init(|| {
+            // Where the time of making goes: the shaders' translation (on
+            // first use), or the rest (root signature, library, driver).
+            let began = Instant::now();
+            for s in &self.shaders {
+                s.translated();
+            }
+            let translating = began.elapsed();
+            let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
+            note_made(translating, began.elapsed() - translating, &self.shaders);
+            made
+        });
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
@@ -88,6 +98,41 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
                 failed.join(" + ")
             })
         }
+    }
+}
+
+/// Microseconds the pipelines made so far spent in translation and in the
+/// rest of their making, how many were made, and the longest of either.
+static MAKING_US: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+static MAKING_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Counts a pipeline made; logs the slow ones, and the averages every 100.
+fn note_made(translating: Duration, creating: Duration, shaders: &[Arc<Shader>]) {
+    let (t, c) = (translating.as_micros() as u64, creating.as_micros() as u64);
+    MAKING_US[0].fetch_add(t, Ordering::Relaxed);
+    MAKING_US[1].fetch_add(c, Ordering::Relaxed);
+    MAKING_US[2].fetch_max(t, Ordering::Relaxed);
+    MAKING_US[3].fetch_max(c, Ordering::Relaxed);
+    if t + c >= 1_000_000 {
+        tracing::info!(
+            translate_ms = t / 1000,
+            create_ms = c / 1000,
+            ?shaders,
+            "a host pipeline took a second or more to make"
+        );
+    }
+    let n = MAKING_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if n % 100 == 0 {
+        let avg = |i: usize| MAKING_US[i].load(Ordering::Relaxed) / n / 1000;
+        tracing::info!(
+            made = n,
+            waiting = WAITING.load(Ordering::Relaxed),
+            avg_translate_ms = avg(0),
+            avg_create_ms = avg(1),
+            max_translate_ms = MAKING_US[2].swap(0, Ordering::Relaxed) / 1000,
+            max_create_ms = MAKING_US[3].swap(0, Ordering::Relaxed) / 1000,
+            "host pipelines made, time spent making them"
+        );
     }
 }
 

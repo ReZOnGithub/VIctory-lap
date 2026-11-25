@@ -46,6 +46,12 @@ struct Journal {
     /// other ahead asking is made, and `ahead` stays, until
     /// [`ask_once_end`].
     kept: bool,
+    /// With [`per_frame`]: the title frame `known` and `hot` are of.
+    frame: u64,
+    /// Page ranges the kernel answered for in this frame, merged: start to end.
+    known: BTreeMap<usize, usize>,
+    /// Pages found written (or written by us) and the frame they were last.
+    hot: BTreeMap<usize, u64>,
 }
 
 static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
@@ -55,7 +61,167 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     ahead: Vec::new(),
     ahead_asked: 0,
     kept: false,
+    frame: u64::MAX,
+    known: BTreeMap::new(),
+    hot: BTreeMap::new(),
 });
+
+/// Whether a page range is asked of the kernel once a title frame, and in
+/// the frame's later submissions only its pages written lately ([`HOT_FRAMES`])
+/// are asked again (`VICTORY_ASK_PER_FRAME=1`; off by default: in the world
+/// 230 askings a frame were answered this way against 4,500 asked whole,
+/// so it saved little, and a page first written mid-frame was a frame late).
+///
+/// Every submission asked the kernel about every range its lists refresh:
+/// in the world 33 submissions a frame asked about 8.7 GB of pages, 2,849
+/// askings and 27 ms a frame, for some 120 MB written; an asking walks page
+/// tables, about 2 ms a GB on one thread however many threads share it
+/// (measured: the kernel serializes them).
+///
+/// Nothing written is lost: the kernel keeps a page's written bit until it
+/// is asked about. A page the title writes in the middle of a frame that it
+/// had not written in the frames before is seen by the next frame's first
+/// asking, a frame late. What our runtime writes into title memory (copies
+/// at submission, DirectStorage) is noted at once ([`title_memory_written`]).
+fn per_frame() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_PER_FRAME").is_some_and(|v| v == "1"))
+}
+
+/// Whether a view of the runtime's holds a byte of `[start, end)`: memory the
+/// kernel cannot write-watch (the guards watch it).
+fn view_memory(start: usize, end: usize) -> bool {
+    crate::inplace::touches_view(start, end.saturating_sub(start))
+}
+
+/// Frames a page found written stays hot ([`per_frame`]).
+const HOT_FRAMES: u64 = 4;
+
+/// Since the last line ([`per_frame`]): ranges answered from the frame's
+/// knowledge, ranges asked whole, and frames begun.
+static KNOWN_STATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Starts a new frame's knowledge if a frame was presented since: frames by
+/// presents, not by the title's frame waits (several a presented frame).
+fn new_frame(j: &mut Journal) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let frame = crate::queue::presented();
+    if j.frame != frame {
+        j.frame = frame;
+        j.known.clear();
+        j.hot.retain(|_, f| f.saturating_add(HOT_FRAMES) >= frame);
+        if KNOWN_STATS[2].fetch_add(1, Relaxed) % 16 == 15 {
+            let [claimed, whole, frames] = [0, 1, 2].map(|i| KNOWN_STATS[i].swap(0, Relaxed));
+            tracing::info!(
+                claimed,
+                asked_whole = whole,
+                frames = frames + 1,
+                hot_pages = j.hot.len(),
+                "write-watch askings answered from the frame's earlier ones (VICTORY_ASK_PER_FRAME)"
+            );
+        }
+    }
+}
+
+/// The parts of pages `[first, last)` the kernel has not answered for this
+/// frame, in order.
+fn unknown(j: &Journal, first: usize, last: usize) -> Vec<(usize, usize)> {
+    let mut gaps = Vec::new();
+    let mut at = first;
+    // The interval that may hold `first`, then those starting inside.
+    let start = j.known.range(..=first).next_back().map_or(first, |(&a, _)| a);
+    for (&a, &b) in j.known.range(start..last) {
+        if b <= at {
+            continue;
+        }
+        if a > at {
+            gaps.push((at, a.min(last)));
+        }
+        at = at.max(b);
+        if at >= last {
+            break;
+        }
+    }
+    if at < last {
+        gaps.push((at, last));
+    }
+    gaps
+}
+
+/// Pages `[first, last)` were answered for: into the merged set.
+fn note_known(j: &mut Journal, first: usize, last: usize) {
+    let (mut a, mut b) = (first, last);
+    let touching: Vec<(usize, usize)> = j
+        .known
+        .range(..=last)
+        .rev()
+        .take_while(|&(_, &e)| e >= first)
+        .map(|(&s, &e)| (s, e))
+        .collect();
+    for (s, e) in touching {
+        if e >= first && s <= last {
+            j.known.remove(&s);
+            a = a.min(s);
+            b = b.max(e);
+        }
+    }
+    j.known.insert(a, b);
+}
+
+/// Asks the kernel for the parts of `[first, last)` not answered this frame
+/// and their hot pages; whether all of it now stands answered (else the
+/// caller asks as before).
+fn ask_known(j: &mut Journal, first: usize, last: usize) -> bool {
+    if !per_frame() {
+        return false;
+    }
+    let gaps = unknown(j, first, last);
+    if gaps.len() == 1 && gaps[0] == (first, last) {
+        KNOWN_STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return false;
+    }
+    KNOWN_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    for (a, b) in gaps {
+        if !ask_kernel(j, a, b) {
+            return false;
+        }
+    }
+    ask_hot(j, first, last);
+    true
+}
+
+/// Asks the kernel about the hot pages of `[first, last)` only, a run of
+/// them (with gaps of up to 16 pages) at a time.
+fn ask_hot(j: &mut Journal, first: usize, last: usize) {
+    let pages: Vec<usize> = j.hot.range(first..last).map(|(&p, _)| p).collect();
+    let mut i = 0;
+    while i < pages.len() {
+        let a = pages[i];
+        let mut b = a + 1;
+        let mut k = i + 1;
+        while k < pages.len() && pages[k] <= b + 16 {
+            b = pages[k] + 1;
+            k += 1;
+        }
+        ask_kernel(j, a, b);
+        i = k;
+    }
+}
+
+/// Our runtime wrote title memory `[at, at + len)` (DirectStorage, copies):
+/// its pages are hot, so the frame's later submissions ask about them.
+pub fn title_memory_written(at: usize, len: usize) {
+    if len == 0 || !per_frame() {
+        return;
+    }
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let j = &mut *j;
+    new_frame(j);
+    let frame = j.frame;
+    for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
+        j.hot.insert(page, frame);
+    }
+}
 
 /// Ranges of one submission closer than this are asked about together:
 /// walking the pages between them costs less than another kernel call (a
@@ -72,9 +238,12 @@ const AHEAD_MAX: usize = (1 << 30) / PAGE;
 /// 456 ms, in run 14). Ranges that are not write-watched, or lie alone, are
 /// left to `writes`.
 pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
+    // View memory is left to `writes` (the guards): asked of the kernel it
+    // fails, and a run holding some was halved and asked again down to
+    // single pieces.
     let mut pieces: Vec<(usize, usize)> = ranges
         .iter()
-        .filter(|r| r.0 < r.1)
+        .filter(|r| r.0 < r.1 && !view_memory(r.0, r.1))
         .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
         .collect();
     if pieces.len() < 2 {
@@ -88,6 +257,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     if j.kept {
         return;
     }
+    new_frame(j);
     j.asked += 1;
     j.ahead_asked = j.asked;
     j.ahead.clear();
@@ -103,7 +273,13 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
             last = last.max(pieces[k].1);
             k += 1;
         }
-        ask_run(j, &pieces[i..k]);
+        // Answered this frame, in part or whole: the rest and its hot pages
+        // only ([`per_frame`]).
+        if ask_known(j, first, last) {
+            j.ahead.push((first, last));
+        } else {
+            ask_run(j, &pieces[i..k]);
+        }
         i = k;
     }
 }
@@ -176,6 +352,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     ask_ahead(ranges);
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
+    new_frame(j);
     if j.ahead.is_empty() {
         // `ask_ahead` asked nothing (fewer than two ranges).
         j.asked += 1;
@@ -187,11 +364,14 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     // askings a frame with the switch on, as without it). They are asked
     // here, once; what is not write-watched stays with `writes`.
     for &(start, end) in ranges {
-        if start >= end {
+        if start >= end || view_memory(start, end) {
             continue;
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) && ask_kernel(j, first, last) {
+        if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+            continue;
+        }
+        if ask_known(j, first, last) || ask_kernel(j, first, last) {
             j.ahead.push((first, last));
         }
     }
@@ -218,8 +398,10 @@ pub(crate) fn wrote(at: usize, len: usize) {
     }
     j.asked += 1;
     let now = j.asked;
+    let frame = j.frame;
     for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
         j.written.insert(page, now);
+        j.hot.insert(page, frame);
     }
 }
 
@@ -274,9 +456,16 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
         slow(started.elapsed().as_micros() as u64);
     }
     let now = j.ahead_asked;
+    let frame = j.frame;
     for k in 0..count {
         let page = j.found[k] / PAGE;
         j.written.insert(page, now);
+        if per_frame() {
+            j.hot.insert(page, frame);
+        }
+    }
+    if per_frame() {
+        note_known(j, first, last);
     }
     true
 }
@@ -316,22 +505,42 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
                 .collect(),
         ));
     }
+    // View memory cannot be write-watched: the kernel's answer is a
+    // failure, every time (texture checks asked twice per texture, and the
+    // failed askings counted nowhere). The runtime knows its views: such
+    // memory goes to the guards at once.
+    let view = view_memory(start, end);
+    // Answered this frame ([`per_frame`]): the rest and the hot pages are
+    // asked under an asking of its own, and the journal answers.
+    if per_frame() && !view {
+        new_frame(j);
+        let kept = j.ahead_asked;
+        j.asked += 1;
+        j.ahead_asked = j.asked;
+        let answered = ask_known(j, first, last);
+        let now = j.ahead_asked;
+        j.ahead_asked = kept;
+        if answered {
+            return Some((now, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()));
+        }
+    }
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
     let mut granularity = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     // SAFETY: the answer buffer holds `count` entries.
-    let failed = unsafe {
-        GetWriteWatch(
-            WRITE_WATCH_FLAG_RESET,
-            (first * PAGE) as *const _,
-            (last - first) * PAGE,
-            j.found.as_mut_ptr().cast(),
-            &mut count,
-            &mut granularity,
-        )
-    } != 0;
+    let failed = view
+        || unsafe {
+            GetWriteWatch(
+                WRITE_WATCH_FLAG_RESET,
+                (first * PAGE) as *const _,
+                (last - first) * PAGE,
+                j.found.as_mut_ptr().cast(),
+                &mut count,
+                &mut granularity,
+            )
+        } != 0;
     let guarded = if failed {
         count = 0;
         if !guarded {
@@ -356,8 +565,16 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     j.asked += 1;
     let now = j.asked;
     let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
+    let frame = j.frame;
     for page in pages.collect::<Vec<_>>() {
         j.written.insert(page, now);
+        if per_frame() {
+            j.hot.insert(page, frame);
+        }
+    }
+    // The kernel answered for the whole range (not view memory).
+    if per_frame() && !failed {
+        note_known(j, first, last);
     }
     Some((
         now,
@@ -1104,5 +1321,46 @@ mod mapping_tests {
         drop(changing);
         reader.join().unwrap();
         assert!(read.load(Ordering::SeqCst));
+    }
+}
+
+#[cfg(test)]
+mod known_tests {
+    use super::*;
+
+    fn journal() -> Journal {
+        Journal {
+            asked: 0,
+            written: BTreeMap::new(),
+            found: Vec::new(),
+            ahead: Vec::new(),
+            ahead_asked: 0,
+            kept: false,
+            frame: 0,
+            known: BTreeMap::new(),
+            hot: BTreeMap::new(),
+        }
+    }
+
+    /// The pages answered this frame merge, and what is left to ask is
+    /// exactly what no answer covers.
+    #[test]
+    fn answered_ranges_merge_and_leave_the_gaps() {
+        let mut j = journal();
+        assert_eq!(unknown(&j, 10, 20), vec![(10, 20)]);
+        note_known(&mut j, 10, 20);
+        note_known(&mut j, 30, 40);
+        assert_eq!(unknown(&j, 12, 18), vec![]);
+        assert_eq!(unknown(&j, 5, 45), vec![(5, 10), (20, 30), (40, 45)]);
+        assert_eq!(unknown(&j, 15, 35), vec![(20, 30)]);
+        note_known(&mut j, 20, 30);
+        assert_eq!(j.known.len(), 1);
+        assert_eq!(j.known.get(&10), Some(&40));
+        assert_eq!(unknown(&j, 10, 40), vec![]);
+        note_known(&mut j, 0, 5);
+        note_known(&mut j, 3, 12);
+        assert_eq!(j.known.len(), 1);
+        assert_eq!(j.known.get(&0), Some(&40));
+        assert_eq!(unknown(&j, 39, 41), vec![(40, 41)]);
     }
 }

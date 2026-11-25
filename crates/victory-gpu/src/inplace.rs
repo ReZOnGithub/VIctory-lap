@@ -338,6 +338,15 @@ fn cover_in(views: &BTreeMap<usize, (usize, usize, u64)>, at: usize, len: usize)
     if one { Cover::Run(first.0, first.1) } else { Cover::Scattered }
 }
 
+/// Whether any of the title's views holds a byte of `[at, at + len)`: the
+/// runtime maps and unmaps views from other threads, so such memory is
+/// read only through the kernel (`crate::host::copy_mapped`).
+pub(crate) fn touches_view(at: usize, len: usize) -> bool {
+    let end = at.saturating_add(len.max(1));
+    let v = views();
+    v.views.range(..end).next_back().is_some_and(|(base, view)| base + view.0 > at)
+}
+
 /// [`Cover`] of `[at, at + len)` by the title's views as they are now.
 pub(crate) fn cover(at: usize, len: usize) -> Cover {
     cover_in(&views().views, at, len)

@@ -371,11 +371,32 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
         return -1; // EXCEPTION_CONTINUE_EXECUTION
     }
     // SAFETY: as above.
-    if FATAL.contains(&unsafe { (*(*info).ExceptionRecord).ExceptionCode }) {
+    if FATAL.contains(&unsafe { (*(*info).ExceptionRecord).ExceptionCode })
+        // SAFETY: as above.
+        && !in_probe(unsafe { (*(*info).ExceptionRecord).ExceptionAddress } as usize)
+    {
         // SAFETY: as above.
         unsafe { report("first-chance exception", info, false) };
     }
     EXCEPTION_CONTINUE_SEARCH
+}
+
+/// Whether `at` is in `IsBadReadPtr` or `IsBadWritePtr`, whose own handlers
+/// take the faults they raise by design: the host's copies probe title memory
+/// with them (`victory_gpu`), and logging each such fault with a stack walk
+/// was thousands of lines a minute.
+fn in_probe(at: usize) -> bool {
+    static PROBES: std::sync::OnceLock<[usize; 2]> = std::sync::OnceLock::new();
+    let probes = PROBES.get_or_init(|| {
+        // SAFETY: plain lookups of exports of a loaded module.
+        unsafe {
+            use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+            let k32 = GetModuleHandleA(c"kernel32.dll".as_ptr().cast());
+            let k = |name: &std::ffi::CStr| GetProcAddress(k32, name.as_ptr().cast()).map_or(0, |f| f as usize);
+            [k(c"IsBadReadPtr"), k(c"IsBadWritePtr")]
+        }
+    });
+    probes.iter().any(|&p| p != 0 && at >= p && at < p + 0x200)
 }
 
 /// For an unhandled-exception filter: reports the exception that is about

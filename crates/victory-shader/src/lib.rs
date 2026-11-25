@@ -6,6 +6,11 @@
 //! (compiler options) and the zlib-compressed GFX10 code. The bitcode may use
 //! console-only intrinsics, so the GFX10 code is translated in general.
 
+/// A fingerprint of this crate's sources and the workspace's lock file
+/// (`build.rs`): what a translation depends on, short of the settings
+/// read at run time. The translated-shader cache is keyed by it.
+pub const SOURCE_HASH: &str = env!("VICTORY_SHADER_SOURCE_HASH");
+
 pub mod bvh;
 pub mod dxbc;
 pub mod dxil;
