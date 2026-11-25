@@ -93,6 +93,7 @@ fn build(words: &[u32]) -> Result<HostShader, crate::ShaderError> {
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
+        half_views: Default::default(),
         root_uavs: lowered.root_uavs,
         root_indexed_views: Vec::new(),
     };

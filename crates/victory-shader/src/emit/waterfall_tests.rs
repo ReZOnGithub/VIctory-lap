@@ -56,9 +56,9 @@ fn build(words: &[u32], buffers: bool, nonuniform_handles: u32) -> HostShader {
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
-    let (shader, nonuniform_handles, wave_ops) = lowered(&native);
-    // One access with each lane's own heap index, no wave operation.
-    assert_eq!(nonuniform_handles, 1);
+    let (shader, handles, wave_ops) = lowered(&native);
+    // The accesses with each lane's own heap index, no wave operation.
+    assert_eq!(handles, nonuniform_handles);
     assert!(!wave_ops);
     shader
 }

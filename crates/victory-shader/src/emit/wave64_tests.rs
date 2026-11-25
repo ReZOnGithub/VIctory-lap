@@ -822,7 +822,7 @@ fn shared_in_a_branch(in_loop: bool) -> NativeProgram {
 /// The program, its form for a host of 32-lane waves, and what `f` makes of it.
 fn on_a_32_lane_host<R>(native: &NativeProgram, f: impl FnOnce(&crate::dxbc::Container, &ir::Program) -> R) -> R {
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let c = crate::dxbc::Container { digest: [0; 16], version: (1, 0), parts: Vec::new() };
+    let c = crate::dxbc::Container { bytes: &[], digest: [0; 16], version: (1, 0), parts: Vec::new() };
     let was = lower::TEST_HOST_WAVE.replace(Some(32));
     let r = f(&c, &p);
     lower::TEST_HOST_WAVE.set(was);

@@ -2369,6 +2369,7 @@ void main() {
         static_samplers: Vec::new(),
         root_cbvs: Vec::new(),
         root_srvs: Vec::new(),
+        half_views: Default::default(),
         root_uavs: Vec::new(),
         root_indexed_views: Vec::new(),
     };

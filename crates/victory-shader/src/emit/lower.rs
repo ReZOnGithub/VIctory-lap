@@ -4791,7 +4791,7 @@ impl<'a> Lower<'a> {
                 let t = self.s.m.bin(c, Bin::Or, t, or);
                 self.s.m.bin(c, Bin::Xor, t, xor)
             };
-            let r = if mesh_quad {
+            let r = if mesh_quad || self.helpers_read(quad) {
                 self.quad_pick(x, src)
             } else if self.s.threads.is_some()
                 && self.s.mesh.is_none()
@@ -7485,7 +7485,7 @@ impl<'a> Lower<'a> {
         };
         let mut r = match quick {
             Some(q) => super::lean::quad_op(&mut self.s, c, x, q),
-            None if mesh_quad => self.quad_pick(x, src),
+            None if mesh_quad || self.helpers_read(quad) => self.quad_pick(x, src),
             None => self.read_lane(x, src),
         };
         let mut enable = None;
