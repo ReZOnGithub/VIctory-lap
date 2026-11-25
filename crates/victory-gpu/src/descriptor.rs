@@ -303,15 +303,31 @@ fn sync_heaps_avoiding(avoid: Option<&[(usize, usize)]>, due_left: bool) {
                     let mut bytes = vec![0u8; to - from];
                     if crate::host::read_into(from as *const u8, &mut bytes) {
                         pages += 1;
-                        work.push(SyncPage {
-                            host: std::ptr::from_ref(host) as usize,
-                            start,
-                            step,
-                            mirrored_count,
-                            from,
-                            to,
-                            bytes,
-                        });
+                        // In pieces of `sync_piece` records, cut where a
+                        // record starts: a page's records are all of one
+                        // job otherwise, and the sync's wall time was its
+                        // longest job's (run m9: 30.9 ms wall, 30.3 the
+                        // longest, 75 in all).
+                        let cut = sync_piece() as usize * step as usize;
+                        let mut a = from;
+                        while a < to {
+                            let next = (start as usize).saturating_add((((a - start as usize) / step as usize) + 1) * step as usize);
+                            let b = if cut == 0 {
+                                to
+                            } else {
+                                (next + cut - step as usize).min(to)
+                            };
+                            work.push(SyncPage {
+                                host: std::ptr::from_ref(host) as usize,
+                                start,
+                                step,
+                                mirrored_count,
+                                from: a,
+                                to: b,
+                                bytes: bytes[a - from..b - from].to_vec(),
+                            });
+                            a = b;
+                        }
                     }
                     continue;
                 }
@@ -407,14 +423,19 @@ fn mirror_left(host: &host::HostHeap, start: u64, step: u64) {
             .map(|chunk| {
                 let (chunk, counts) = (chunk.to_vec(), counts.clone());
                 Box::new(move || {
+                    let began = std::time::Instant::now();
                     let host = unsafe { &*(at as *const host::HostHeap) };
                     let (m, g) = mirror_left_run(host, start, step, &chunk);
                     counts[0].fetch_add(m, Relaxed);
                     counts[1].fetch_add(g, Relaxed);
+                    job_done(JOBS_LEFT, began);
                 }) as Box<dyn FnOnce() + Send>
             })
             .collect();
+        let n = jobs.len() as u64;
+        let wall = std::time::Instant::now();
         crate::shadow::wide_run(jobs);
+        jobs_ran(JOBS_LEFT, n, wall);
         (counts[0].load(Relaxed), counts[1].load(Relaxed))
     } else {
         mirror_left_run(host, start, step, &due)
@@ -696,23 +717,41 @@ fn mirror_wide(work: Vec<SyncPage>) -> (u64, u64) {
     // Several jobs a thread, taken as threads come free: the written pages
     // cluster, and with one run of pages a thread the sync stood 11 ms a
     // frame for the one that held most of them (run p6's profile).
-    let each = work.len().div_ceil(jobs_n * split_finer()).max(1);
-    let mut pages = work.into_iter();
-    let mut jobs: Vec<Box<dyn FnOnce() + Send>> = Vec::with_capacity(jobs_n);
-    loop {
-        let chunk: Vec<SyncPage> = pages.by_ref().take(each).collect();
+    // Dealt round, one piece to each job in turn: a heavy page's pieces
+    // lie side by side in `work`, and in runs they went to one job.
+    let n_jobs = (jobs_n * split_finer()).min(work.len()).max(1);
+    let mut chunks: Vec<Vec<SyncPage>> = (0..n_jobs).map(|_| Vec::new()).collect();
+    for (i, page) in work.into_iter().enumerate() {
+        chunks[i % n_jobs].push(page);
+    }
+    let mut jobs: Vec<Box<dyn FnOnce() + Send>> = Vec::with_capacity(n_jobs);
+    for chunk in chunks {
         if chunk.is_empty() {
-            break;
+            continue;
         }
         let counts = counts.clone();
         jobs.push(Box::new(move || {
+            let began = std::time::Instant::now();
             let (looked, mirrored) = chunk.iter().map(look).fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
             counts[0].fetch_add(looked, Relaxed);
             counts[1].fetch_add(mirrored, Relaxed);
+            job_done(JOBS_PAGES, began);
         }));
     }
+    let n = jobs.len() as u64;
+    let wall = std::time::Instant::now();
     crate::shadow::wide_run(jobs);
+    jobs_ran(JOBS_PAGES, n, wall);
     (counts[0].load(Relaxed), counts[1].load(Relaxed))
+}
+
+/// With [`sync_wide`]: the records a piece of a heap page holds at most,
+/// each piece a job's part on its own (`VICTORY_SYNC_PIECE`, 256; 0 whole
+/// pages, as before).
+#[cfg(windows)]
+fn sync_piece() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_SYNC_PIECE").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(256))
 }
 
 /// How many jobs per thread of [`sync_wide`] the heap sync's pages and
@@ -732,7 +771,42 @@ pub(crate) static SYNCED: [std::sync::atomic::AtomicU64; 4] = [const { std::sync
 /// With the frame line: what [`sync_heaps`] did per frame over `frames`.
 /// Nothing while no heap page changed.
 #[cfg(windows)]
+/// Of the heap sync's jobs on the wide threads, by kind ([`JOBS_PAGES`],
+/// [`JOBS_LEFT`]), since the last line: runs, jobs, the wall time of the
+/// runs, the jobs' time summed, the longest job of each run summed (us).
+static JOB_STATS: [[std::sync::atomic::AtomicU64; 5]; 2] = [const { [const { std::sync::atomic::AtomicU64::new(0) }; 5] }; 2];
+/// The longest job of the run under way, by kind.
+static JOB_LONGEST: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+const JOBS_PAGES: usize = 0;
+const JOBS_LEFT: usize = 1;
+
+fn job_done(kind: usize, began: std::time::Instant) {
+    let us = began.elapsed().as_micros() as u64;
+    JOB_STATS[kind][3].fetch_add(us, std::sync::atomic::Ordering::Relaxed);
+    JOB_LONGEST[kind].fetch_max(us, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn jobs_ran(kind: usize, n: u64, wall: std::time::Instant) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let s = &JOB_STATS[kind];
+    s[0].fetch_add(1, Relaxed);
+    s[1].fetch_add(n, Relaxed);
+    s[2].fetch_add(wall.elapsed().as_micros() as u64, Relaxed);
+    s[4].fetch_add(JOB_LONGEST[kind].swap(0, Relaxed), Relaxed);
+}
+
 pub(crate) fn sync_line(frames: f64) {
+    {
+        let v: Vec<Vec<f64>> = JOB_STATS
+            .iter()
+            .map(|k| k.iter().map(|c| c.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames).collect())
+            .collect();
+        tracing::info!(
+            "the heap sync's wide jobs per frame: pages {:.1} runs of {:.0} jobs, {:.2} ms wall, {:.2} ms in jobs, {:.2} ms the longest jobs;              left slots {:.1} runs of {:.0} jobs, {:.2} ms wall, {:.2} ms in jobs, {:.2} ms the longest jobs",
+            v[0][0], v[0][1], v[0][2] / 1000.0, v[0][3] / 1000.0, v[0][4] / 1000.0,
+            v[1][0], v[1][1], v[1][2] / 1000.0, v[1][3] / 1000.0, v[1][4] / 1000.0,
+        );
+    }
     let [pages, looked, mirrored, micros] = [0, 1, 2, 3].map(|i| SYNCED[i].swap(0, std::sync::atomic::Ordering::Relaxed));
     if pages == 0 {
         return;
