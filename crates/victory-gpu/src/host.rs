@@ -224,7 +224,7 @@ pub(crate) fn retire<T: 'static>(object: T) {
     let started = STARTED.load(Ordering::Acquire);
     if started <= FINISHED.load(Ordering::Acquire) {
         RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
-        drop(object);
+        reap(vec![Retired(Box::new(object))]);
         return;
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
@@ -247,7 +247,58 @@ fn bury(finished: u64) {
         *retired = keep;
         done
     };
-    drop(done);
+    reap(done.into_iter().map(|(_, r)| r).collect());
+}
+
+/// Whether retired objects are dropped by a thread of their own
+/// (`VICTORY_REAPER`, on unless `0`).
+///
+/// Dropping a host texture or buffer is the driver's work: destroying the
+/// allocation and freeing its GPU address (`NtGdiDdDDIDestroyAllocation2`,
+/// `NtGdiDdDDIFreeGpuVirtualAddress`). The once-a-second sweep let go of
+/// idle texture copies on the submitting thread, under the submission
+/// lock: about 8 ms a frame in the profile of run p4, all of it on the
+/// frame's path. `bury` did the same on the landing thread. With the
+/// switch both hand the objects to the reaper, which drops them beside.
+fn reaper_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REAPER").is_none_or(|v| v != "0"))
+}
+
+/// The reaper's queue ([`reaper_on`]), its thread made on first use;
+/// `None` if the thread could not be made.
+fn reaper() -> Option<&'static std::sync::mpsc::Sender<Vec<Retired>>> {
+    static TX: OnceLock<Option<std::sync::mpsc::Sender<Vec<Retired>>>> = OnceLock::new();
+    TX.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<Retired>>();
+        std::thread::Builder::new()
+            .name("victory-reaper".into())
+            .spawn(move || {
+                while let Ok(items) = rx.recv() {
+                    drop(items);
+                }
+            })
+            .ok()
+            .map(|_| tx)
+    })
+    .as_ref()
+}
+
+/// Drops `items`, on the reaper's thread if there is one.
+fn reap(items: Vec<Retired>) {
+    if items.is_empty() {
+        return;
+    }
+    if reaper_on()
+        && let Some(tx) = reaper()
+    {
+        // (A send fails only with the thread gone: then dropped here.)
+        if let Err(std::sync::mpsc::SendError(items)) = tx.send(items) {
+            drop(items);
+        }
+        return;
+    }
+    drop(items);
 }
 
 /// Objects [`retire`] dropped at once (no submission was running) and
@@ -2998,6 +3049,10 @@ enum Step {
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
+    /// A title buffer copy (destination, source, bytes) done when its
+    /// submission lands instead of while it is prepared ([`land_copies`]):
+    /// nothing at preparing.
+    LandCopy(usize, usize, usize),
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -3984,6 +4039,8 @@ struct Sent {
     /// The title memory its read-backs write once it has run
     /// ([`read_back_spans`]).
     read_back: Vec<(usize, usize)>,
+    /// Its title copies done when it lands ([`land_copies`]).
+    land_copies: Vec<(usize, usize, usize)>,
 }
 
 /// A submission on the card that has not been waited for ([`late`]): its
@@ -4008,6 +4065,9 @@ struct Flight {
     /// copies' picked spans where it declared nothing.
     picks: bool,
     texture_back_ranges: Vec<(usize, usize)>,
+    /// Title copies (destination, source, bytes) done when it lands, after
+    /// its shaders' writes are in title memory ([`land_copies`]).
+    land_copies: Vec<(usize, usize, usize)>,
 }
 
 /// One thing in the line of what waits for the card, in order.
@@ -4561,6 +4621,13 @@ fn table_card_line(frames: f64) -> String {
 /// title memory gets it when the flight lands, as for a dispatch's writes.
 /// Later CPU reads of that destination in the same list (fills, title
 /// copies left on the CPU) read the copy's source instead.
+/// Whether [`HostList::card_constant`] takes views in nested buffers'
+/// bytes (`crate::shadow::nested_copies`; on unless `VICTORY_CARD_NESTED=0`).
+fn card_nested() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_NESTED").is_none_or(|v| v != "0"))
+}
+
 pub(crate) fn table_gpu_copy() -> u8 {
     static LEVEL: OnceLock<u8> = OnceLock::new();
     *LEVEL.get_or_init(|| {
@@ -4635,7 +4702,9 @@ pub(crate) mod table_gpu {
     /// At submission: views under flights' writes made in another copy
     /// than the view's: their fill waits for the flights, as before.
     pub const ELSEWHERE: usize = 27;
-    pub const ALL: usize = 28;
+    /// Views in nested buffers' bytes, with the other copies as sources.
+    pub const NESTED: usize = 28;
+    pub const ALL: usize = 29;
     pub static STATS: [AtomicU64; ALL] = [const { AtomicU64::new(0) }; ALL];
 
     pub fn count(place: usize) {
@@ -4938,6 +5007,184 @@ pub(crate) fn covered(ranges: &[(usize, usize)], from: usize, to: usize) -> bool
     at >= to
 }
 
+/// Whether a title buffer copy whose source lies under flights' shader
+/// writes, and whose destination does not, is done when its own submission
+/// lands instead of making the submission wait for those flights
+/// (`VICTORY_LAND_COPIES=1`; off: runs t4/t5 settled as often, for other
+/// reads, and the checks on pending copies added waits of their own).
+///
+/// Such a copy (20 KiB of the title's transient pool into a small buffer
+/// it reads on the CPU) made the submission settle about once a frame,
+/// 40-60 ms: the card and the landing of every flight in the air. It may
+/// not simply read ahead: in run t1 its source had other bytes after the
+/// wait 2 times in 482. Done at the landing it reads the source once every
+/// flight before it has put its shaders' writes into title memory, which is
+/// what the card's copy would have read; the title learns of it only from
+/// fence signals and memory values behind the flight, which the landing
+/// sets after it.
+///
+/// Taken only where that holds: the submission's own shaders write
+/// neither the source nor the destination, nothing else in the submission
+/// reads or writes the destination or writes the source (no step that may
+/// write title memory at all), and none of its lists reads the copy's
+/// destination. Until it is done, its destination counts as memory flights
+/// write (later reads of it wait, as for shader writes), and a later
+/// submission that writes its source (shaders, or a title copy) waits for
+/// it: no flight landed with it can have changed its source.
+fn land_copies_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_COPIES").is_some_and(|v| v == "1"))
+}
+
+/// Sources (from, to) of copies taken by [`take_land_copies`] and not yet
+/// done by a landing, and how many there are.
+static LAND_PENDING: Mutex<Vec<(usize, usize, usize, usize)>> = Mutex::new(Vec::new());
+static LAND_PENDING_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Copies done at landings, and their bytes, since the last frame line.
+pub(crate) static LAND_COPIED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Whether `[from, to)` overlaps the source (`dst` false) or destination
+/// of a copy still to be done at a landing. Writing its source, or reading
+/// or writing its destination, waits for that landing. (Its destination
+/// is not among the memory flights' shaders write: the title writing next
+/// to it is no write under shader writes.)
+fn land_pending_at(from: usize, to: usize, dst: bool) -> bool {
+    if LAND_PENDING_N.load(Ordering::Acquire) == 0 {
+        return false;
+    }
+    LAND_PENDING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|&(s0, s1, d0, d1)| if dst { d0 < to && from < d1 } else { s0 < to && from < s1 })
+}
+
+fn land_pending(from: usize, to: usize) -> bool {
+    land_pending_at(from, to, false)
+}
+
+fn land_any() -> bool {
+    LAND_PENDING_N.load(Ordering::Acquire) > 0
+}
+
+/// At a submission: its title copies done at its landing
+/// ([`land_copies_on`]), each made a [`Step::LandCopy`] in its list.
+fn take_land_copies(runs: &[&HostList]) -> Vec<(usize, usize, usize)> {
+    if !land_copies_on() {
+        return Vec::new();
+    }
+    let written = {
+        let line = line();
+        if line.written.is_empty() {
+            return Vec::new();
+        }
+        line.written.clone()
+    };
+    // Every step of the submission, flattened, with its list and place.
+    let mut candidates: Vec<(usize, usize, usize, usize, usize)> = Vec::new();
+    {
+        let mut n = 0;
+        for (l, list) in runs.iter().enumerate() {
+            let deferred = list.deferred();
+            for (i, step) in deferred.copies.iter().enumerate() {
+                if let &Step::Copy(dst, src, len) = step
+                    && len > 0
+                    && touches(&written, src, src + len)
+                    && !touches(&written, dst, dst + len)
+                    && !land_pending(dst, dst + len)
+                    && !land_pending_at(dst, dst + len, true)
+                    && !land_pending_at(src, src + len, true)
+                    && dst.max(src) >= dst.min(src) + len
+                {
+                    candidates.push((l, i, dst, src, len));
+                }
+                n += 1;
+            }
+        }
+        let _ = n;
+    }
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    let overlaps = |a: usize, b: usize, c: usize, d: usize| a < d && c < b;
+    // The steps that rule a candidate out, over the whole submission.
+    let mut taken: Vec<(usize, usize, usize, usize, usize)> = Vec::new();
+    'next: for &(l, i, dst, src, len) in &candidates {
+        let (d1, s1) = (dst + len, src + len);
+        for (m, list) in runs.iter().enumerate() {
+            let deferred = list.deferred();
+            for (j, step) in deferred.copies.iter().enumerate() {
+                if (m, j) == (l, i) {
+                    continue;
+                }
+                let bad = match step {
+                    Step::Run(_) => true,
+                    &Step::Copy(d, s, n) => {
+                        overlaps(d, d + n, dst, d1) || overlaps(s, s + n, dst, d1) || overlaps(d, d + n, src, s1)
+                    }
+                    &Step::LandCopy(d, s, n) => {
+                        overlaps(d, d + n, dst, d1) || overlaps(s, s + n, dst, d1) || overlaps(d, d + n, src, s1)
+                    }
+                    &Step::Fill(_, s, n, _) | &Step::CardFill(_, s, n) => overlaps(s, s + n, dst, d1),
+                    &Step::GpuWrite(_, at, n) => overlaps(at, at + n, src, s1) || overlaps(at, at + n, dst, d1),
+                    Step::Refresh(_, at, n) => overlaps(*at, *at + *n, dst, d1),
+                    Step::Texture(staging) => {
+                        let (at, n) = staging.memory();
+                        overlaps(at, at + n, dst, d1)
+                    }
+                    Step::Host(..) => false,
+                };
+                if bad {
+                    continue 'next;
+                }
+            }
+            // A list that reads the destination on the card.
+            if deferred.gpu_reads.iter().any(|&(at, n)| overlaps(at, at + n, dst, d1)) {
+                continue 'next;
+            }
+        }
+        taken.push((l, i, dst, src, len));
+    }
+    if taken.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(taken.len());
+    {
+        let mut pending = LAND_PENDING.lock().unwrap_or_else(|e| e.into_inner());
+        for &(l, i, dst, src, len) in &taken {
+            let mut deferred = runs[l].deferred();
+            if let Some(step) = deferred.copies.get_mut(i) {
+                *step = Step::LandCopy(dst, src, len);
+            }
+            pending.push((src, src + len, dst, dst + len));
+            LAND_PENDING_N.fetch_add(1, Ordering::AcqRel);
+            out.push((dst, src, len));
+        }
+    }
+    out
+}
+
+/// At a flight's landing, once its shaders' writes are in title memory:
+/// its copies taken by [`take_land_copies`], in order.
+fn run_land_copies(copies: &[(usize, usize, usize)]) {
+    if copies.is_empty() {
+        return;
+    }
+    for &(dst, src, len) in copies {
+        copy_mapped(dst as *mut u8, src as *const u8, len, true);
+        crate::watch::wrote(dst, len);
+        LAND_COPIED[0].fetch_add(1, Ordering::Relaxed);
+        LAND_COPIED[1].fetch_add(len as u64, Ordering::Relaxed);
+    }
+    let mut pending = LAND_PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    for &(_, src, len) in copies {
+        if let Some(k) = pending.iter().position(|&r| (r.0, r.1) == (src, src + len)) {
+            pending.swap_remove(k);
+            LAND_PENDING_N.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
 /// [`table_gpu_copy`]: what a step does to a slot's fill and copies on the
 /// card, as the step scanners see it. Whether `step` reads title memory
 /// that flights' shaders may write (`written`, in order, joined) on the
@@ -4947,15 +5194,29 @@ pub(crate) fn covered(ranges: &[(usize, usize)], from: usize, to: usize) -> bool
 fn step_blocks(step: &Step, written: &[(usize, usize)]) -> Option<(usize, usize)> {
     match step {
         &Step::Copy(dst, src, len) => {
-            (touches(written, src, src + len) || touches(written, dst, dst + len)).then_some((WHY_READ, 15))
+            (touches(written, src, src + len)
+                || touches(written, dst, dst + len)
+                || land_pending(dst, dst + len)
+                || land_pending_at(dst, dst + len, true)
+                || land_pending_at(src, src + len, true))
+                .then_some((WHY_READ, 15))
         }
-        &Step::Fill(_, src, len, _) => touches(written, src, src + len).then_some((WHY_READ, 16)),
+        &Step::Fill(_, src, len, _) => {
+            (touches(written, src, src + len) || land_pending_at(src, src + len, true)).then_some((WHY_READ, 16))
+        }
         Step::Texture(staging) => {
             let (at, len) = staging.memory();
-            touches(written, at, at + len).then_some((WHY_READ, 17))
+            (touches(written, at, at + len) || land_pending_at(at, at + len, true)).then_some((WHY_READ, 17))
         }
         Step::Run(_) => Some((WHY_RUN, usize::MAX)),
-        Step::CardFill(..) | Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(..) => None,
+        // A write into the source of a copy done at a landing still to
+        // come ([`land_copies`]) waits for that landing.
+        &Step::GpuWrite(_, at, len) => {
+            (land_pending(at, at + len) || land_pending_at(at, at + len, true)).then_some((WHY_READ, 15))
+        }
+        Step::Refresh(_, at, len) => land_pending_at(*at, *at + *len, true).then_some((WHY_READ, 15)),
+        &Step::CardFill(_, src, len) => land_pending_at(src, src + len, true).then_some((WHY_READ, 16)),
+        Step::Host(..) | Step::LandCopy(..) => None,
     }
 }
 
@@ -5086,6 +5347,10 @@ struct CardView {
     /// The title buffers' copies in the card's memory that hold it (one,
     /// or two side by side): copy, from, to (title addresses).
     pieces: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    /// Other buffers' copies over some of its bytes (nested buffers,
+    /// `crate::shadow::nested_copies`): copy, from, to. A part under
+    /// flights' writes made in one of them is taken from it.
+    alts: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     /// Its fill's place in the list's steps.
     step: usize,
     /// Under flights' writes made in another copy: its fill became a
@@ -5102,14 +5367,29 @@ struct CardView {
 unsafe impl Send for CardView {}
 
 impl CardView {
-    /// [`under_writes`] of the view's pieces.
-    fn under_writes(
-        &self,
-        written: &[(usize, usize)],
-        pending: impl Fn(usize, usize, usize) -> bool,
-    ) -> Result<Vec<(usize, usize, usize)>, ()> {
+    /// [`under_writes`] of the view's pieces, each part taken from the
+    /// piece's own copy or, where the flights' writes were made in another
+    /// copy over it ([`CardView::alts`]), from that one: indices past the
+    /// pieces name alternates ([`CardView::source`]).
+    fn under_writes(&self, written: &[(usize, usize)]) -> Result<Vec<(usize, usize, usize)>, ()> {
         let pieces: Vec<(usize, usize)> = self.pieces.iter().map(|p| (p.1, p.2)).collect();
-        under_writes(&pieces, written, pending)
+        under_writes(&pieces, written, |i, lo, hi| {
+            if self.pieces[i].0.pending_covers(lo, hi) {
+                return Some(i);
+            }
+            self.alts
+                .iter()
+                .position(|(shadow, from, to)| *from <= lo && hi <= *to && shadow.carded() && shadow.pending_covers(lo, hi))
+                .map(|a| self.pieces.len() + a)
+        })
+    }
+
+    /// The copy part `i` of [`CardView::on_card`] is taken from.
+    fn source(&self, i: usize) -> &std::sync::Arc<crate::shadow::Shadow> {
+        match self.pieces.get(i) {
+            Some(p) => &p.0,
+            None => &self.alts[i - self.pieces.len()].0,
+        }
     }
 }
 
@@ -5123,15 +5403,15 @@ impl CardView {
 fn under_writes(
     pieces: &[(usize, usize)],
     written: &[(usize, usize)],
-    pending: impl Fn(usize, usize, usize) -> bool,
+    pending: impl Fn(usize, usize, usize) -> Option<usize>,
 ) -> Result<Vec<(usize, usize, usize)>, ()> {
     let mut out = Vec::new();
     for (i, &(from, to)) in pieces.iter().enumerate() {
         for (lo, hi) in parts_in(written, from, to) {
-            if !pending(i, lo, hi) {
+            let Some(source) = pending(i, lo, hi) else {
                 return Err(());
-            }
-            out.push((i, lo, hi));
+            };
+            out.push((source, lo, hi));
         }
     }
     Ok(out)
@@ -5167,7 +5447,7 @@ fn read_plan(runs: &[&HostList]) -> ReadPlan {
                     read.push((at, at + len, NOT_FILL));
                 }
                 Step::Run(_) => ours = true,
-                Step::CardFill(..) | Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(..) => {}
+                Step::CardFill(..) | Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(..) | Step::LandCopy(..) => {}
             }
         }
     }
@@ -5330,7 +5610,7 @@ fn reads_unwritten(runs: &[&HostList], need: u64) -> bool {
                 }
                 &Step::Fill(_, src, len, _) => read.push((src, src + len)),
                 Step::Texture(_) | Step::Run(_) => return false,
-                Step::CardFill(..) | Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(..) => {}
+                Step::CardFill(..) | Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(..) | Step::LandCopy(..) => {}
             }
         }
     }
@@ -5557,7 +5837,7 @@ fn flying() -> bool {
 fn late_blocked(runs: &[&HostList], count: bool) -> Option<usize> {
     let written = {
         let line = line();
-        if line.written.is_empty() {
+        if line.written.is_empty() && !land_any() {
             return None;
         }
         line.written.clone()
@@ -5569,7 +5849,7 @@ fn late_blocked(runs: &[&HostList], count: bool) -> Option<usize> {
 /// may write (in order, joined); `count` whether the kind of read is
 /// counted for the frame line.
 fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Option<usize> {
-    if written.is_empty() {
+    if written.is_empty() && !land_any() {
         return None;
     }
     let ahead = fill_ahead::on();
@@ -5590,7 +5870,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                 if count {
                     match step {
                         &Step::Copy(dst, src, len) => fill_check::blocked_copy(written, dst, src, len),
-                        &Step::Fill(_, src, len, _) => fill_check::blocked(written, src, len),
+                        &Step::Fill(_, src, len, kind) => fill_check::blocked(written, src, len, kind),
                         _ => {}
                     }
                 }
@@ -5608,9 +5888,17 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
 /// always waits).
 fn read_ahead(step: &Step, written: &[(usize, usize)]) -> Option<(usize, usize)> {
     match step {
-        &Step::Copy(dst, src, len) => (copy_ahead() && touches(written, src, src + len) && !touches(written, dst, dst + len))
+        &Step::Copy(dst, src, len) => (copy_ahead()
+            && touches(written, src, src + len)
+            && !touches(written, dst, dst + len)
+            && !land_pending_at(src, src + len, true)
+            && !land_pending_at(dst, dst + len, true)
+            && !land_pending(dst, dst + len))
             .then_some((src, len)),
-        &Step::Fill(_, src, len, _) => touches(written, src, src + len).then_some((src, len)),
+        &Step::Fill(_, src, len, _) => {
+            (touches(written, src, src + len) && !fill_ahead::waits_at(src, len) && !land_pending_at(src, src + len, true))
+                .then_some((src, len))
+        }
         _ => None,
     }
 }
@@ -5754,6 +6042,33 @@ mod fill_ahead {
         *ON.get_or_init(|| std::env::var_os("VICTORY_FILL_WAIT").is_none_or(|v| v != "1")) && !WAIT.load(Relaxed)
     }
 
+    /// The 64 KiB pieces where a fill read bytes a flight then changed:
+    /// fills there wait for flights from then on; fills elsewhere go on
+    /// reading ahead. One such fill made every fill wait again before
+    /// (and does unless `VICTORY_FILL_WAIT_LOCAL=1`: off by default, run h4
+    /// found fills there missing writes again and again): in the world a fill of
+    /// 2,048 bytes at 0xdc07ea300 in frame 1682 of run h3, after which a
+    /// 480-byte fill under a 174 MB view shaders may write settled every
+    /// frame, 56 ms of the submitting thread, while none of the 203
+    /// fills and copies checked after such a wait read other bytes.
+    static BAD: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+    static BAD_N: AtomicU64 = AtomicU64::new(0);
+
+    fn local() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_FILL_WAIT_LOCAL").is_some_and(|v| v == "1"))
+    }
+
+    /// Whether a fill of `len` bytes at `src` waits for flights all the
+    /// same: it reads a piece where a fill read ahead of a write before.
+    pub(super) fn waits_at(src: usize, len: usize) -> bool {
+        if BAD_N.load(Relaxed) == 0 || len == 0 {
+            return false;
+        }
+        let bad = BAD.lock().unwrap_or_else(|e| e.into_inner());
+        bad.as_ref().is_some_and(|b| (src / PIECE..=(src + len - 1) / PIECE).any(|p| b.contains(&p)))
+    }
+
     /// A fill reads `len` bytes at `src` ahead of flights that may write
     /// them; `upto`: the highest number among the flights in the air.
     pub(super) fn read(src: usize, len: usize, upto: u64) {
@@ -5810,6 +6125,26 @@ mod fill_ahead {
             }
             let n = COUNT[2].fetch_add(1, Relaxed) + 1;
             let first = now.iter().zip(&new[a - at..b - at]).position(|(x, y)| x != y).unwrap_or(0);
+            if local() {
+                let mut bad = BAD.lock().unwrap_or_else(|e| e.into_inner());
+                let set = bad.get_or_insert_with(Default::default);
+                for piece in from / PIECE..=(to - 1) / PIECE {
+                    if set.insert(piece) {
+                        BAD_N.fetch_add(1, Relaxed);
+                    }
+                }
+                if n <= 16 {
+                    tracing::warn!(
+                        "a fill of upload memory read {} bytes at {from:#x} in frame {read_in} ahead of a flight whose shaders \
+                         changed them (first at {:#x}, landed in frame {frame}): fills of that 64 KiB wait for flights from here \
+                         on ({n} such fills; {} pieces wait)",
+                        to - from,
+                        a + first,
+                        set.len()
+                    );
+                }
+                continue;
+            }
             if !WAIT.swap(true, Relaxed) {
                 tracing::warn!(
                     "a fill of upload memory read {} bytes at {from:#x} in frame {read_in} ahead of a flight whose shaders changed \
@@ -5877,7 +6212,7 @@ mod fill_check {
     static CHECKED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
     /// A fill of `len` bytes at `src` blocks on `written`.
-    pub(super) fn blocked(written: &[(usize, usize)], src: usize, len: usize) {
+    pub(super) fn blocked(written: &[(usize, usize)], src: usize, len: usize, kind: u8) {
         let at = written.partition_point(|r| r.1 <= src);
         let touched = written.get(at).copied().unwrap_or((0, 0));
         let key = (src & !0xfff, len);
@@ -5889,7 +6224,12 @@ mod fill_check {
                 seen.push((key.0, key.1, 1));
                 if seen.len() <= 12 {
                     tracing::info!(
-                        "a fill of upload memory waits for flights: {len} bytes at {src:#x}; the range shaders may write that it                          touches: {:#x}+{:#x} ({} ranges in the air); frame {}",
+                        "a fill of upload memory waits for flights: {len} bytes at {src:#x} (kind {kind}, its copy {}); the range shaders may write that it                          touches: {:#x}+{:#x} ({} ranges in the air); frame {}",
+                        match crate::shadow::find(src as u64, len as u64) {
+                            Some(s) if s.carded() => "in the card's memory",
+                            Some(_) => "in the PC's memory",
+                            None => "none",
+                        },
                         touched.0,
                         touched.1 - touched.0,
                         written.len(),
@@ -9048,6 +9388,7 @@ impl Host {
         for item in items {
             match item {
                 Late::Run(flight) => {
+                    run_land_copies(&flight.land_copies);
                     last = flight.number;
                     fence_early::landed(flight.fence);
                     ahead = Some(flight.fence);
@@ -9396,6 +9737,7 @@ impl Host {
                 freed: false,
                 picks,
                 texture_back_ranges: sent.texture_back_ranges,
+                land_copies: sent.land_copies,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
             FLIGHTS_LINED.fetch_add(1, Ordering::SeqCst);
@@ -9462,6 +9804,7 @@ impl Host {
                 freed: false,
                 picks: false,
                 texture_back_ranges: sent.texture_back_ranges,
+                land_copies: sent.land_copies,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
             FLIGHTS_LINED.fetch_add(1, Ordering::SeqCst);
@@ -9855,6 +10198,7 @@ impl Host {
             for item in items {
                 match item {
                     Late::Run(flight) => {
+                        run_land_copies(&flight.land_copies);
                         last = flight.number;
                         for &i in &flight.order {
                             read_backs(flight.lists[i].host());
@@ -10082,6 +10426,9 @@ impl Host {
         if copy_on_card() > 0 {
             card_copy_look(runs);
         }
+        // Title copies whose source flights' shaders may write: done when
+        // this submission lands, not waited for here ([`land_copies`]).
+        let mut land_copies = if late { take_land_copies(runs) } else { Vec::new() };
         let blocked = if late { late_blocked(runs, false) } else { None };
         if !late {
             self.settle(&mut submitted, WHY_SYNC);
@@ -10405,6 +10752,7 @@ impl Host {
                 texture_back_ranges,
                 writes,
                 read_back,
+                land_copies: std::mem::take(&mut land_copies),
             };
             mark.to(work::SEND);
             working(was_working);
@@ -11783,16 +12131,28 @@ impl HostList {
                 return Some(gpu);
             }
         }
-        let pieces = match crate::shadow::card_pieces(address, len) {
-            Ok(pieces) => pieces,
+        let (pieces, alts) = match crate::shadow::card_pieces(address, len) {
+            Ok(pieces) => (pieces, Vec::new()),
             Err(crate::shadow::NotSole::NoBuffer) => {
                 g::count(g::NO_BUFFER);
                 return None;
             }
-            Err(crate::shadow::NotSole::OtherCopy) => {
-                g::count(g::OTHER_COPY);
-                return None;
-            }
+            // Nested buffers: the innermost copy, and the others over it
+            // for parts the flights wrote there (`VICTORY_CARD_NESTED=0`:
+            // filled with the wait, as before).
+            Err(crate::shadow::NotSole::OtherCopy) => match card_nested()
+                .then(|| crate::shadow::nested_copies(address, len))
+                .flatten()
+            {
+                Some((inner, others)) => {
+                    g::count(g::NESTED);
+                    (vec![(inner, address, len.max(1))], others)
+                }
+                None => {
+                    g::count(g::OTHER_COPY);
+                    return None;
+                }
+            },
         };
         // A copy in the PC's memory is written by later submissions'
         // preparing at once, maybe before the card has copied out of it.
@@ -11836,6 +12196,7 @@ impl HostList {
             from,
             to,
             pieces: pieces.into_iter().map(|(shadow, at, n)| (shadow, at as usize, (at + n) as usize)).collect(),
+            alts: alts.into_iter().map(|(shadow, from, to)| (shadow, from as usize, to as usize)).collect(),
             step,
             waits: false,
             on_card: Vec::new(),
@@ -11864,7 +12225,7 @@ impl HostList {
             if view.waits || !touches(written, view.from, view.to) {
                 continue;
             }
-            match view.under_writes(written, |i, lo, hi| view.pieces[i].0.pending_covers(lo, hi)) {
+            match view.under_writes(written) {
                 Ok(parts) => {
                     if !parts.is_empty() {
                         g::count(g::CARD_VIEWS);
@@ -11901,7 +12262,7 @@ impl HostList {
         let mut from_card: Vec<CardCopy> = Vec::new();
         for view in deferred.card_views.iter().filter(|v| !v.waits) {
             for &(i, lo, hi) in &view.on_card {
-                let shadow = &view.pieces[i].0;
+                let shadow = view.source(i);
                 g::add(g::CARD_BYTES, (hi - lo) as u64);
                 let part = part_region(shadow.buffer.clone(), shadow.offset(lo as u64), view.ring.clone(), view.ring_at, view.from, lo, hi);
                 push_region(&mut from_card, part);
@@ -12460,7 +12821,7 @@ impl HostList {
                 Step::Fill(..) | Step::CardFill(..) => prep::FILL,
                 Step::Refresh(..) => prep::QUEUE,
                 Step::Run(_) => prep::RUN,
-                Step::Host(..) => prep::HOST,
+                Step::Host(..) | Step::LandCopy(..) => prep::HOST,
                 Step::GpuWrite(..) => prep::DECLARE,
                 Step::Texture(_) => prep::TEXTURE,
             };
@@ -12606,6 +12967,8 @@ impl HostList {
                     }
                     continue;
                 }
+                // Done when the submission lands (`land_copies`).
+                Step::LandCopy(..) => continue,
             };
             preparing(0, since.elapsed().as_micros() as u64);
             preparing(1, copied as u64);

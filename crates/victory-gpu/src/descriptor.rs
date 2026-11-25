@@ -391,6 +391,44 @@ fn mirror_left(host: &host::HostHeap, start: u64, step: u64) {
         return;
     }
     let began = std::time::Instant::now();
+    // Some 12,600 a frame in the world, 17.5 ms on the submitting thread
+    // alone (run h1): in runs of slots on the sync's threads
+    // ([`sync_wide`]), as the pages of the sync are. Each slot is made by
+    // one job; slots' locks are their own (`host::Made`).
+    let jobs_n = sync_wide();
+    let (mirrored, gone) = if jobs_n >= 2 && due.len() >= 1024 {
+        let counts = std::sync::Arc::new([std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)]);
+        let each = due.len().div_ceil(jobs_n);
+        // SAFETY (in the jobs): the host heap of a registered heap, under
+        // the heaps' lock the caller holds until every job is done.
+        let at = std::ptr::from_ref(host) as usize;
+        let jobs: Vec<Box<dyn FnOnce() + Send>> = due
+            .chunks(each)
+            .map(|chunk| {
+                let (chunk, counts) = (chunk.to_vec(), counts.clone());
+                Box::new(move || {
+                    let host = unsafe { &*(at as *const host::HostHeap) };
+                    let (m, g) = mirror_left_run(host, start, step, &chunk);
+                    counts[0].fetch_add(m, Relaxed);
+                    counts[1].fetch_add(g, Relaxed);
+                }) as Box<dyn FnOnce() + Send>
+            })
+            .collect();
+        crate::shadow::wide_run(jobs);
+        (counts[0].load(Relaxed), counts[1].load(Relaxed))
+    } else {
+        mirror_left_run(host, start, step, &due)
+    };
+    let s = &host::SYNC_STATS;
+    s[host::S_LEFT_MIRRORED].fetch_add(mirrored, Relaxed);
+    s[host::S_LEFT_GONE].fetch_add(gone, Relaxed);
+    s[host::S_LEFT_US].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
+}
+
+/// [`mirror_left`] for the records `due` (title slot, record key, by slot):
+/// mirrored and gone.
+#[cfg(windows)]
+fn mirror_left_run(host: &host::HostHeap, start: u64, step: u64, due: &[(u32, u64)]) -> (u64, u64) {
     let (mut mirrored, mut gone) = (0u64, 0u64);
     let mut bytes: Vec<u8> = Vec::new();
     let mut n = 0;
@@ -416,10 +454,7 @@ fn mirror_left(host: &host::HostHeap, start: u64, step: u64) {
         }
         n = end;
     }
-    let s = &host::SYNC_STATS;
-    s[host::S_LEFT_MIRRORED].fetch_add(mirrored, Relaxed);
-    s[host::S_LEFT_GONE].fetch_add(gone, Relaxed);
-    s[host::S_LEFT_US].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
+    (mirrored, gone)
 }
 
 /// How many jobs [`sync_heaps`] splits the records it looks at into, run on
@@ -500,7 +535,9 @@ fn sync_page(
 /// `mirrored_count` slots mirrored), `bytes` being that range as read.
 #[cfg(windows)]
 fn page_records(start: u64, step: u64, mirrored_count: u32, from: usize, to: usize, bytes: &[u8]) -> Vec<(u32, u64, &[u8])> {
-    let mut records: Vec<(u32, u64, &[u8])> = Vec::new();
+    // A page's worth of records at most (one per `step` bytes, and one
+    // straddling): allocated once instead of grown push by push.
+    let mut records: Vec<(u32, u64, &[u8])> = Vec::with_capacity(bytes.len() / (step.max(1) as usize) + 1);
     for index in changed_slots(from, to, start as usize, step, mirrored_count) {
         let handle = start + index * step;
         // A record that straddles the range's ends is left to the range

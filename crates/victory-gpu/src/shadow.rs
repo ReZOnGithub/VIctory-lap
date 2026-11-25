@@ -2023,8 +2023,18 @@ struct Workers {
 }
 
 /// How many threads [`workers`] keeps.
+///
+/// `VICTORY_WIDE_THREADS=N` sets it (1 to 15). Else half the processors,
+/// 2 to 8: with a quarter (4 of 16) the heap sync stood 11 ms a frame
+/// waiting for its jobs (run p4's profile: the pool's threads were busy
+/// with the refreshes' moves and the mirror), while the process kept only
+/// about 5 of 16 processors busy.
 fn kept_threads() -> usize {
-    std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6)
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| match std::env::var("VICTORY_WIDE_THREADS").ok().and_then(|v| v.parse::<usize>().ok()) {
+        Some(n) if n > 0 => n.min(15),
+        _ => std::thread::available_parallelism().map_or(4, |n| n.get() / 2).clamp(2, 8),
+    })
 }
 
 /// The threads a [`wide_run`] runs its jobs on: the kept ones and the
@@ -6322,6 +6332,44 @@ pub(crate) fn card_pieces(address: u64, len: u64) -> Result<Vec<(Arc<Shadow>, u6
         return Err(NotSole::OtherCopy);
     }
     Ok(vec![(first, address, mid - address), (second, mid, end - mid)])
+}
+
+/// For [`card_pieces`]' [`NotSole::OtherCopy`] where title buffers nest
+/// (a buffer placed inside a larger one, both with copies: the title's
+/// transient pool of 174 MB and the buffers it places in it): the copy of
+/// the innermost buffer holding the whole range, as [`find`] gives it, and
+/// the other buffers' copies over any of its bytes (copy, from, to: the
+/// part of the range each holds). Shaders writing through a view of the
+/// outer buffer write the outer copy; the caller takes each part under
+/// flights' writes from whichever copy they were made in
+/// (`crate::host`'s `card_classify`). `None` where a window outside
+/// buffers holds some of the bytes, or the innermost buffer does not hold
+/// all of them.
+pub(crate) fn nested_copies(address: u64, len: u64) -> Option<(Arc<Shadow>, Vec<(Arc<Shadow>, u64, u64)>)> {
+    let end = address.checked_add(len.max(1))?;
+    {
+        let map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        if map.range((address.saturating_sub(64 << 20), 0)..(end, 0)).any(|(k, _)| k.0 + k.1 > address) {
+            return None;
+        }
+    }
+    let inner = find(address, len)?;
+    if inner.left(address) < len {
+        return None;
+    }
+    let others: Vec<(Arc<Shadow>, u64, u64)> = {
+        let map = buffers();
+        map.range(..(end, 0))
+            .rev()
+            .take(256)
+            .filter(|(_, e)| e.end > address)
+            .filter_map(|(k, e)| {
+                let shadow = e.shadow.as_ref()?;
+                (!Arc::ptr_eq(shadow, &inner)).then(|| (shadow.clone(), k.0.max(address), e.end.min(end)))
+            })
+            .collect()
+    };
+    Some((inner, others))
 }
 
 /// The end of the innermost title buffer holding `address`, if one does.

@@ -170,9 +170,27 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     }
     if p.made.get().is_none() {
         start(p, REQUESTED);
-        wait(p, crate::frame::current());
+        if p.graphics.is_none() && compute_waits() {
+            // A dispatch is never left out: what it writes (skinned
+            // vertices, the next pass's buffers) is read by later work,
+            // and a skipped one left meshes stretched across the screen
+            // for frames where a cutscene cut to new pipelines (capture
+            // c1, frames 1796 and 1820, with `VICTORY_PIPELINE_WAIT_MS=30`).
+            // A draw left out is only missing from its frame.
+            p.make();
+        } else {
+            wait(p, crate::frame::current());
+        }
     }
     p.made.get()?.as_ref()
+}
+
+/// Whether a compute pipeline's dispatch waits until it is made, past the
+/// frame's budget (on by default; `VICTORY_PIPELINE_COMPUTE_WAIT=0`: the
+/// budget as for draws, dispatches left out after it).
+fn compute_waits() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_COMPUTE_WAIT").is_none_or(|v| v != "0"))
 }
 
 /// Makes `p` on this thread if it is not made yet (waiting for a worker

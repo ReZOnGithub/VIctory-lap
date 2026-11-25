@@ -138,6 +138,14 @@ enum Console {
 /// and `VICTORY_DISPLAY_MODE` (picked from the host display already).
 const FAST_DEFAULTS: &[(&str, &str)] = &[
     ("VICTORY_CHEAP_LOOKS", "1"),
+    // A draw whose pipeline is still being made is left out for a frame or
+    // two instead of the title waiting up to 500 ms a frame for it (runs
+    // g1, g2: 35-39 s of 240 waited, one 270 ms title stall a frame).
+    ("VICTORY_PIPELINE_WAIT_MS", "30"),
+    // The heap sync's pages and its records left to draws on four threads:
+    // with a lock per group of slots (`descriptor::host::Made`) the jobs no
+    // longer take turns at one lock.
+    ("VICTORY_SYNC_WIDE", "8"),
     ("VICTORY_ASYNC_TEXTURES", "4"),
     ("VICTORY_ASYNC_TEXTURES_MB", "256"),
     ("VICTORY_STAGING_POOL_MB", "128"),
