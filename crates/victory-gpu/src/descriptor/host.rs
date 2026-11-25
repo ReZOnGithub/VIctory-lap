@@ -120,7 +120,10 @@ pub(crate) struct HostHeap {
     /// A fingerprint of the record each slot held when the pass over
     /// records copied in as bytes last looked at it
     /// ([`HostHeap::mirror_copied_many`]; 0: never looked at). Made on first use.
-    copied: Mutex<Vec<u64>>,
+    /// Per slot, atomics: the page jobs of a heap sync (`VICTORY_SYNC_WIDE`)
+    /// each touch their own slots, and under one lock they ran one after
+    /// the other (run p5: half of the jobs' time stood at it).
+    copied: std::sync::OnceLock<Box<[std::sync::atomic::AtomicU64]>>,
     /// Records the pass over records copied in as bytes left to the draws
     /// that read their slots through tables (`VICTORY_HEAP_SYNC_TABLES=2`
     /// or `3`): title slot, record key (as `made` keeps it) and the frame
@@ -1148,7 +1151,7 @@ impl HostHeap {
             null_cbv: (0..if sampler || !(null_skip() || cfg!(test)) { 0 } else { count })
                 .map(|_| std::sync::atomic::AtomicBool::new(false))
                 .collect(),
-            copied: Mutex::new(Vec::new()),
+            copied: std::sync::OnceLock::new(),
             left: Mutex::new(Vec::new()),
             drawn: (0..if sampler || sync_tables() < 2 { 0 } else { count })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
@@ -2159,6 +2162,11 @@ impl HostHeap {
     /// record in order, if they were taken already (`super`'s pre-read of
     /// heap pages, `VICTORY_SYNC_OVERLAP=3`, from the same bytes); else
     /// they are taken here.
+    /// [`HostHeap::copied`], made (all 0) on first use.
+    fn copied_prints(&self) -> &[std::sync::atomic::AtomicU64] {
+        self.copied.get_or_init(|| (0..self.count).map(|_| std::sync::atomic::AtomicU64::new(0)).collect())
+    }
+
     pub(crate) fn mirror_copied_many(&self, records: &[(u32, u64, &[u8])], prints: Option<&[u64]>) -> u64 {
         use std::sync::atomic::Ordering::Relaxed;
         let frame = crate::frame::current();
@@ -2169,10 +2177,7 @@ impl HostHeap {
         let mut made: Vec<(u32, u64, u64)> = Vec::new();
         let mut unchanged = 0u64;
         {
-            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-            if copied.is_empty() && !records.is_empty() {
-                copied.resize(self.count as usize, 0);
-            }
+            let copied = self.copied_prints();
             for (n, &(index, handle, record)) in records.iter().enumerate() {
                 if index >= self.count {
                     continue;
@@ -2181,10 +2186,11 @@ impl HostHeap {
                     Some(p) => p[n],
                     None => record_print(record) | 1,
                 };
-                let Some(last) = copied.get_mut(index as usize) else {
+                let Some(slot) = copied.get(index as usize) else {
                     continue;
                 };
-                if *last == print || (*last == 0 && record.iter().all(|&b| b == 0)) {
+                let last = slot.load(Relaxed);
+                if last == print || (last == 0 && record.iter().all(|&b| b == 0)) {
                     unchanged += 1;
                     continue;
                 }
@@ -2196,7 +2202,7 @@ impl HostHeap {
                     COPIED_TABLED.fetch_add(1, Relaxed);
                     continue;
                 }
-                *last = print;
+                slot.store(print, Relaxed);
                 made.push((index, handle, record_key(record)));
             }
         }
@@ -2557,10 +2563,7 @@ impl HostHeap {
         let mut looked = 0u64;
         let mut due: Vec<(u32, u64)> = Vec::new();
         {
-            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-            if copied.is_empty() {
-                copied.resize(self.count as usize, 0);
-            }
+            let copied = self.copied_prints();
             for index in slots {
                 let handle = start + index * step;
                 // A record that straddles the range's ends is left to the
@@ -2573,14 +2576,15 @@ impl HostHeap {
                 };
                 looked += 1;
                 // None past the host heap's slots, as `mirror_copied`.
-                let Some(last) = copied.get_mut(index as usize) else {
+                let Some(slot) = copied.get(index as usize) else {
                     continue;
                 };
                 // Never 0, which is "never looked at".
                 let print = record_print(record) | 1;
+                let last = slot.load(std::sync::atomic::Ordering::Relaxed);
                 // The record last seen, or a slot never looked at that
                 // holds nothing: as it was.
-                if *last == print || (*last == 0 && record.iter().all(|&b| b == 0)) {
+                if last == print || (last == 0 && record.iter().all(|&b| b == 0)) {
                     continue;
                 }
                 // A table's slot lately: left to its draws, and looked at
@@ -2589,7 +2593,7 @@ impl HostHeap {
                     COPIED_TABLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     continue;
                 }
-                *last = print;
+                slot.store(print, std::sync::atomic::Ordering::Relaxed);
                 due.push((index as u32, handle));
             }
         }

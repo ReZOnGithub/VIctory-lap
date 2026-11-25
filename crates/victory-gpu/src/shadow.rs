@@ -599,6 +599,36 @@ pub(crate) fn card_room_kept() -> u64 {
 /// The copies in the card's memory.
 static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
 
+/// With [`dirty_list`]: the copies in the card's memory by address
+/// (`Arc::as_ptr`), and those whose `dirty` went from empty to not since
+/// [`card_dirty`] last looked. Locked after a copy's `dirty` lock
+/// (`Shadow::card_changed`), never the other way round.
+static CARDED_AT: Mutex<Option<std::collections::HashMap<usize, std::sync::Weak<Shadow>>>> = Mutex::new(None);
+static DIRTY_PENDING: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+/// Whether [`card_dirty`] looks only at copies noted dirty
+/// (`VICTORY_CARD_DIRTY_LIST`, on unless `0`). With every title buffer on
+/// the card (`VICTORY_CARD_BUFFERS_MIN_KB=64`) there are some 9,400 copies,
+/// and every submission (29 a frame) took two locks on each of them: 4.9 ms
+/// a frame on the submitting thread in run p5, nearly all on copies with
+/// nothing to send.
+fn dirty_list() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_DIRTY_LIST").is_none_or(|v| v != "0"))
+}
+
+/// Notes a new copy in the card's memory ([`CARDED`], [`CARDED_AT`]).
+fn carded(shadow: &Arc<Shadow>) {
+    CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(shadow));
+    if dirty_list() {
+        CARDED_AT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(Default::default)
+            .insert(Arc::as_ptr(shadow) as usize, Arc::downgrade(shadow));
+    }
+}
+
 /// Since the last frame line: bytes copied to card sides and the ranges
 /// they were; pieces compared on the card, pieces fetched and their
 /// bytes; the waits for the card the fetches added and their microseconds.
@@ -944,12 +974,57 @@ pub(crate) fn window_asked() -> [u64; 3] {
 /// be merged came after are dropped.
 pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
     let mut out = Vec::new();
-    let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
     let fetched = RELAY_FETCHED.load(Ordering::Acquire);
+    if dirty_list() {
+        let mut pending = std::mem::take(&mut *DIRTY_PENDING.lock().unwrap_or_else(|e| e.into_inner()));
+        pending.sort_unstable();
+        pending.dedup();
+        let shadows: Vec<Arc<Shadow>> = {
+            let mut at = CARDED_AT.lock().unwrap_or_else(|e| e.into_inner());
+            let map = at.get_or_insert_with(Default::default);
+            let found = pending
+                .iter()
+                .filter_map(|p| match map.get(p).map(std::sync::Weak::upgrade) {
+                    Some(Some(shadow)) => Some(shadow),
+                    Some(None) => {
+                        map.remove(p);
+                        None
+                    }
+                    None => None,
+                })
+                .collect();
+            // Now and then the copies gone that were never dirty again.
+            static ROUNDS: AtomicU64 = AtomicU64::new(0);
+            if ROUNDS.fetch_add(1, Ordering::Relaxed) % 1024 == 0 {
+                map.retain(|_, w| w.strong_count() > 0);
+                CARDED.lock().unwrap_or_else(|e| e.into_inner()).retain(|w| w.strong_count() > 0);
+            }
+            found
+        };
+        for shadow in shadows {
+            if let Some(ranges) = card_dirty_one(&shadow, sent_as, fetched) {
+                out.push((shadow, ranges));
+            }
+        }
+        return out;
+    }
+    let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
     carded.retain(|weak| {
         let Some(shadow) = weak.upgrade() else {
             return false;
         };
+        if let Some(ranges) = card_dirty_one(&shadow, sent_as, fetched) {
+            out.push((shadow, ranges));
+        }
+        true
+    });
+    out
+}
+
+/// [`card_dirty`] of one copy: its changed offsets, taken and joined, if
+/// any.
+fn card_dirty_one(shadow: &Arc<Shadow>, sent_as: u64, fetched: u64) -> Option<Vec<(usize, usize)>> {
+    {
         let ranges = shadow
             .card
             .as_ref()
@@ -977,11 +1052,10 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
                 let bytes: usize = ranges.iter().map(|&(a, b)| b - a).sum();
                 WINDOW_CARD_STATS[window_stats::SENT].fetch_add(bytes as u64, Ordering::Relaxed);
             }
-            out.push((shadow, ranges));
+            return Some(ranges);
         }
-        true
-    });
-    out
+        None
+    }
 }
 
 /// Ranges in order, those that overlap or touch as one.
@@ -6105,6 +6179,9 @@ impl Shadow {
             return;
         }
         let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+        if dirty.is_empty() && dirty_list() {
+            DIRTY_PENDING.lock().unwrap_or_else(|e| e.into_inner()).push(std::ptr::from_ref(self) as usize);
+        }
         match dirty.last_mut() {
             Some(last) if from <= last.1 && to >= last.0 => *last = (last.0.min(from), last.1.max(to)),
             _ => dirty.push((from, to)),
@@ -6674,17 +6751,30 @@ pub(crate) fn card_pieces(address: u64, len: u64) -> Result<Vec<(Arc<Shadow>, u6
 /// all of them.
 pub(crate) fn nested_copies(address: u64, len: u64) -> Option<(Arc<Shadow>, Vec<(Arc<Shadow>, u64, u64)>)> {
     let end = address.checked_add(len.max(1))?;
-    {
+    // Windows outside buffers over the bytes: alternates like the outer
+    // buffers' copies (`VICTORY_CARD_NESTED_WINDOWS=0`: none taken, as
+    // before). A part flights wrote in a window on the card is copied from
+    // it; one written in a window in the PC's memory still makes the fill
+    // wait (`CardView::under_writes`). Run c2: the waits left with every
+    // buffer on the card were all small shader-written buffers inside the
+    // pool that a window also covered.
+    let windows: Vec<(Arc<Shadow>, u64, u64)> = {
         let map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
-        if map.range((address.saturating_sub(64 << 20), 0)..(end, 0)).any(|(k, _)| k.0 + k.1 > address) {
+        let over: Vec<(Arc<Shadow>, u64, u64)> = map
+            .range((address.saturating_sub(64 << 20), 0)..(end, 0))
+            .filter(|(k, _)| k.0 + k.1 > address)
+            .map(|(k, shadow)| (shadow.clone(), k.0.max(address), (k.0 + k.1).min(end)))
+            .collect();
+        if !over.is_empty() && !nested_windows() {
             return None;
         }
-    }
+        over
+    };
     let inner = find(address, len)?;
     if inner.left(address) < len {
         return None;
     }
-    let others: Vec<(Arc<Shadow>, u64, u64)> = {
+    let mut others: Vec<(Arc<Shadow>, u64, u64)> = {
         let map = buffers();
         map.range(..(end, 0))
             .rev()
@@ -6696,7 +6786,15 @@ pub(crate) fn nested_copies(address: u64, len: u64) -> Option<(Arc<Shadow>, Vec<
             })
             .collect()
     };
+    others.extend(windows.into_iter().filter(|w| !Arc::ptr_eq(&w.0, &inner)));
     Some((inner, others))
+}
+
+/// Whether [`nested_copies`] takes windows outside buffers over the bytes
+/// as alternates (`VICTORY_CARD_NESTED_WINDOWS`, on unless `0`).
+fn nested_windows() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_NESTED_WINDOWS").is_none_or(|v| v != "0"))
 }
 
 /// The end of the innermost title buffer holding `address`, if one does.
@@ -6795,7 +6893,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         shadow.bar = bar;
         let shadow = Arc::new(shadow);
         if shadow.card.is_some() {
-            CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+            carded(&shadow);
         }
         entry.shadow = Some(shadow);
     }
@@ -7058,7 +7156,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     shadow.bar = bar;
     let shadow = Arc::new(shadow);
     if shadow.card.is_some() {
-        CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+        carded(&shadow);
     }
     note(&shadow);
     map.insert((start, len), shadow.clone());

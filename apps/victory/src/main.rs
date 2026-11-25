@@ -146,7 +146,12 @@ const FAST_DEFAULTS: &[(&str, &str)] = &[
     // with a lock per group of slots (`descriptor::host::Made`) the jobs no
     // longer take turns at one lock.
     ("VICTORY_SYNC_WIDE", "8"),
+    // Every title buffer's copy in the card's memory: the card's time for
+    // the title's lists 100 -> 50 ms a frame (runs c1-c3), the table views
+    // under flights' writes copied on the card instead of waited for.
     ("VICTORY_CARD_BUFFERS_MIN_KB", "64"),
+    ("VICTORY_CARD_BUFFERS_MB", "3072"),
+    ("VICTORY_TABLE_GPU_COPY", "1"),
     ("VICTORY_ASYNC_TEXTURES", "4"),
     ("VICTORY_ASYNC_TEXTURES_MB", "256"),
     ("VICTORY_STAGING_POOL_MB", "128"),
