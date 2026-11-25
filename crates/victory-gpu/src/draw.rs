@@ -1484,6 +1484,15 @@ impl State {
     /// shortcut: the render target views are made again from the handles'
     /// descriptors as they are now, not as they were when the title set
     /// the targets (a descriptor rewritten in between names another view).
+    /// A compute pipeline and root signature of ours were set on the host
+    /// list (`crate::list`'s copy on the card): the title's are set again by
+    /// its next dispatch (`bind`), its root arguments as every dispatch sets
+    /// them.
+    pub(crate) fn forget_compute(&mut self) {
+        self.host_pipeline = 0;
+        self.host_roots[1] = 0;
+    }
+
     pub(crate) fn replay(&mut self, list: &HostList) {
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
@@ -2318,7 +2327,9 @@ impl State {
             // fails the next check, as the host slot is made from that one.
             let words = crate::descriptor::record_words(handle);
             let mirroring = std::time::Instant::now();
+            crate::descriptor::host::PASS_SLOT.set(index);
             let view = host.mirror(index, handle, true);
+            crate::descriptor::host::PASS_SLOT.set(u32::MAX);
             let mirrored = std::time::Instant::now();
             let spent = (mirrored - mirroring).as_nanos() as u64;
             mirror_ns += spent;

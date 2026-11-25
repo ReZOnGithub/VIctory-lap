@@ -945,7 +945,16 @@ extern "system" fn copy_buffer_region(
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
     {
-        if !gpu_copy(list, to as u64, from as u64, len) {
+        let mut on_card = false;
+        if gpu_copies() {
+            with_list_state(this, list, |list, state| {
+                on_card = gpu_copy(list, to as u64, from as u64, len);
+                if on_card {
+                    state.forget_compute();
+                }
+            });
+        }
+        if !on_card {
             list.defer_copy(to, from, len as usize);
         }
     }
@@ -953,26 +962,84 @@ extern "system" fn copy_buffer_region(
     let _ = (this, dst, dst_offset, src, src_offset, len);
 }
 
+/// Whether title buffer copies between copies in the card's memory are
+/// done by the card ([`gpu_copy`]); `VICTORY_GPU_COPIES=0`: on the CPU at
+/// submission, as before.
+#[cfg(windows)]
+fn gpu_copies() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_COPIES").is_none_or(|v| v != "0")) && crate::host::late()
+}
+
+/// The copy shader of [`gpu_copy`]: `bytes` bytes (a multiple of 4) from
+/// `t0` to `u0`, 16 a thread, `groups` groups looping over the rest.
+#[cfg(windows)]
+const COPY_SHADER: &str = r#"
+#define RS "RootConstants(num32BitConstants=2, b0), SRV(t0), UAV(u0)"
+cbuffer C : register(b0) { uint bytes; uint groups; };
+ByteAddressBuffer src : register(t0);
+RWByteAddressBuffer dst : register(u0);
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 g : SV_GroupID, uint t : SV_GroupIndex) {
+    for (uint at = (g.x * 64u + t) * 16u; at < bytes; at += groups * 1024u) {
+        if (at + 16u <= bytes) {
+            dst.Store4(at, src.Load4(at));
+        } else {
+            for (uint b = at; b < bytes; b += 4u) {
+                dst.Store(b, src.Load(b));
+            }
+        }
+    }
+}
+"#;
+
+/// The root signature and pipeline of [`COPY_SHADER`], made once.
+#[cfg(windows)]
+fn copier() -> Option<&'static (windows::Win32::Graphics::Direct3D12::ID3D12RootSignature, windows::Win32::Graphics::Direct3D12::ID3D12PipelineState)> {
+    static MADE: std::sync::OnceLock<Option<(windows::Win32::Graphics::Direct3D12::ID3D12RootSignature, windows::Win32::Graphics::Direct3D12::ID3D12PipelineState)>> = std::sync::OnceLock::new();
+    MADE.get_or_init(|| {
+        let made = (|| -> windows::core::Result<(windows::Win32::Graphics::Direct3D12::ID3D12RootSignature, windows::Win32::Graphics::Direct3D12::ID3D12PipelineState)> {
+            let host = crate::host::host().ok_or_else(windows::core::Error::empty)?;
+            let code = crate::host::compile(COPY_SHADER, windows::core::s!("main"), windows::core::s!("cs_5_1"))?;
+            // SAFETY: our compiled bytes, the root signature inside them.
+            unsafe {
+                let root: windows::Win32::Graphics::Direct3D12::ID3D12RootSignature = host.device.CreateRootSignature(0, &code)?;
+                let pso: windows::Win32::Graphics::Direct3D12::ID3D12PipelineState = host.device.CreateComputePipelineState(&windows::Win32::Graphics::Direct3D12::D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: windows::Win32::Graphics::Direct3D12::D3D12_SHADER_BYTECODE { pShaderBytecode: code.as_ptr().cast(), BytecodeLength: code.len() },
+                    ..Default::default()
+                })?;
+                Ok((root, pso))
+            }
+        })();
+        made.map_err(|e| tracing::warn!(error = %e, "no copy shader: title buffer copies stay on the CPU")).ok()
+    })
+    .as_ref()
+}
+
 /// A title buffer copy between two buffers whose host copies are in the
-/// card's memory, done by the card in the list's order, as on the console
-/// (`VICTORY_GPU_COPIES=1`; off by default: the copy is fenced by UAV barriers
-/// only, which do not order a copy's writes before later shader reads, and
-/// objects were drawn out of place). The
-/// destination is declared written, as a shader's write is: what the copy
-/// put there goes back into title memory when the list has run.
+/// card's memory, done by the card in the list's order, as on the console,
+/// by a compute shader of ours (on by default; `VICTORY_GPU_COPIES=0`: on
+/// the CPU). The destination is declared written, as a shader's write is:
+/// what the copy put there goes back into title memory when the list has
+/// run, and steps that read it see a shader write ahead of them.
 ///
 /// Done on the CPU at submission, a copy reading memory that submissions
 /// still on the card may write made the CPU wait for all of them before
-/// preparing the next (`crate::host::late`): with the card busy, up to
-/// 160 ms a frame in the world.
+/// preparing the next (`crate::host::late`): with the card busy, 15-20 ms
+/// a frame in the world, the one "title memory read" settle left.
+///
+/// A shader and not `CopyBufferRegion`: the copies' buffers are used as
+/// shaders' unordered access buffers throughout, and the unordered access
+/// barriers this layer puts between shader writes and reads order a
+/// shader's writes; a copy's writes they do not (the first form, with
+/// `CopyBufferRegion`, drew objects out of place).
 #[cfg(windows)]
 fn gpu_copy(list: &crate::host::HostList, to: u64, from: u64, len: u64) -> bool {
     use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("VICTORY_GPU_COPIES").is_some_and(|v| v == "1")) || len == 0 {
-        return false;
-    }
-    if !crate::host::late() {
+    // 4-byte steps, at most 64 MiB a copy.
+    if len == 0 || len % 4 != 0 || to % 4 != 0 || from % 4 != 0 || len > 64 << 20 {
         return false;
     }
     let (Some(d), Some(s)) = (crate::shadow::find(to, len), crate::shadow::find(from, len)) else {
@@ -984,28 +1051,49 @@ fn gpu_copy(list: &crate::host::HostList, to: u64, from: u64, len: u64) -> bool 
     if !d.carded() || !s.carded() || d.left(to) < len || s.left(from) < len {
         return false;
     }
-    // One buffer: the host copies a region only if source and destination
-    // do not overlap.
+    // One buffer: no overlap (threads would read what others wrote).
     if std::sync::Arc::ptr_eq(&d, &s) && to < from + len && from < to + len {
+        return false;
+    }
+    let Some((root, pso)) = copier() else {
+        return false;
+    };
+    let (dst_gpu, src_gpu) = (d.gpu(to), s.gpu(from));
+    if dst_gpu % 4 != 0 || src_gpu % 4 != 0 {
         return false;
     }
     s.refresh(list, from, len);
     d.refresh(list, to, len);
     d.gpu_writes(list, to, len);
+    let groups = (len.div_ceil(1024) as u32).clamp(1, 65_535);
+    let constants = [len as u32, groups];
     // SAFETY: the same layout; no resource named (every shader write).
     let wait = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
     // SAFETY: an open list; both host copies live (the refreshes and the
     // declared write hold them until the list is reset); regions inside
-    // them, not overlapping.
+    // them, not overlapping; our root signature and pipeline.
     unsafe {
         list.list.ResourceBarrier(&[wait.clone()]);
-        list.list.CopyBufferRegion(&d.buffer, d.offset(to), &s.buffer, s.offset(from), len);
+        list.list.SetComputeRootSignature(root);
+        list.list.SetPipelineState(pso);
+        list.list.SetComputeRoot32BitConstants(0, 2, constants.as_ptr().cast(), 0);
+        list.list.SetComputeRootShaderResourceView(1, src_gpu);
+        list.list.SetComputeRootUnorderedAccessView(2, dst_gpu);
+        list.list.Dispatch(groups, 1, 1);
         list.list.ResourceBarrier(&[wait]);
     }
+    list.note_waited();
     // An indirect call may read what it wrote.
     list.note_writes();
+    GPU_COPIED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    GPU_COPIED[1].fetch_add(len, std::sync::atomic::Ordering::Relaxed);
     true
 }
+
+/// Title buffer copies done on the card ([`gpu_copy`]) and their bytes,
+/// since the start.
+#[cfg(windows)]
+pub(crate) static GPU_COPIED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// Whether one of two resources is a target in a stand-in format and the
 /// other is not ([`crate::resource::target_format`]): their texels differ

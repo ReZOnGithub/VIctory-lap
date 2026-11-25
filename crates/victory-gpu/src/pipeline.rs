@@ -204,6 +204,7 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
+                crate::shader_cache::keep_container(&self.hash.to_string(), &self.stage.to_string(), &self.container);
                 let done = translate(&self.container);
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with

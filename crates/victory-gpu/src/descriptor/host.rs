@@ -1808,7 +1808,11 @@ impl HostHeap {
         } else {
             buffers.remove(&index)
         };
-        if was {
+        // Not for the slot the heap pass is resolving now: it has the
+        // slot's new view in hand, and marked changed again it was walked a
+        // second time at the next pass for nothing (some 20,000 slots a
+        // frame in the world). `VICTORY_HEAP_PASS_ECHO=1`: marked as before.
+        if was && !(PASS_SLOT.get() == index && !pass_echo()) {
             self.changed
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -2169,6 +2173,22 @@ impl HostHeap {
         let mut class_n = [0u64; 4];
         let mut run: Option<(usize, std::time::Instant)> = None;
         SYNCING.set(true);
+        // Bytes that are no record of ours, all at once first: each made
+        // its slot null through `mirror` with every set's lock taken once
+        // per record (7,852 a frame in the world, 20.9 ms). Done before the
+        // views of the page, the slots end as they would in order: a placed
+        // view that makes an older one stale finds a nulled slot out of
+        // the placed spans already, and makes nothing of it.
+        if null_batch() {
+            let nones: Vec<u32> = made.iter().filter(|m| m.2 == 0).map(|m| m.0).collect();
+            if !nones.is_empty() {
+                let at = std::time::Instant::now();
+                self.null_many(&nones);
+                class_us[3] += at.elapsed().as_micros() as u64;
+                class_n[3] += nones.len() as u64;
+                made.retain(|m| m.2 != 0);
+            }
+        }
         for &(index, handle, key) in &made {
             let class = if key == 0 { 3 } else { (key_class(key) as usize).min(3) };
             if run.is_none_or(|(c, _)| c != class) {
@@ -2297,6 +2317,73 @@ impl HostHeap {
         key != 0
             && read.load(Relaxed) == key
             && (stamp.load(Relaxed).wrapping_sub(seq.wrapping_sub(1)) as i32) >= 0
+    }
+
+    /// What [`HostHeap::mirror`] (not for a draw) does for each of `indices`
+    /// whose record is no view of ours: a slot made from something is made
+    /// null and leaves the texture queue, the placed spans, the buffer
+    /// slots and the stride table; one made from nothing is left as it is.
+    /// Each lock is taken once for all of them.
+    fn null_many(&self, indices: &[u32]) {
+        let mut nulled: Vec<u32> = Vec::with_capacity(indices.len());
+        {
+            let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            for &index in indices {
+                outcome(O_NONE);
+                if let Some(slot) = made.get_mut(index as usize)
+                    && *slot != 0
+                {
+                    *slot = 0;
+                    nulled.push(index);
+                }
+            }
+            for &index in &nulled {
+                if self.sampler {
+                    self.null_sampler(index);
+                } else {
+                    null_view(self.cpu(index));
+                }
+                self.set_null_cbv(index, false);
+            }
+        }
+        if nulled.is_empty() {
+            return;
+        }
+        let olds: Vec<ID3D12Resource> = {
+            let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+            nulled.iter().filter_map(|&i| kept.get_mut(i as usize).and_then(Option::take)).collect()
+        };
+        for old in olds {
+            crate::host::retire(old);
+        }
+        if self.sampler {
+            return;
+        }
+        {
+            let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+            for &index in &nulled {
+                textures.remove(index);
+            }
+        }
+        {
+            let mut placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
+            for &index in &nulled {
+                placed.forget(index);
+            }
+        }
+        if let Some((_, _, data, _)) = &self.strides {
+            for &index in nulled.iter().filter(|&&i| i < victory_shader::emit::SLOT_STRIDES_COUNT) {
+                // SAFETY: inside the mapping (as `note_buffer`).
+                unsafe { (*data as *mut u32).add(index as usize).write_volatile(0) };
+            }
+        }
+        let was: Vec<u32> = {
+            let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+            nulled.iter().copied().filter(|i| buffers.remove(i)).collect()
+        };
+        if !was.is_empty() {
+            self.changed.lock().unwrap_or_else(|e| e.into_inner()).extend(was);
+        }
     }
 
     /// [`HostHeap::mirror`] for the pass over records copied in as bytes,
@@ -2958,6 +3045,25 @@ pub(crate) const S_PRE_US: usize = 29;
 pub(crate) const S_PRE_USED: usize = 30;
 pub(crate) const S_PRE_STALE: usize = 31;
 pub(crate) const S_N: usize = 32;
+
+/// Whether the heap sync makes the slots of records that are no view of
+/// ours null all at once ([`HostHeap::null_many`]); `VICTORY_SYNC_NULL_BATCH=0`:
+/// one at a time through `mirror`, as before.
+fn null_batch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SYNC_NULL_BATCH").is_none_or(|v| v != "0"))
+}
+
+thread_local! {
+    /// The title slot the heap pass over buffer views (`crate::draw`'s
+    /// `heap_buffers`) resolves on this thread now, or `u32::MAX`.
+    pub(crate) static PASS_SLOT: std::cell::Cell<u32> = const { std::cell::Cell::new(u32::MAX) };
+}
+
+fn pass_echo() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_PASS_ECHO").is_some_and(|v| v == "1"))
+}
 
 /// Counts what `mirror` did, when the sync called it.
 fn outcome(what: usize) {

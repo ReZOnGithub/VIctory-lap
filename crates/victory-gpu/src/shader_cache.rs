@@ -22,8 +22,18 @@ static CACHE: OnceLock<Cache> = OnceLock::new();
 static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
 
+/// The folder of the title's shader containers as it gave them
+/// ([`keep_container`]), beside the cache.
+static LIBRARY: OnceLock<PathBuf> = OnceLock::new();
+
 /// Keeps translated shaders in `dir` from now on.
 pub fn use_shader_cache(dir: PathBuf) {
+    if std::env::var_os("VICTORY_SHADER_LIBRARY").is_none_or(|v| v != "0") {
+        let library = dir.with_file_name("library");
+        if std::fs::create_dir_all(&library).is_ok() {
+            let _ = LIBRARY.set(library);
+        }
+    }
     match Cache::open(dir) {
         Ok(cache) => {
             let _ = CACHE.set(cache);
@@ -83,9 +93,14 @@ fn build() -> [u8; 32] {
         h.update(exe);
     }
     h.update(&victory_shader::emit::translation_fingerprint());
-    h.update(include_bytes!("shader_cache.rs"));
+    // The entry encoding's version, not this whole file: any edit here (the
+    // library, the warm-up) threw away every cached translation.
+    h.update(&ENCODING.to_le_bytes());
     *h.finalize().as_bytes()
 }
+
+/// The version of `encode`/`decode`'s format: raise it when either changes.
+const ENCODING: u32 = 1;
 
 /// The offline warm-up (`victory translate --warm`): `container` is
 /// translated into the cache unless it is there already. `Ok(true)`: it
@@ -93,6 +108,14 @@ fn build() -> [u8; 32] {
 /// the run will have (`victory_shader::emit::translation_fingerprint`).
 pub fn warm(container: &[u8]) -> Result<bool, String> {
     let cache = CACHE.get().ok_or("no shader cache")?;
+    // The host facts the key holds (the card's wave size, the view heap's
+    // null slot) come from the device: made once here as a run makes it, or
+    // the warm-up filed every translation under a key no run asks for.
+    static DEVICE: std::sync::Once = std::sync::Once::new();
+    DEVICE.call_once(|| {
+        let _ = crate::host::host();
+        crate::descriptor::host::probe_view_limit();
+    });
     let ran = AtomicBool::new(false);
     let translate = |c: &[u8]| {
         ran.store(true, Ordering::Relaxed);
@@ -101,9 +124,114 @@ pub fn warm(container: &[u8]) -> Result<bool, String> {
     cached(cache, &build(), container, translate).map(|_| ran.load(Ordering::Relaxed))
 }
 
+/// Keeps a container the title gave in the library ([`LIBRARY`]) once, by
+/// its hash and stage, for the warm-up of later runs ([`warm_library`]).
+pub(crate) fn keep_container(hash: &str, stage: &str, container: &[u8]) {
+    static KEPT: std::sync::Mutex<Option<std::collections::HashSet<String>>> = std::sync::Mutex::new(None);
+    let Some(library) = LIBRARY.get() else {
+        return;
+    };
+    let name = format!("{hash}.{stage}.cdxil");
+    {
+        let mut kept = KEPT.lock().unwrap_or_else(|e| e.into_inner());
+        if !kept.get_or_insert_with(Default::default).insert(name.clone()) {
+            return;
+        }
+    }
+    let path = library.join(&name);
+    if path.exists() {
+        return;
+    }
+    // Written aside and renamed: a warm-up never reads half a file.
+    let part = library.join(format!("{name}.part"));
+    if std::fs::write(&part, container).is_ok() {
+        let _ = std::fs::rename(&part, &path);
+    }
+}
+
+/// Translates every container of the library ([`LIBRARY`]) into the cache
+/// in the background, oldest first (the order the title first used them),
+/// on half the processor's threads at lowered priority. Each shader was
+/// translated at its first draw: after a build that changed the
+/// translator, every one of the title's thousands of shaders again, one at
+/// a time, inside the frames (seconds a frame for minutes). Started at the
+/// first translation asked for, when the host's device exists (its facts
+/// are in the cache key). `VICTORY_SHADER_LIBRARY=0`: no library, no
+/// warm-up.
+fn warm_library() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let Some(library) = LIBRARY.get().cloned() else {
+            return;
+        };
+        let _ = std::thread::Builder::new().name("shader warm-up".into()).spawn(move || {
+            let mut files: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(&library)
+                .into_iter()
+                .flatten()
+                .filter_map(Result::ok)
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|x| x == "cdxil"))
+                .map(|p| (std::fs::metadata(&p).and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH), p))
+                .collect();
+            if files.is_empty() {
+                return;
+            }
+            files.sort();
+            let threads = std::thread::available_parallelism().map_or(4, |n| n.get() / 2).max(1);
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            let counts = [const { AtomicU64::new(0) }; 3];
+            let began = std::time::Instant::now();
+            std::thread::scope(|scope| {
+                for _ in 0..threads {
+                    scope.spawn(|| {
+                        lower_priority();
+                        loop {
+                            let i = next.fetch_add(1, Ordering::Relaxed);
+                            let Some((_, path)) = files.get(i) else {
+                                break;
+                            };
+                            let Ok(bytes) = std::fs::read(path) else {
+                                continue;
+                            };
+                            let k = match warm(&bytes) {
+                                Ok(true) => 0,
+                                Ok(false) => 1,
+                                Err(_) => 2,
+                            };
+                            counts[k].fetch_add(1, Ordering::Relaxed);
+                        }
+                    });
+                }
+            });
+            let [made, there, failed] = counts.map(|c| c.load(Ordering::Relaxed));
+            tracing::info!(
+                made,
+                there,
+                failed,
+                threads,
+                seconds = began.elapsed().as_secs_f64(),
+                "shader warm-up from the library done (VICTORY_SHADER_LIBRARY=0: none)"
+            );
+        });
+    });
+}
+
+#[cfg(windows)]
+fn lower_priority() {
+    use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL};
+    // SAFETY: the pseudo handle of the calling thread.
+    unsafe {
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    }
+}
+
+#[cfg(not(windows))]
+fn lower_priority() {}
+
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
+    warm_library();
     let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
     match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate),
