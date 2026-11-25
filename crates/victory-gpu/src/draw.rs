@@ -2723,8 +2723,7 @@ impl State {
         let taking = std::time::Instant::now();
         host.texture_slots_remapped(frame);
         let remapped = taking.elapsed();
-        // Levels on demand: the slots of textures whose first level with
-        // memory changed since the last pass are made again from it.
+        // Levels on demand: rebuild slots whose resident mips have changed.
         host.texture_views_remade();
         // And with room, the textures whose upload left a held level
         // without the card's memory are uploaded again.
