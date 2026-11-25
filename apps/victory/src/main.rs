@@ -130,7 +130,72 @@ enum Console {
     SeriesS,
 }
 
+/// The frame-rate settings measured together in fork PR #995 (its
+/// `docs/fps-notes.md`, 2.5 -> 7.5 frames a second on an RTX 5070 Ti), set
+/// for every switch the environment leaves unset. `VICTORY_FAST_DEFAULTS=0`:
+/// none of them. Left out of that list: `VICTORY_WAVE_WIDE=0` (it drops the
+/// wave-wide visibility and tiling passes: walls missing on 32-lane cards)
+/// and `VICTORY_DISPLAY_MODE` (picked from the host display already).
+const FAST_DEFAULTS: &[(&str, &str)] = &[
+    ("VICTORY_CHEAP_LOOKS", "1"),
+    ("VICTORY_ASYNC_TEXTURES", "4"),
+    ("VICTORY_ASYNC_TEXTURES_MB", "256"),
+    ("VICTORY_STAGING_POOL_MB", "128"),
+    ("VICTORY_HEAP_TEXTURE_MS", "60"),
+    ("VICTORY_HEAP_ROLLING_RESCAN", "1"),
+    ("VICTORY_LATE_WAIT", "3"),
+    ("VICTORY_WIDE_BACK", "1"),
+    ("VICTORY_JOIN_FETCH", "1"),
+    ("VICTORY_CARD_BUFFERS_MIN_MB", "1"),
+    ("VICTORY_CARD_BUFFERS_MB", "1024"),
+    ("VICTORY_COMMIT_FLOOR_MB", "6144"),
+    ("VICTORY_DECLARE_ONCE", "0"),
+    ("VICTORY_FINE_PAGES", "1"),
+    ("VICTORY_HEAP_SLOT_CACHE", "1"),
+    ("VICTORY_ASK_ONCE_VIEWS", "1"),
+    ("VICTORY_WIDE_COPY", "1"),
+    ("VICTORY_WIDE_MERGE", "1"),
+    ("VICTORY_WIDE_FILLS", "1"),
+    ("VICTORY_CARD_NO_PC_COPY", "0"),
+    ("VICTORY_HEAP_RECHECK", "0"),
+    ("VICTORY_REUPLOAD_WHEN_FULL", "0"),
+    ("VICTORY_VIEW_GUARD", "0"),
+    ("VICTORY_HEAP_SYNC_TABLES", "2"),
+    ("VICTORY_TABLE_INDEXED", "1"),
+    ("VICTORY_GPU_UPLOAD_COPIES", "1"),
+    ("VICTORY_GPU_UPLOAD_COPIES_MB", "4096"),
+    ("VICTORY_TABLE_ON_CARD", "1"),
+    ("VICTORY_INDIRECT_BATCH", "3"),
+    // (windows and batched clamps do not go together: PR #995)
+    ("VICTORY_INDIRECT_WINDOW", "0"),
+    ("VICTORY_GUARD_PLACEHOLDERS", "1"),
+    ("VICTORY_AHEAD_INDEX", "1"),
+    ("VICTORY_VIEWS_TRIM", "1"),
+    ("VICTORY_VIEW_KNOWN", "1"),
+    ("VICTORY_DECLARED_WIDE", "1"),
+    ("VICTORY_WIDE_TEXTURES", "1"),
+    ("VICTORY_STALE_ONCE", "1"),
+    ("VICTORY_CARD_FETCH_INFLIGHT", "2"),
+    ("VICTORY_SYNC_NULL_SKIP", "1"),
+    // Copies of title memory made in place (fork 0b0074e: the submit
+    // thread's kernel time 44 -> 20 ms a frame, the picture the same).
+    ("VICTORY_COPY_PLAIN", "1"),
+];
+
+fn fast_defaults() {
+    if std::env::var_os("VICTORY_FAST_DEFAULTS").is_some_and(|v| v == "0") {
+        return;
+    }
+    for (name, value) in FAST_DEFAULTS {
+        if std::env::var_os(name).is_none() {
+            // SAFETY: first thing in `main`, before any other thread starts.
+            unsafe { std::env::set_var(name, value) };
+        }
+    }
+}
+
 fn main() -> Result<()> {
+    fast_defaults();
     victory_core::logging::init("info");
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]
