@@ -7006,7 +7006,12 @@ impl<'a> Lower<'a> {
             }
             return r;
         }
-        let mut guard = self.guard(b, i)?;
+        // A scalar result (`v_readlane`, `v_readfirstlane`) is written
+        // whatever EXEC holds.
+        let mut guard = match v.dst {
+            Some(Operand::Scalar { .. }) => None,
+            _ => self.guard(b, i)?,
+        };
         if let Some(d) = v.dpp {
             let (x, enable) = self.dpp(inst, d)?;
             guard = match (guard, enable) {
