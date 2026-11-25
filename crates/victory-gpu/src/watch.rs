@@ -933,7 +933,7 @@ pub(crate) fn wrote_own(page: usize, others: &[usize]) -> (u64, u64) {
 /// never). Read only, for `crate::backreads`.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn stamp(page: usize) -> u64 {
-    JOURNAL.lock().unwrap_or_else(|e| e.into_inner()).written.get(&page).copied().unwrap_or(0)
+    JOURNAL.lock().unwrap_or_else(|e| e.into_inner()).written.pages.get(&page).copied().unwrap_or(0)
 }
 
 /// One kernel asking for `pieces` (page ranges in order); by halves if it
@@ -1684,6 +1684,13 @@ impl Hot {
             }
         }
     }
+}
+
+/// Whether the block `page` is read-only by our hand and unwritten since a
+/// copy took it (diagnostics: `crate::backreads`).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn clean(page: usize) -> bool {
+    guards().clean.contains(page)
 }
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {

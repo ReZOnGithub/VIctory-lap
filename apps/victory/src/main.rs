@@ -146,6 +146,7 @@ const FAST_DEFAULTS: &[(&str, &str)] = &[
     // with a lock per group of slots (`descriptor::host::Made`) the jobs no
     // longer take turns at one lock.
     ("VICTORY_SYNC_WIDE", "8"),
+    ("VICTORY_CARD_BUFFERS_MIN_KB", "64"),
     ("VICTORY_ASYNC_TEXTURES", "4"),
     ("VICTORY_ASYNC_TEXTURES_MB", "256"),
     ("VICTORY_STAGING_POOL_MB", "128"),
