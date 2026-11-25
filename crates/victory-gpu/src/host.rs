@@ -705,7 +705,19 @@ impl WorkMark {
 /// once (both hold the heaps' lock throughout); a pass and the sweep do not
 /// either ([`ALONG_GATE`]). A pass beside the preparing is what `1` did.
 pub(crate) fn sync_overlap() -> bool {
-    sync_overlap_level() == 1
+    matches!(sync_overlap_level(), 1 | 4)
+}
+
+/// `VICTORY_SYNC_OVERLAP=4`: the sync of `1` on its own thread, beside
+/// only the submission's write-watch asking and stale checks, and joined
+/// before the steps run (`1` joined after them). What garbled `1` and `2`
+/// (runs n42, n45) was host slots made while a submission's steps ran;
+/// here every slot the sync makes is there before the first step, as with
+/// `0`. The asking and the stale checks take the write journal and the
+/// guards (as the sync does, under their locks) and the copies' own locks,
+/// and neither makes nor reads host slots.
+fn sync_join_early() -> bool {
+    sync_overlap_level() == 4
 }
 
 /// `VICTORY_SYNC_OVERLAP`: 0 (off), 1 (beside the preparing), 2 (all
@@ -727,6 +739,7 @@ fn sync_overlap_level() -> u8 {
         Some("1") => 1,
         Some("2") => 2,
         Some("3") => 3,
+        Some("4") => 4,
         _ => 0,
     })
 }
@@ -2168,6 +2181,17 @@ fn card_budget() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_CARD_BUDGET").is_none_or(|v| v != "0"))
 }
 
+/// Whether shader writes to title memory in place (`crate::inplace`) are
+/// held as written by their flight (`VICTORY_INPLACE_DECLARED`, on unless
+/// `0`). With [`late`] a flight's shaders write title memory there while
+/// later submissions are prepared; without the note a fill or a title copy
+/// read those bytes before the card wrote them (why `crate::inplace`
+/// warned against level 2 with late wait).
+pub(crate) fn inplace_declared() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INPLACE_DECLARED").is_none_or(|v| v != "0"))
+}
+
 /// Whether each list of a submission runs and is timed on its own, slow
 /// ones logged with their commands (`VICTORY_GPU_TIMING`, diagnostics
 /// builds; the commands are noted with `VICTORY_D3D12_DRED` on).
@@ -3087,6 +3111,12 @@ struct Deferred {
     back_wanted: Vec<crate::texback::Target>,
     /// Those copies, whose texels go to title memory once the list has run.
     texture_backs: Vec<crate::texback::Back>,
+    /// Title memory (from, to) the list's shaders may write in place
+    /// (`crate::inplace`): nothing to copy back, but with [`late`] the
+    /// flight's line holds it as written, so that what reads it on the
+    /// CPU (fills, title copies) waits for the flight as for a copy's
+    /// declared range ([`inplace_declared`]).
+    inplace_writes: Vec<(usize, usize)>,
     /// Whether the indirect-work budget is zeroed for this recording (a
     /// step on the CPU, or in the list for the card's copy).
     budget_zeroed: bool,
@@ -10619,6 +10649,19 @@ impl Host {
             settled += settling.elapsed();
         }
         mark.to(work::ASK);
+        // `VICTORY_SYNC_OVERLAP=4`: the sync beside ends here, before any
+        // step reads host slots; then the slots that waited for a
+        // texture's host copy, those it added among them.
+        if beside && sync_join_early() {
+            let joining = std::time::Instant::now();
+            sync_beside_join(&mut beside);
+            PATH[path::JOIN_LATE_US].fetch_add(joining.elapsed().as_micros() as u64, Ordering::Relaxed);
+            mark.to(work::SYNC);
+            let waiting_slots = std::time::Instant::now();
+            crate::descriptor::make_waiting();
+            prep_add(prep::WAITING_SLOTS, waiting_slots);
+            mark.to(work::ASK);
+        }
         // A settle since the plan copied everything back: title memory
         // holds what the flights wrote, and the fills read it there.
         if SETTLES_DONE.load(Ordering::Relaxed) == settles_before {
@@ -10738,7 +10781,9 @@ impl Host {
             let back = declared_writes(runs);
             let mut texture_back_ranges = Vec::new();
             for list in runs {
-                texture_back_ranges.extend(list.deferred().texture_backs.iter().map(crate::texback::Back::range));
+                let deferred = list.deferred();
+                texture_back_ranges.extend(deferred.texture_backs.iter().map(crate::texback::Back::range));
+                texture_back_ranges.extend(deferred.inplace_writes.iter().copied());
             }
             let writes = runs.iter().flat_map(|l| l.deferred().writes.clone()).collect();
             let read_back = read_back_spans(runs);
@@ -12442,6 +12487,21 @@ impl HostList {
 
     /// Shaders of the list write `[address, address + len)` of a buffer's
     /// host copy: copied back into title memory once the list has run.
+    /// Shaders of this list may write title memory `[address, address +
+    /// len)` in place ([`inplace_declared`]).
+    pub(crate) fn defer_inplace_write(&self, address: usize, len: usize) {
+        if len == 0 || !late() || !inplace_declared() {
+            return;
+        }
+        let mut deferred = self.deferred();
+        let range = (address, address + len);
+        // Dispatches declare the same ranges thousands of times.
+        if deferred.inplace_writes.last() == Some(&range) || deferred.inplace_writes.contains(&range) {
+            return;
+        }
+        deferred.inplace_writes.push(range);
+    }
+
     pub(crate) fn defer_gpu_write(
         &self,
         shadow: &std::sync::Arc<crate::shadow::Shadow>,
