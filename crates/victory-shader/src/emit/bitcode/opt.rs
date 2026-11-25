@@ -63,6 +63,10 @@ pub const ALL: u32 = MODULE | FIRST;
 pub(crate) struct Usage {
     /// A wave or quad operation.
     pub wave_ops: bool,
+    /// A wave operation outside the opt-in broadcast/vote allowlist.
+    pub unsafe_wave32: bool,
+    /// Any barrier, including a fence without group sync.
+    pub barrier: bool,
     /// A 64-bit integer, as a result or an operand.
     pub int64: bool,
     /// A typed load of several components from a UAV.
@@ -1004,6 +1008,12 @@ impl Module {
                 let name = name.strip_prefix("dx.op.").unwrap_or(name);
                 if name.starts_with("wave") || name.starts_with("quad") {
                     u.wave_ops = true;
+                    u.unsafe_wave32 |= !matches!(
+                        name.split('.').next().unwrap_or(name),
+                        "waveReadLaneFirst" | "waveAnyTrue" | "waveAllTrue" | "waveActiveAllEqual"
+                    );
+                } else if name.starts_with("barrier") {
+                    u.barrier = true;
                 } else if name == "createHandleFromHeap" {
                     match args.get(2).and_then(|&s| self.int_k(s)) {
                         Some((_, 0)) => u.heap_views = true,
