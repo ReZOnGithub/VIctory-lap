@@ -2234,7 +2234,39 @@ fn pool(
 /// Runs `jobs` on the kept threads and on this one, and returns when all
 /// of them are done. The jobs copy and compare memory; they do not panic.
 fn wide(jobs: Vec<Job>) {
+    if LANDING.get() && land_pool() {
+        wide_on(land_workers(), jobs);
+        return;
+    }
     wide_on(workers(), jobs);
+}
+
+std::thread_local! {
+    /// Whether this thread is the one that lands flights (`crate::host`'s
+    /// relay): its [`wide`] jobs go to a pool of their own.
+    static LANDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Marks the calling thread as the one that lands flights ([`LANDING`]).
+pub(crate) fn landing_thread() {
+    LANDING.set(true);
+}
+
+/// Whether the landing thread's [`wide`] jobs (finding and merging what
+/// shaders wrote) run on threads of their own (`VICTORY_LAND_POOL=1`; off
+/// by default). Tried because in one pool the submitting thread's
+/// heap sync can stand behind them; run d4 measured the sync no faster
+/// (46.6 against 38.1 ms a frame).
+fn land_pool() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_POOL").is_some_and(|v| v == "1"))
+}
+
+/// The landing thread's pool ([`land_pool`]).
+fn land_workers() -> &'static Workers {
+    static WORKERS: std::sync::OnceLock<Workers> = std::sync::OnceLock::new();
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    pool(&WORKERS, &STARTED, kept_threads().min(4), "victory-land")
 }
 
 /// [`wide`] on the threads of [`texture_workers`] and this one: the

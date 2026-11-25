@@ -152,6 +152,9 @@ const FAST_DEFAULTS: &[(&str, &str)] = &[
     ("VICTORY_CARD_BUFFERS_MIN_KB", "64"),
     ("VICTORY_CARD_BUFFERS_MB", "3072"),
     ("VICTORY_TABLE_GPU_COPY", "1"),
+    // With every buffer on the card, 512 changed runs a submission were
+    // outrun 1.5 times a frame, each a settle of 6 ms (run d1).
+    ("VICTORY_MERGE_RUNS", "4096"),
     ("VICTORY_ASYNC_TEXTURES", "4"),
     ("VICTORY_ASYNC_TEXTURES_MB", "256"),
     ("VICTORY_STAGING_POOL_MB", "128"),

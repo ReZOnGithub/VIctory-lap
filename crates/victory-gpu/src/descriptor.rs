@@ -398,7 +398,7 @@ fn mirror_left(host: &host::HostHeap, start: u64, step: u64) {
     let jobs_n = sync_wide();
     let (mirrored, gone) = if jobs_n >= 2 && due.len() >= 1024 {
         let counts = std::sync::Arc::new([std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)]);
-        let each = due.len().div_ceil(jobs_n);
+        let each = due.len().div_ceil(jobs_n * split_finer()).max(256);
         // SAFETY (in the jobs): the host heap of a registered heap, under
         // the heaps' lock the caller holds until every job is done.
         let at = std::ptr::from_ref(host) as usize;
@@ -693,7 +693,10 @@ fn mirror_wide(work: Vec<SyncPage>) -> (u64, u64) {
         return work.iter().map(look).fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
     }
     let counts = std::sync::Arc::new([std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)]);
-    let each = work.len().div_ceil(jobs_n);
+    // Several jobs a thread, taken as threads come free: the written pages
+    // cluster, and with one run of pages a thread the sync stood 11 ms a
+    // frame for the one that held most of them (run p6's profile).
+    let each = work.len().div_ceil(jobs_n * split_finer()).max(1);
     let mut pages = work.into_iter();
     let mut jobs: Vec<Box<dyn FnOnce() + Send>> = Vec::with_capacity(jobs_n);
     loop {
@@ -710,6 +713,14 @@ fn mirror_wide(work: Vec<SyncPage>) -> (u64, u64) {
     }
     crate::shadow::wide_run(jobs);
     (counts[0].load(Relaxed), counts[1].load(Relaxed))
+}
+
+/// How many jobs per thread of [`sync_wide`] the heap sync's pages and
+/// left slots are cut into (`VICTORY_SYNC_SPLIT`, 1; 8 measured no faster in run d2).
+#[cfg(windows)]
+fn split_finer() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_SYNC_SPLIT").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).clamp(1, 64))
 }
 
 /// Since the last frame line, of [`sync_heaps`]: changed pages of placed
