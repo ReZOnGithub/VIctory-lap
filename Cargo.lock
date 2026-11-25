@@ -739,7 +739,6 @@ dependencies = [
 name = "victory-shader"
 version = "0.1.0"
 dependencies = [
- "blake3",
  "thiserror",
  "windows",
  "windows-sys",

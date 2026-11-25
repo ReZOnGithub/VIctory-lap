@@ -10,7 +10,6 @@ publish.workspace = true
 [dependencies]
 thiserror.workspace = true
 zlib-rs.workspace = true
-blake3.workspace = true
 
 [features]
 # Host D3D12 pipeline checks (`emit::host`).
