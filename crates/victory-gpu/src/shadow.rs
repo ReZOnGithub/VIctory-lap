@@ -1136,6 +1136,80 @@ pub(crate) fn under_landed(start: u64, len: u64, pieces: u64, flagged: u64) {
     });
 }
 
+/// Diagnostics: bytes the refreshes moved into each copy (by its start),
+/// with what kind of memory it is, said every 5 s, the most moved first:
+/// which copies the frame's refresh volume is made of, and whether their
+/// memory could be opened as the card's (private and committed whole, or
+/// a view of the page pool).
+#[cfg(feature = "diagnostics")]
+static MOVED: Mutex<Option<(std::time::Instant, u64, std::collections::HashMap<u64, (u64, u64, u64, u8)>)>> = Mutex::new(None);
+
+#[cfg(feature = "diagnostics")]
+fn moved_note(shadow: &Shadow, bytes: u64) {
+    if bytes == 0 {
+        return;
+    }
+    let frame = crate::frame::current();
+    let mut g = MOVED.lock().unwrap_or_else(|e| e.into_inner());
+    let (since, first_frame, map) = g.get_or_insert_with(|| (std::time::Instant::now(), frame, std::collections::HashMap::new()));
+    let e = map.entry(shadow.start).or_insert_with(|| {
+        // 1 card copy, 2 window, 4 view memory, 8 private whole.
+        let (st, ln) = (shadow.start as usize, shadow.len as usize);
+        let mut kind = 0u8;
+        if shadow.card.is_some() {
+            kind |= 1;
+        }
+        if shadow.window {
+            kind |= 2;
+        }
+        if crate::inplace::touches_view(st, ln) {
+            kind |= 4;
+        } else if crate::inplace::private_whole(st, ln) {
+            kind |= 8;
+        }
+        (shadow.len, 0, 0, kind)
+    });
+    e.1 += bytes;
+    e.2 += 1;
+    if since.elapsed() >= std::time::Duration::from_secs(5) {
+        let frames = frame.saturating_sub(*first_frame).max(1) as f64;
+        let mut all: Vec<(u64, (u64, u64, u64, u8))> = map.drain().collect();
+        all.sort_by_key(|(_, v)| std::cmp::Reverse(v.1));
+        let total: u64 = all.iter().map(|(_, v)| v.1).sum();
+        let mut by_kind = [0u64; 16];
+        for (_, v) in &all {
+            by_kind[usize::from(v.3)] += v.1;
+        }
+        let kinds: Vec<String> = by_kind
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| **b > 0)
+            .map(|(k, &b)| {
+                format!(
+                    "{}{}{}{}: {:.1} MB",
+                    if k & 1 != 0 { "card " } else { "pc " },
+                    if k & 2 != 0 { "window " } else { "buffer " },
+                    if k & 4 != 0 { "view" } else { "" },
+                    if k & 8 != 0 { "private" } else { "" },
+                    b as f64 / 1e6 / frames
+                )
+            })
+            .collect();
+        let top: Vec<String> = all
+            .iter()
+            .take(12)
+            .map(|(at, v)| format!("{at:#x}+{:#x} kind {}: {:.2} MB/frame in {:.0} moves", v.0, v.3, v.1 as f64 / 1e6 / frames, v.2 as f64 / frames))
+            .collect();
+        tracing::info!(
+            "refresh volume by copy, per frame over {frames:.0} frames: {:.1} MB in {} copies; by kind {kinds:?}; the most: {top:?}",
+            total as f64 / 1e6 / frames,
+            all.len()
+        );
+        *since = std::time::Instant::now();
+        *first_frame = frame;
+    }
+}
+
 /// Ranges in order, those that overlap or touch as one.
 fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     ranges.sort_unstable();
@@ -6018,6 +6092,8 @@ impl Shadow {
     /// the card's memory sends them up.
     pub(crate) fn moved(&self, ranges: &[(usize, usize)]) {
         let start = self.start as usize;
+        #[cfg(feature = "diagnostics")]
+        moved_note(self, ranges.iter().map(|r| (r.1 - r.0) as u64).sum());
         for &(from, to) in ranges {
             if self.card.is_none() {
                 count_skinned(skinned::PC, from as u64, to as u64);

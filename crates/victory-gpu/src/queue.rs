@@ -257,7 +257,8 @@ fn submit_cut(this: This, lists: &[This]) {
     let Some(host) = crate::host::host() else {
         return;
     };
-    let first = if !behind() && lock(&queue(this).held).is_empty() {
+    // Gathered ([`batch_most`]): every list goes into the line.
+    let first = if batch_most() == 0 && !behind() && lock(&queue(this).held).is_empty() {
         lists
             .iter()
             .position(|&l| crate::list::cut_list(l))
@@ -326,6 +327,15 @@ fn submit_cut(this: This, lists: &[This]) {
         let mut waiting = lock(&WAITING);
         if !waiting.contains(&(this as usize)) {
             waiting.push(this as usize);
+        }
+    }
+    if batch_most() > 0 && first < lists.len() {
+        BATCH_STATS[3].fetch_add(1, Ordering::Relaxed);
+        lock(&BATCH_OLDEST).get_or_insert_with(std::time::Instant::now);
+        let runs = lock(&queue(this).held).iter().filter(|h| matches!(h, Held::Run(..))).count();
+        if runs >= batch_most() {
+            batch_force(0);
+            return;
         }
     }
     // What ran may be what another queue waits for, and what was just
@@ -444,6 +454,113 @@ pub(crate) fn release_held(all: bool) {
         return;
     }
     release_held_now(all);
+}
+
+/// How many parts a queue's line gathers before they are prepared and sent
+/// together (`VICTORY_BATCH=N`, N of 2 or more; off by default: 0).
+///
+/// The title makes some 29 submissions a frame and each paid the whole of
+/// a submission's preparing: the heap sync, the write-watch asking over
+/// every copy it refreshes, the flush of the refreshes (pages the title
+/// rewrote since the submission before copied again), the stale checks,
+/// the card copies' sends and compare, a flight to land and to settle.
+/// Joining parts that stood in a line (`VICTORY_JOIN_PARTS`) found almost
+/// none standing (run j1); a thread of ours preparing them
+/// (`VICTORY_ASYNC_SUBMIT`) left the title waiting on it (run j2).
+///
+/// With the switch a submission whose waits are met is put in its queue's
+/// line, as one held behind a fence is, and the line is prepared and sent,
+/// joined, on the thread that is there when it must be ([`batch_forced`]):
+/// at the `N`th part, at a present, at a blocking fence wait, a
+/// synchronous submission of ours, a change of page mappings, the results'
+/// flip wait, or when the oldest part has stood [`batch_ms`] milliseconds
+/// (a thread of ours looks every millisecond: a title thread that polls
+/// memory a held part writes is never left standing for long). What it
+/// assumes is what `VICTORY_ASYNC_SUBMIT` assumes: title memory a part
+/// reads is not rewritten between its submit call and its preparing.
+#[cfg(windows)]
+fn batch_most() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        let n = std::env::var("VICTORY_BATCH").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+        let n = if n >= 2 && crate::host::late() { n } else { 0 };
+        if n > 0 {
+            tracing::info!(parts = n, ms = batch_ms(), "submissions are gathered in their queues' lines and sent together (VICTORY_BATCH)");
+            let _ = std::thread::Builder::new().name("victory-batch".into()).spawn(batch_timer);
+        }
+        n
+    })
+}
+
+/// [`batch_most`]: how long the oldest gathered part may stand
+/// (`VICTORY_BATCH_MS`, 2).
+#[cfg(windows)]
+fn batch_ms() -> u64 {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| std::env::var("VICTORY_BATCH_MS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(2).clamp(1, 50))
+}
+
+#[cfg(windows)]
+std::thread_local! {
+    /// Whether this thread runs the lines because a batch must go
+    /// ([`batch_force`]).
+    static BATCH_FORCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// When the oldest gathered part was put in a line ([`batch_most`]).
+#[cfg(windows)]
+static BATCH_OLDEST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+/// Since the last line: batches sent by the cap, by a forced point, by the
+/// timer; parts gathered.
+#[cfg(windows)]
+static BATCH_STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Whether held runs go now: no batching, or this thread was asked to
+/// send what is gathered ([`batch_force`]).
+#[cfg(windows)]
+fn batch_forced() -> bool {
+    batch_most() == 0 || BATCH_FORCE.get()
+}
+
+/// Runs the lines with what is gathered let go ([`batch_most`]), on this
+/// thread (`why`: a [`BATCH_STATS`] index).
+#[cfg(windows)]
+fn batch_force(why: usize) {
+    let was = BATCH_FORCE.replace(true);
+    *lock(&BATCH_OLDEST) = None;
+    BATCH_STATS[why].fetch_add(1, Ordering::Relaxed);
+    release_held_now(false);
+    BATCH_FORCE.set(was);
+}
+
+/// The thread of [`batch_ms`].
+#[cfg(windows)]
+fn batch_timer() {
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        let due = lock(&BATCH_OLDEST).is_some_and(|at| at.elapsed() >= std::time::Duration::from_millis(batch_ms()));
+        if due {
+            batch_force(2);
+        }
+    }
+}
+
+/// The frame line's account of [`batch_most`] (empty when off).
+#[cfg(windows)]
+pub(crate) fn batch_line(frames: f64) -> String {
+    if batch_most() == 0 {
+        return String::new();
+    }
+    let s: Vec<f64> = BATCH_STATS.iter().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames.max(1.0)).collect();
+    format!(
+        "; batches (VICTORY_BATCH={}): {:.1} parts gathered, sent {:.1} at the cap, {:.1} at a forced point, {:.1} by the timer",
+        batch_most(),
+        s[3],
+        s[0],
+        s[1],
+        s[2]
+    )
 }
 
 /// Whether a submission is only put in its queue's line by the thread
@@ -632,6 +749,10 @@ static RUNNING_LINES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU3
 /// submission keeps its place behind them.
 #[cfg(windows)]
 pub(crate) fn before_sync() {
+    if batch_most() > 0 && !RELEASING_HERE.get() {
+        batch_force(1);
+        return;
+    }
     if behind() && !RELEASING_HERE.get() {
         drain(a::OURS_US);
     }
@@ -667,6 +788,10 @@ pub(crate) fn lines_moving() -> bool {
 /// With [`behind`]: our thread looks at the lines.
 #[cfg(windows)]
 pub(crate) fn nudge() {
+    if batch_most() > 0 && !RELEASING_HERE.get() {
+        batch_force(1);
+        return;
+    }
     if behind() {
         wake();
     }
@@ -782,6 +907,10 @@ pub(crate) fn wait_for_fence(event: usize, reached: &dyn Fn() -> bool) -> bool {
 /// ([`fence_wait`] off, or it found nothing moving).
 #[cfg(windows)]
 pub(crate) fn before_fence() {
+    if batch_most() > 0 && !RELEASING_HERE.get() {
+        batch_force(1);
+        return;
+    }
     if behind() && !RELEASING_HERE.get() {
         drain(a::FENCE_US);
     }
@@ -948,6 +1077,9 @@ fn release_held_now(all: bool) {
                         break;
                     }
                     Some(Held::Value(wait)) if !all && !value_met(wait) => break,
+                    // Gathered runs go together, when they must
+                    // ([`batch_most`]).
+                    Some(Held::Run(..)) if !all && !batch_forced() => break,
                     Some(_) => {}
                 }
                 match held.remove(0) {
@@ -1336,7 +1468,7 @@ pub(crate) fn join_line(frames: f64) -> String {
         n(j::END_AIR),
         n(j::END_DECLARED),
         n(j::END_REFRESH),
-    )
+    ) + &batch_line(frames)
 }
 
 /// Whether a queue may pass `wait`: memory holds the value, or, with
@@ -1482,6 +1614,28 @@ fn execute_now(this: This, count: u32, lists: *const This) {
                     waiting.push(this as usize);
                 }
             }
+        }
+        // Gathered ([`batch_most`]): into the line even if it holds nothing.
+        if batch_most() > 0 && !this.is_null() && !behind() {
+            let (taken, order) = crate::list::detach(lists);
+            lined(1);
+            let runs = {
+                let mut held = lock(&queue(this).held);
+                held.push(Held::Run(taken, order, std::time::Instant::now()));
+                held.iter().filter(|h| matches!(h, Held::Run(..))).count()
+            };
+            {
+                let mut waiting = lock(&WAITING);
+                if !waiting.contains(&(this as usize)) {
+                    waiting.push(this as usize);
+                }
+            }
+            BATCH_STATS[3].fetch_add(1, Ordering::Relaxed);
+            lock(&BATCH_OLDEST).get_or_insert_with(std::time::Instant::now);
+            if runs >= batch_most() {
+                batch_force(0);
+            }
+            return;
         }
         let kept = hold(this, || {
             let (taken, order) = crate::list::detach(lists);
@@ -1782,6 +1936,24 @@ extern "system" fn present(
 }
 
 fn present_now(this: This, planes: u32, plane_parameters: *const Plane, _parameters: *const u8) -> HRESULT {
+    // Everything gathered goes at a present ([`batch_most`]).
+    #[cfg(windows)]
+    let was_forced = BATCH_FORCE.replace(true);
+    #[cfg(windows)]
+    if batch_most() > 0 {
+        *lock(&BATCH_OLDEST) = None;
+        BATCH_STATS[1].fetch_add(1, Ordering::Relaxed);
+    }
+    #[cfg(windows)]
+    struct Unforce(bool);
+    #[cfg(windows)]
+    impl Drop for Unforce {
+        fn drop(&mut self) {
+            BATCH_FORCE.set(self.0);
+        }
+    }
+    #[cfg(windows)]
+    let _unforce = Unforce(was_forced);
     #[cfg(windows)]
     let presenting = std::time::Instant::now();
     #[cfg(all(windows, feature = "diagnostics"))]
@@ -2011,7 +2183,9 @@ extern "system" fn copy_page_mappings(
     }
     // Submissions made before it read the pages as they are mapped now.
     #[cfg(windows)]
-    if maps_drain() && count > 0 {
+    if batch_most() > 0 && count > 0 && !RELEASING_HERE.get() {
+        batch_force(1);
+    } else if maps_drain() && count > 0 {
         drain(a::MAPS_US);
     }
     let batches = (count > 0).then(|| {
