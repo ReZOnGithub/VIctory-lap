@@ -2898,6 +2898,8 @@ fn install() {
         // (then it is ours again, not read-only for some other reason).
         let mut g = guards();
         if open_fault(&mut g, at) {
+            // Renderer port #2's fallback says who wrote a block of the heap.
+            crate::port_descriptors::faulted(at, r.ExceptionAddress as usize);
             tally(S::Faults, 1);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);

@@ -158,6 +158,8 @@ fn mirror(handle: u64) {
     let Some((heap, index)) = shader_slot(handle) else {
         return;
     };
+    // Renderer port #2: its record is looked at again with the title's own.
+    crate::port_descriptors::mark(handle);
     let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
     match heap.host.get() {
         None => pending.push(index),
@@ -270,11 +272,30 @@ fn sync_heaps_avoiding(avoid: Option<&[(usize, usize)]>, due_left: bool) {
         // Pages left before first (each lies in one page), then the
         // pages written since.
         let mut pieces: Vec<(usize, usize)> = left.iter().filter(|l| l.0 == at).map(|l| (l.1, l.2)).collect();
-        for (range_from, range_end) in written.take(start as usize, end as usize) {
-            let mut page = range_from & !(crate::watch::PAGE - 1);
-            while page < range_end {
-                pieces.push((page.max(range_from), (page + crate::watch::PAGE).min(range_end)));
-                page += crate::watch::PAGE;
+        // Renderer port #2 (`crate::port_descriptors`): the slots the
+        // title's patched stores and our calls marked, in place of the
+        // changed pages; and a few of the pages the watch says were
+        // written, looked at whole (its fallback).
+        if crate::port_descriptors::adopted(start) {
+            let frame = crate::frame::current();
+            for (first, n) in crate::port_descriptors::take(start).unwrap_or_default() {
+                let from = start as usize + first as usize * step as usize;
+                pieces.push((from, from + n as usize * step as usize));
+            }
+            if crate::port_descriptors::ask_due(frame) {
+                let taken = written.take(start as usize, end as usize);
+                crate::port_descriptors::asked(&taken);
+            }
+            for page in crate::port_descriptors::to_check(frame) {
+                pieces.push((page.max(start as usize), (page + crate::watch::PAGE).min(end as usize)));
+            }
+        } else {
+            for (range_from, range_end) in written.take(start as usize, end as usize) {
+                let mut page = range_from & !(crate::watch::PAGE - 1);
+                while page < range_end {
+                    pieces.push((page.max(range_from), (page + crate::watch::PAGE).min(range_end)));
+                    page += crate::watch::PAGE;
+                }
             }
         }
         for (from, to) in pieces {
@@ -863,6 +884,7 @@ fn jobs_ran(kind: usize, n: u64, wall: std::time::Instant) {
 }
 
 pub(crate) fn sync_line(frames: f64) {
+    crate::port_descriptors::line(frames);
     {
         let v: Vec<Vec<f64>> = JOB_STATS
             .iter()
@@ -992,6 +1014,7 @@ impl Drop for Heap {
         // Its pre-read pages go with it (a heap made later at the same
         // address must not take them).
         PREREAD.lock().unwrap_or_else(|e| e.into_inner()).retain(|r| r.at != at);
+        crate::port_descriptors::let_go(self.start);
     }
 }
 
@@ -1820,6 +1843,11 @@ pub(crate) extern "system" fn create_heap(
             .then(|| crate::watch::track(start as usize, size as usize, true))
             .flatten(),
     });
+    // Renderer port #2: the title's own stores tell this heap's slots.
+    #[cfg(windows)]
+    if placed && visible && desc.kind == VIEWS_KIND {
+        crate::port_descriptors::adopt(start, desc.count);
+    }
     #[cfg(windows)]
     if visible {
         let at = std::ptr::from_ref::<Heap>(&heap) as usize;
