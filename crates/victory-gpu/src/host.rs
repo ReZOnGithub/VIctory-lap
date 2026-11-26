@@ -13354,6 +13354,80 @@ fn do_fills(fills: &[(usize, usize, usize)]) -> (usize, bool) {
 }
 
 /// `runs` (title ranges) in order, those that overlap or touch as one.
+/// Whether a flush of all plans its copies on several threads
+/// (`VICTORY_WIDE_PLAN=1`): [`Shadow::plan`] of each copy
+/// touches that copy's notes and the write journal (under its lock) and
+/// nothing of another copy's, so copies are planned side by side, each
+/// copy's parts and ranges in their order on one thread. On the submitting
+/// thread alone it was some 10 ms a frame (run p7). Off by default
+/// (`=1` on): run w1 measured the planning's wall time 14.6 -> 20.6 ms a
+/// frame, the threads standing at the journal's lock.
+fn wide_plan() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_PLAN").is_some_and(|v| v == "1"))
+}
+
+type PlanGroup = (std::sync::Arc<crate::shadow::Shadow>, Vec<Vec<(usize, usize)>>, Vec<(usize, usize)>);
+
+/// [`wide_plan`]: the plans of `declared` (parts declarations left) and
+/// `refreshes` (copy, from, to), one per copy with its runs joined, as the
+/// flush of all makes them on one thread.
+fn plan_wide(
+    declared: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)>,
+    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> {
+    let mut groups: Vec<PlanGroup> = Vec::new();
+    let mut which: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    let mut slot = |groups: &mut Vec<PlanGroup>, shadow: &std::sync::Arc<crate::shadow::Shadow>| -> usize {
+        *which.entry(std::sync::Arc::as_ptr(shadow) as usize).or_insert_with(|| {
+            groups.push((shadow.clone(), Vec::new(), Vec::new()));
+            groups.len() - 1
+        })
+    };
+    for (shadow, parts) in declared {
+        let i = slot(&mut groups, &shadow);
+        groups[i].1.push(parts);
+    }
+    for (shadow, from, to) in refreshes {
+        let i = slot(&mut groups, &shadow);
+        groups[i].2.push((from, to));
+    }
+    let plan_one = |(shadow, parts, ranges): PlanGroup| -> Option<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> {
+        let mut runs = Vec::new();
+        for p in &parts {
+            shadow.plan_parts(p, &mut runs);
+        }
+        for &(from, to) in &ranges {
+            shadow.plan(from, to - from, &mut runs);
+        }
+        if parts.len() + ranges.len() > 1 {
+            runs = joined_runs(runs);
+        }
+        (!runs.is_empty()).then_some((shadow, runs))
+    };
+    let n_jobs = crate::shadow::wide_threads().min(groups.len()).max(1);
+    if n_jobs < 2 {
+        return groups.into_iter().filter_map(plan_one).collect();
+    }
+    let mut chunks: Vec<Vec<PlanGroup>> = (0..n_jobs).map(|_| Vec::new()).collect();
+    for (i, g) in groups.into_iter().enumerate() {
+        chunks[i % n_jobs].push(g);
+    }
+    let out: std::sync::Arc<Mutex<Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)>>> = std::sync::Arc::default();
+    let jobs: Vec<Box<dyn FnOnce() + Send>> = chunks
+        .into_iter()
+        .map(|chunk| {
+            let out = out.clone();
+            Box::new(move || {
+                let mine: Vec<_> = chunk.into_iter().filter_map(plan_one).collect();
+                out.lock().unwrap_or_else(|e| e.into_inner()).extend(mine);
+            }) as Box<dyn FnOnce() + Send>
+        })
+        .collect();
+    crate::shadow::wide_run(jobs);
+    std::mem::take(&mut *out.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
 fn joined_runs(mut runs: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     runs.sort_unstable();
     let mut out: Vec<(usize, usize)> = Vec::with_capacity(runs.len());
@@ -13655,6 +13729,9 @@ impl Batch {
             // together on several (`crate::shadow::wide_copy`).
             let started = std::time::Instant::now();
             let mut plans: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
+            if wide_plan() && self.refreshes.len() + self.declared_parts.len() >= 64 {
+                plans = plan_wide(std::mem::take(&mut self.declared_parts), std::mem::take(&mut self.refreshes));
+            }
             // With [`declared_wide`]: the parts declarations left, first. A
             // copy planned twice (parts, then a span queued after its
             // declaration) gets one plan, its runs joined, so that no two
