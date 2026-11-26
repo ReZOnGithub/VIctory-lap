@@ -2078,7 +2078,14 @@ impl HostHeap {
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
         // A running submission may still read the old resource through
         // this slot: retired, after the lock is let go.
+        let new = resource.as_ref().map(windows::core::Interface::as_raw);
         if let Some(old) = self.kept.swap(index as usize, resource) {
+            // The same resource kept again: the slot holds it still, so the
+            // reference given back goes at once, with nothing to retire.
+            if Some(windows::core::Interface::as_raw(&old)) == new {
+                drop(old);
+                return;
+            }
             crate::host::retire(old);
         }
     }

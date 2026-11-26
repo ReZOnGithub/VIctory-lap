@@ -71,7 +71,22 @@ unsafe impl Sync for Host {}
 /// releases reach the host at once, from its own threads, while the host
 /// runs a submission: freeing there is a GPU page fault on the freed
 /// texture (a device hang).
-static RETIRED: Mutex<Vec<(u64, Retired)>> = Mutex::new(Vec::new());
+///
+/// In [`RETIRE_SHARDS`] shards, a thread's retirements in one of its own:
+/// the heap sync's jobs retire a slot's old resource at every slot they
+/// make (some 19,000 a frame), and under one lock they waited on each
+/// other and on `bury`'s pass over all of them (run p9).
+static RETIRED: [Mutex<Vec<(u64, Retired)>>; RETIRE_SHARDS] = [const { Mutex::new(Vec::new()) }; RETIRE_SHARDS];
+const RETIRE_SHARDS: usize = 16;
+
+/// The calling thread's shard of [`RETIRED`].
+fn retire_shard() -> usize {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    std::thread_local! {
+        static SHARD: usize = NEXT.fetch_add(1, Ordering::Relaxed) % RETIRE_SHARDS;
+    }
+    SHARD.with(|s| *s)
+}
 /// Submissions started and finished (waited for).
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -228,26 +243,29 @@ pub(crate) fn retire<T: 'static>(object: T) {
         return;
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
-    RETIRED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push((started, Retired(Box::new(object))));
+    let retired = (started, Retired(Box::new(object)));
+    RETIRED[retire_shard()].lock().unwrap_or_else(|e| e.into_inner()).push(retired);
 }
 
 /// Drops what waited for submissions up to `finished`.
 fn bury(finished: u64) {
-    let done: Vec<(u64, Retired)> = {
-        let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut done: Vec<Retired> = Vec::new();
+    for shard in &RETIRED {
+        let mut retired = shard.lock().unwrap_or_else(|e| e.into_inner());
         if retired.is_empty() {
-            return;
+            continue;
         }
-        let (done, keep) = std::mem::take(&mut *retired)
-            .into_iter()
-            .partition(|(at, _)| *at <= finished);
+        let mut keep = Vec::with_capacity(retired.len());
+        for (at, r) in std::mem::take(&mut *retired) {
+            if at <= finished {
+                done.push(r);
+            } else {
+                keep.push((at, r));
+            }
+        }
         *retired = keep;
-        done
-    };
-    reap(done.into_iter().map(|(_, r)| r).collect());
+    }
+    reap(done);
 }
 
 /// Whether retired objects are dropped by a thread of their own
