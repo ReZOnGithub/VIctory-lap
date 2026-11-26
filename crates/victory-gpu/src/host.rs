@@ -7411,6 +7411,7 @@ fn late_line(frames: f64) {
             );
         }
     }
+    crate::port::log(frames);
     if late_exact() {
         let [pages, runs, bytes] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
         tracing::info!(
@@ -13312,6 +13313,7 @@ impl HostList {
                         add(C::CopyBytes, len as u64);
                     }
                     batch.title_wrote(dst, len);
+                    crate::port::copied(dst, src, len);
                     #[cfg(feature = "diagnostics")]
                     fill_check::copy_runs(dst, src, len);
                     // Timed from here: the flush above counts its own time.
@@ -13350,6 +13352,7 @@ impl HostList {
                     }
                     #[cfg(feature = "diagnostics")]
                     let _reads_as = crate::backreads::reading_as(crate::backreads::TITLE_COPY, 0);
+                    crate::port::filled(src, len);
                     copy_fill(dst as *mut u8, src as *const u8, len);
                     // Under flights' shader writes ([`fill_from_copy`]):
                     // what they wrote comes from the copies they wrote.
