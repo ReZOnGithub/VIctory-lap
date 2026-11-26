@@ -1080,6 +1080,9 @@ static UNDER: Mutex<Option<(std::time::Instant, std::collections::HashMap<u64, [
 
 #[cfg(feature = "diagnostics")]
 fn under_with(start: u64, len: u64, f: impl FnOnce(&mut [u64; 6])) {
+    if !volume_diag() {
+        return;
+    }
     let mut g = UNDER.lock().unwrap_or_else(|e| e.into_inner());
     let (since, map) = g.get_or_insert_with(|| (std::time::Instant::now(), std::collections::HashMap::new()));
     let e = map.entry(start).or_insert([len, 0, 0, 0, 0, 0]);
@@ -1144,9 +1147,17 @@ pub(crate) fn under_landed(start: u64, len: u64, pieces: u64, flagged: u64) {
 #[cfg(feature = "diagnostics")]
 static MOVED: Mutex<Option<(std::time::Instant, u64, std::collections::HashMap<u64, (u64, u64, u64, u8)>)>> = Mutex::new(None);
 
+/// Whether the per-copy volume diagnostics run (`VICTORY_VOLUME_DIAG=1`):
+/// they take a global lock on every move.
+#[cfg(feature = "diagnostics")]
+fn volume_diag() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VOLUME_DIAG").is_some_and(|v| v == "1"))
+}
+
 #[cfg(feature = "diagnostics")]
 fn moved_note(shadow: &Shadow, bytes: u64) {
-    if bytes == 0 {
+    if bytes == 0 || !volume_diag() {
         return;
     }
     let frame = crate::frame::current();
