@@ -1226,13 +1226,74 @@ impl Tracked {
         };
         let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
         let mut ranges: Vec<(usize, usize)> = Vec::new();
-        for (page, write) in pages {
+        // With [`heap_subs`]: of each changed page, only its 4 KiB parts
+        // written since this last took it, each widened by [`SUBS_EDGE`]
+        // bytes both ways so that a record straddling a part's edge, only
+        // one half of it written, is read whole and looked at.
+        let subs = heap_subs() && fine();
+        let mut parts = Vec::new();
+        if subs {
+            let asked: Vec<(usize, u64)> = pages.iter().map(|&(page, _)| (page, seen.get(&page).copied().unwrap_or(0))).collect();
+            subs_after(&asked, &mut parts);
+            // Said every 5 s: how the pages came.
+            static SAID: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+            let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+            if said.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(5)) {
+                *said = Some(std::time::Instant::now());
+                let full = parts.iter().filter(|&&m| m == ALL_SUBS).count();
+                let zero = parts.iter().filter(|&&m| m == 0).count();
+                tracing::info!(
+                    pages_as_parts = HEAP_SUBS_STAT[0].load(Relaxed),
+                    parts = HEAP_SUBS_STAT[1].load(Relaxed),
+                    pages_whole = HEAP_SUBS_STAT[2].load(Relaxed),
+                    this_take = parts.len(),
+                    this_all = full,
+                    this_none = zero,
+                    "heap pages taken by part (VICTORY_HEAP_SUBS)"
+                );
+            }
+        }
+        for (n, (page, write)) in pages.into_iter().enumerate() {
             if seen.get(&page).is_some_and(|&last| last >= write) {
                 continue;
             }
             let (start, end) = ((page * PAGE).max(from), ((page + 1) * PAGE).min(to));
             if start >= end {
                 continue;
+            }
+            let mask = if subs { parts.get(n).copied().unwrap_or(ALL_SUBS) } else { ALL_SUBS };
+            if mask != ALL_SUBS && mask != 0 {
+                let full = (page * PAGE).max(self.start) >= from && ((page + 1) * PAGE).min(self.end) <= to;
+                if full {
+                    seen.insert(page, write);
+                }
+                let mut i = 0;
+                while i < SUBS {
+                    if mask >> i & 1 == 0 {
+                        i += 1;
+                        continue;
+                    }
+                    let mut k = i;
+                    while k < SUBS && mask >> k & 1 != 0 {
+                        k += 1;
+                    }
+                    let a = (page * PAGE + i * SUB).saturating_sub(SUBS_EDGE).max(from);
+                    let b = (page * PAGE + k * SUB + SUBS_EDGE).min(to);
+                    let (a, b) = (a.max(self.start), b.min(self.end));
+                    if a < b {
+                        match ranges.last_mut() {
+                            Some((_, last)) if *last >= a => *last = (*last).max(b),
+                            _ => ranges.push((a, b)),
+                        }
+                    }
+                    i = k;
+                }
+                HEAP_SUBS_STAT[0].fetch_add(1, Relaxed);
+                HEAP_SUBS_STAT[1].fetch_add(u64::from(mask.count_ones()), Relaxed);
+                continue;
+            }
+            if subs {
+                HEAP_SUBS_STAT[2].fetch_add(1, Relaxed);
             }
             // Keep partial pages dirty: the caller has not taken the rest.
             if (page * PAGE).max(self.start) >= from
@@ -1246,6 +1307,31 @@ impl Tracked {
             }
         }
         ranges
+    }
+}
+
+/// Bytes each written part [`Tracked::take`] gives is widened by, both
+/// ways (a descriptor record is at most 64 bytes).
+const SUBS_EDGE: usize = 64;
+
+/// Since the start: pages [`Tracked::take`] gave as parts, the parts given,
+/// and pages given whole (no parts known, or all written).
+pub(crate) static HEAP_SUBS_STAT: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Whether [`Tracked::take`] gives the written 4 KiB parts of a changed
+/// page, not the whole 64 KiB page (`VICTORY_HEAP_SUBS`: `1` on, `alt` in
+/// turn, else off). Run qs1: the heap sync looked at 234,935 slots a frame
+/// on 240 changed 64 KiB pages to find 10,645 changed records.
+fn heap_subs() -> bool {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_HEAP_SUBS").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => crate::host::alt_phase("VICTORY_HEAP_SUBS"),
     }
 }
 
