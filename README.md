@@ -1,3 +1,23 @@
+# victory-lap
+
+A performance fork of [fxceless/victory-fork](https://github.com/fxceless/victory-fork),
+itself a fork of [VIctory](https://github.com/Marvisak/VIctory). Nearly
+everything here is their work: the compatibility layer, the translator, the
+host copies, the write watch, the landing thread and the measurements this
+fork builds on. All credit to Marvisak and the VIctory contributors, and to
+fxceless and the victory-fork contributors. victory-lap only adds frame-rate
+work on top: lock-free descriptor heap slots and sharded sets, a lookup cache
+race fix, pooled card hash buffers, finer page guards (`VICTORY_FINE_GUARDS=own`),
+striped locks between the stale checks and the landing thread, and a set of
+measured-and-off experiments (submission batching, streaming copies, card
+scatter merges), each documented where it lives in the code.
+
+Measured here on a first prison scene of about 5,000 draws a frame (RTX 5070,
+diagnostics build, 3-minute scripted runs): from 4.9 to about 7.1 frames a
+second.
+
+---
+
 # victory-gta6
 
 A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), the

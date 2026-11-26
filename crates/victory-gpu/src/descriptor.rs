@@ -300,8 +300,8 @@ fn sync_heaps_avoiding(avoid: Option<&[(usize, usize)]>, due_left: bool) {
                 // copy: a page the title unmaps meanwhile fails the read
                 // where 2,048 reads in place would fault.
                 if wide {
-                    let mut bytes = vec![0u8; to - from];
-                    if crate::host::read_into(from as *const u8, &mut bytes) {
+                    let mut bytes = PageBuf::take(to - from);
+                    if crate::host::read_into(from as *const u8, &mut bytes.0) {
                         // One buffer for all its pieces (each piece had a
                         // copy of its own: about 2.5 ms a frame, run p7).
                         let bytes = std::sync::Arc::new(bytes);
@@ -521,8 +521,59 @@ struct SyncPage {
     to: usize,
     /// The page's bytes as read, shared by its pieces, and where this
     /// piece's (`from`) begins in them.
-    bytes: std::sync::Arc<Vec<u8>>,
+    bytes: std::sync::Arc<PageBuf>,
     at: usize,
+}
+
+/// A page's bytes for [`SyncPage`], from a pool it goes back to when its
+/// last piece is done (`VICTORY_SYNC_POOL=1`; off: measured slower in run hp1, likely noise).
+///
+/// Why: each page read for the wide sync was a fresh `vec![0; n]`: a zeroed
+/// allocation that large comes from the system as new pages, each zeroed
+/// and faulted in, then given back. Profile p11: 11.7 % of the heap sync on
+/// the submitting thread in that allocation, before the read overwrote
+/// every byte of it.
+struct PageBuf(Vec<u8>);
+
+static PAGE_POOL: std::sync::Mutex<Vec<Vec<u8>>> = std::sync::Mutex::new(Vec::new());
+
+fn sync_pool() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SYNC_POOL").is_some_and(|v| v == "1"))
+}
+
+impl PageBuf {
+    /// `n` bytes, their contents left as they were (the caller overwrites
+    /// them all, or drops the buffer).
+    fn take(n: usize) -> PageBuf {
+        if !sync_pool() {
+            return PageBuf(vec![0u8; n]);
+        }
+        let mut v = PAGE_POOL.lock().unwrap_or_else(|e| e.into_inner()).pop().unwrap_or_default();
+        if v.len() < n {
+            v.resize(n, 0);
+        }
+        v.truncate(n);
+        PageBuf(v)
+    }
+}
+
+impl std::ops::Deref for PageBuf {
+    type Target = Vec<u8>;
+    fn deref(&self) -> &Vec<u8> {
+        &self.0
+    }
+}
+
+impl Drop for PageBuf {
+    fn drop(&mut self) {
+        if sync_pool() {
+            let mut pool = PAGE_POOL.lock().unwrap_or_else(|e| e.into_inner());
+            if pool.len() < 256 {
+                pool.push(std::mem::take(&mut self.0));
+            }
+        }
+    }
 }
 
 /// The records of one page of a shader-visible heap, `bytes` being title
