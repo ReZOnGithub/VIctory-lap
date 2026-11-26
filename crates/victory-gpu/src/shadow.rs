@@ -5683,7 +5683,9 @@ impl Shadow {
                 // reference under the same lock, and a page read before
                 // such a merge and compared after it would take the card's
                 // bytes for the title's.
-                let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+                let card_side = self.card.is_some() && side_stripes();
+                let _stripes = if card_side { side_locks(self.id, lo - start, hi - lo) } else { Vec::new() };
+                let mut before_lock = (!card_side).then(|| self.before.lock().unwrap_or_else(|e| e.into_inner()));
                 // A page that is not there is left as it is, and looked at
                 // again next time.
                 if !crate::host::read_into(lo as *const u8, title) {
@@ -5716,7 +5718,7 @@ impl Shadow {
                         MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
                     }
                 } else {
-                    let Some(snapshot) = before.as_mut() else {
+                    let Some(snapshot) = before_lock.as_mut().and_then(|b| b.as_mut()) else {
                         crate::cpuwait::stale_why(crate::cpuwait::stale::NO_SNAPSHOT);
                         return true;
                     };
@@ -5734,7 +5736,7 @@ impl Shadow {
                         MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
                     }
                 }
-                drop(before);
+                drop(before_lock);
                 // Taken, if the range holds all of the page that is in the
                 // copy; else the rest of it is the refresh's, which notes
                 // only whole pages, and the page is looked at again.
@@ -6713,7 +6715,8 @@ impl Shadow {
         if at + gpu.len() > self.len as usize || !self.held(at, at + gpu.len()) {
             return 0;
         }
-        let _side = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let _side = (!side_stripes()).then(|| self.before.lock().unwrap_or_else(|e| e.into_inner()));
+        let _stripes = if side_stripes() { side_locks(self.id, at, gpu.len()) } else { Vec::new() };
         // SAFETY: inside the mapping (checked above). The offsets are in a
         // range declared and not done with, which no refresh writes; what
         // does write it (the title's bytes put in under shader writes)
@@ -6771,6 +6774,40 @@ impl Shadow {
         crate::backreads::stored(self.id, (self.start, self.len), start + at, n, false);
         n
     }
+}
+
+/// The locks that keep [`Shadow::merge_under_writes`] and
+/// [`Shadow::card_merge_relay`] off each other's bytes of a copy in the
+/// card's memory (its CPU side), by 64 KiB piece of a copy
+/// (`VICTORY_SIDE_STRIPES`, on unless `0`; off: the copy's snapshot lock,
+/// one for the whole copy, as before).
+///
+/// Why: the landing thread merges a copy piece after piece, each under the
+/// copy's one lock, and the submitting thread's merges of title bytes under
+/// shader writes into other pages of the same copy stood for it: 5.7 % of
+/// the submission's time in run p11. Two merges conflict only over the
+/// same bytes.
+static SIDE: [Mutex<()>; 256] = [const { Mutex::new(()) }; 256];
+const SIDE_PIECE: usize = 64 << 10;
+
+fn side_stripes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SIDE_STRIPES").is_none_or(|v| v != "0"))
+}
+
+/// [`SIDE`]'s locks over offsets `[at, at + n)` of copy `id`, taken in
+/// order of their index (no two takers wait on each other in a circle).
+fn side_locks(id: u64, at: usize, n: usize) -> Vec<std::sync::MutexGuard<'static, ()>> {
+    let (first, last) = (at / SIDE_PIECE, (at + n.max(1) - 1) / SIDE_PIECE);
+    let mut which: Vec<usize> = (first..=last)
+        .map(|p| ((id.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ p as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9) >> 56) as usize)
+        .collect();
+    which.sort_unstable();
+    which.dedup();
+    if which.len() > SIDE.len() / 2 {
+        which = (0..SIDE.len()).collect();
+    }
+    which.into_iter().map(|i| SIDE[i].lock().unwrap_or_else(|e| e.into_inner())).collect()
 }
 
 struct Entry {
