@@ -4869,7 +4869,9 @@ impl Shadow {
         let plain = on
             && *self.plain.get_or_init(|| {
                 let (start, len) = (self.start as usize, self.len as usize);
-                crate::inplace::private_whole(start, len) && !crate::inplace::touches_view(start, len)
+                // The runtime's own knowledge of views first: it asks Windows
+                // nothing.
+                !crate::inplace::touches_view(start, len) && crate::inplace::private_whole_cached(start, len)
             });
         let inside = at >= self.start as usize && at + bytes.len() <= (self.start + self.len) as usize;
         if plain && inside {

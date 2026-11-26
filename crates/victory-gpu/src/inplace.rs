@@ -777,6 +777,47 @@ pub(crate) fn private_whole(at: usize, len: usize) -> bool {
         && (info.BaseAddress as usize).saturating_add(info.RegionSize) >= at.saturating_add(len)
 }
 
+/// [`private_whole`] for a copy that is about to write title memory
+/// (`crate::shadow`'s `write_title`), answered from a region Windows called
+/// private, committed and read-write all through less than a second ago,
+/// if the range lies inside one; else asked, and a yes kept with its
+/// region. The title's transient pool makes new copies all along, each
+/// asking once: the landing thread spent 10 ms a frame in these questions
+/// (run p10), each walking the page tables of a big block. A no is not
+/// kept (a region of mixed states says nothing of a smaller range in it).
+/// What it assumes is what the answer per copy already assumed for the
+/// copy's whole life: the title keeps those blocks as they are.
+pub(crate) fn private_whole_cached(at: usize, len: usize) -> bool {
+    static KNOWN: std::sync::Mutex<Vec<(usize, usize, std::time::Instant)>> = std::sync::Mutex::new(Vec::new());
+    let end = at.saturating_add(len);
+    {
+        let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+        known.retain(|k| k.2.elapsed() < std::time::Duration::from_secs(1));
+        if known.iter().any(|&(base, top, _)| base <= at && end <= top) {
+            return true;
+        }
+    }
+    // SAFETY: plain data filled in by the query.
+    let mut info: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { mem::VirtualQuery(at as *const c_void, &mut info, size_of_val(&info)) };
+    let base = info.BaseAddress as usize;
+    let top = base.saturating_add(info.RegionSize);
+    let yes = n != 0
+        && info.State == mem::MEM_COMMIT
+        && info.Type == mem::MEM_PRIVATE
+        && info.Protect == mem::PAGE_READWRITE
+        && top >= end;
+    if yes {
+        let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+        if known.len() >= 64 {
+            known.remove(0);
+        }
+        known.push((base, top, std::time::Instant::now()));
+    }
+    yes
+}
+
 fn hr<T>(result: &windows::core::Result<T>) -> String {
     match result {
         Ok(_) => "ok".to_owned(),

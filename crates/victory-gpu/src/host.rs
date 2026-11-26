@@ -2911,6 +2911,20 @@ pub(crate) fn hash_buffer_back(bytes: u64, buffer: ID3D12Resource) {
     }
 }
 
+/// Whether the landing thread merges what shaders wrote to copies in the
+/// card's memory on several threads, a copy's pieces in order on one
+/// (`VICTORY_LAND_MERGE_WIDE=1`; off by default). The merges were 44 of the
+/// landing's 52 ms a frame on one thread (run p10), and every title-read
+/// or stale settle waits for the landing; run l9 measured the landing no
+/// shorter with it (66.7 against 67.9 ms a frame).
+fn land_merge_wide() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_MERGE_WIDE").is_some_and(|v| v == "1"))
+}
+
+/// Since the start: landings whose merges ran on several threads.
+static LAND_WIDE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Whether ranges of at most [`CARD_IMMEDIATE_MOST`] bytes sent up to a
 /// copy in the card's memory go as immediate writes of their dwords
 /// (`WriteBufferImmediate`, read from the CPU's side when the list is
@@ -9528,17 +9542,73 @@ impl Host {
         } else {
             ring.1
         };
-        let mut title = Vec::new();
-        let (mut written, mut bytes) = (0, 0u64);
-        for (shadow, lo, hi, at, after) in &pieces {
-            let at = if inflight_on_card() { base + bytes as usize } else { base + at };
-            // SAFETY: inside the mapping of the slots (checked above), or of
-            // the buffer they were copied down to (`inflight_copy_down`
-            // puts them one after the other, and has waited); the copy into
-            // the slot ran in the plan's flight, which the card has run.
-            let gpu = unsafe { std::slice::from_raw_parts(at as *const u8, hi - lo) };
-            written += shadow.card_merge_relay(*lo, gpu, *after, &mut title);
-            bytes += (hi - lo) as u64;
+        // Where each piece's bytes are: one after the other in the buffer
+        // they came down to, or at their slots.
+        let mut bytes = 0u64;
+        let places: Vec<usize> = pieces
+            .iter()
+            .map(|(_, lo, hi, at, _)| {
+                let place = if inflight_on_card() { base + bytes as usize } else { base + at };
+                bytes += (hi - lo) as u64;
+                place
+            })
+            .collect();
+        // SAFETY (in `merge`): inside the mapping of the slots (checked
+        // above), or of the buffer they were copied down to
+        // (`inflight_copy_down` puts them one after the other, and has
+        // waited); the copy into the slot ran in the plan's flight, which
+        // the card has run. Nothing writes that memory before the plans'
+        // tickets are landed, after this.
+        let merge = |i: usize, title: &mut Vec<u8>| -> usize {
+            let (shadow, lo, hi, _, after) = &pieces[i];
+            let gpu = unsafe { std::slice::from_raw_parts(places[i] as *const u8, hi - lo) };
+            shadow.card_merge_relay(*lo, gpu, *after, title)
+        };
+        let mut written = 0usize;
+        // Per copy on threads of their own ([`land_merge_wide`]): a copy's
+        // pieces in their order in one job (a range two flights wrote must
+        // take the later flight's bytes last), copies side by side.
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+        if land_merge_wide() && pieces.len() >= 32 {
+            let mut which: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+            for (i, piece) in pieces.iter().enumerate() {
+                let key = Arc::as_ptr(&piece.0) as usize;
+                let g = *which.entry(key).or_insert_with(|| {
+                    groups.push(Vec::new());
+                    groups.len() - 1
+                });
+                groups[g].push(i);
+            }
+        }
+        if groups.len() >= 2 {
+            let total = std::sync::atomic::AtomicUsize::new(0);
+            std::thread::scope(|scope| {
+                let (merge, total) = (&merge, &total);
+                // Up to as many jobs as the landing pool has threads, the
+                // copies dealt round.
+                let n = groups.len().min(4);
+                let mut jobs: Vec<Vec<usize>> = (0..n).map(|_| Vec::new()).collect();
+                for (k, group) in groups.into_iter().enumerate() {
+                    jobs[k % n].extend(group);
+                }
+                for job in jobs {
+                    scope.spawn(move || {
+                        let mut title = Vec::new();
+                        let mut mine = 0;
+                        for i in job {
+                            mine += merge(i, &mut title);
+                        }
+                        total.fetch_add(mine, Ordering::Relaxed);
+                    });
+                }
+            });
+            written = total.load(Ordering::Relaxed);
+            LAND_WIDE.fetch_add(1, Ordering::Relaxed);
+        } else {
+            let mut title = Vec::new();
+            for i in 0..pieces.len() {
+                written += merge(i, &mut title);
+            }
         }
         for plan in plans {
             for r in &plan.ranges {
