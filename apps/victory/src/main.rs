@@ -155,6 +155,10 @@ const FAST_DEFAULTS: &[(&str, &str)] = &[
     // With every buffer on the card, 512 changed runs a submission were
     // outrun 1.5 times a frame, each a settle of 6 ms (run d1).
     ("VICTORY_MERGE_RUNS", "4096"),
+    // Our merges of what the card wrote open only the 4 KiB parts they
+    // write: the refreshes 142 -> 101 MB a frame, 6.7 fps (run f2); the
+    // title's faults still open whole blocks (`1` drew a stretched mesh).
+    ("VICTORY_FINE_GUARDS", "own"),
     ("VICTORY_ASYNC_TEXTURES", "4"),
     ("VICTORY_ASYNC_TEXTURES_MB", "256"),
     ("VICTORY_STAGING_POOL_MB", "128"),

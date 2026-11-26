@@ -94,8 +94,30 @@ pub(crate) fn fine_level() -> u8 {
 /// whole blocks, as before (the kernel's write must not meet a read-only
 /// part, and the title's length may not be exact).
 pub(crate) fn fine_guards() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| fine() && (cfg!(test) || std::env::var_os("VICTORY_FINE_GUARDS").is_some_and(|v| v == "1")))
+    fine_guards_mode() == 2
+}
+
+/// `VICTORY_FINE_GUARDS`: 0 off; `own` (1) only our own writes of exact
+/// bytes ([`writing_exact`]: the merges of what the card wrote) open just
+/// their parts, the title's faults open whole blocks as without the
+/// switch; `1` (2) both ([`fine_guards`]). Run f1 with `1`: the copies
+/// 142.6 -> 96.1 MB a frame, but a mesh drawn stretched across the sky in
+/// every picture (a title write missed somewhere on the fault path).
+fn fine_guards_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        if !fine() {
+            return 0;
+        }
+        if cfg!(test) {
+            return 2;
+        }
+        match std::env::var("VICTORY_FINE_GUARDS").as_deref() {
+            Ok("1") => 2,
+            Ok("own") => 1,
+            _ => 0,
+        }
+    })
 }
 
 /// The journal's record of what was written: per 64 KiB page the asking
@@ -2277,7 +2299,7 @@ fn open_fault_here(g: &mut Guards, at: usize) -> bool {
 /// [`fine_guards`] only the parts written open, and the blocks count as
 /// written in them.
 fn open_exact(g: &mut Guards, start: usize, end: usize) -> bool {
-    if !fine_guards() {
+    if fine_guards_mode() == 0 {
         return open(g, start, end);
     }
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
