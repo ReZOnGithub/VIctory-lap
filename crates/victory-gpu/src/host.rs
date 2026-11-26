@@ -1264,6 +1264,20 @@ fn more_line(frames: f64) -> String {
     )
 }
 
+/// For switches set to `alt`: whether this is an "on" stretch (twenty
+/// seconds on, twenty off, in turn from the first call); each change is
+/// said in the log as "ALT <name> ON|off", so the frame lines between can
+/// be put on either side.
+pub(crate) fn alt_phase(name: &'static str) -> bool {
+    static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+    static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+    let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+    if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+        tracing::info!("ALT {name} {}", if on { "ON" } else { "off" });
+    }
+    on
+}
+
 /// Adds `since`'s time to part `part` of [`PREP_SPLIT`].
 fn prep_add(part: usize, since: std::time::Instant) {
     PREP_SPLIT[part].fetch_add(since.elapsed().as_nanos() as u64, Ordering::Relaxed);

@@ -4232,6 +4232,18 @@ fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 /// page faults (2026-11-24, run w10), so they are not the cause.
 fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     let Some(host) = host() else { return };
+    // One null view made once, copied into each slot
+    // (`VICTORY_NULL_COPY`, on unless `0`): the heap sync nulls some 7,000
+    // slots a frame, each a whole view creation in the driver (about 2 us
+    // a slot in run qs1, 14 ms a frame of the sync's jobs).
+    if null_copy()
+        && let Some(src) = null_source(&host.device)
+    {
+        // SAFETY: both handles name one CBV/SRV/UAV slot: ours, made once,
+        // in a heap that is not shader-visible, and the caller's.
+        unsafe { host.device.CopyDescriptorsSimple(1, at, src, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) };
+        return;
+    }
     let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
         Format: DXGI_FORMAT_R8G8B8A8_UNORM,
         ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
@@ -4248,6 +4260,50 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         host.device
             .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
     };
+}
+
+fn null_copy() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NULL_COPY").is_none_or(|v| v != "0"))
+}
+
+/// The null view [`null_view`] copies: made once in a CPU-only heap of one
+/// slot (kept for the process's life). `None` if the heap could not be made.
+fn null_source(device: &ID3D12Device) -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
+    struct Held(Option<(ID3D12DescriptorHeap, D3D12_CPU_DESCRIPTOR_HANDLE)>);
+    // SAFETY: a descriptor heap may be used from any thread; this one is
+    // only read (copied from) after it is made.
+    unsafe impl Send for Held {}
+    unsafe impl Sync for Held {}
+    static NULL: std::sync::OnceLock<Held> = std::sync::OnceLock::new();
+    NULL.get_or_init(|| {
+        let desc = D3D12_DESCRIPTOR_HEAP_DESC {
+            Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            NumDescriptors: 1,
+            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+            NodeMask: 0,
+        };
+        // SAFETY: a plain descriptor heap of ours.
+        let heap: Option<ID3D12DescriptorHeap> = unsafe { device.CreateDescriptorHeap(&desc) }.ok();
+        Held(heap.map(|heap| {
+            // SAFETY: the heap's first slot.
+            let at = unsafe { heap.GetCPUDescriptorHandleForHeapStart() };
+            let view = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Texture2D: D3D12_TEX2D_SRV { MipLevels: 1, ..Default::default() },
+                },
+            };
+            // SAFETY: a slot of our heap; a null resource is allowed with a desc.
+            unsafe { device.CreateShaderResourceView(None::<&ID3D12Resource>, Some(&view), at) };
+            (heap, at)
+        }))
+    })
+    .0
+    .as_ref()
+    .map(|h| h.1)
 }
 
 #[cfg(test)]

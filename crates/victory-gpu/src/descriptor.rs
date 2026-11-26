@@ -538,8 +538,17 @@ struct PageBuf(Vec<u8>);
 static PAGE_POOL: std::sync::Mutex<Vec<Vec<u8>>> = std::sync::Mutex::new(Vec::new());
 
 fn sync_pool() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_SYNC_POOL").is_some_and(|v| v == "1"))
+    /// 0 off, 1 on, 2 in turn (`alt`: twenty seconds each, said in the log).
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_SYNC_POOL").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => crate::host::alt_phase("VICTORY_SYNC_POOL"),
+    }
 }
 
 impl PageBuf {

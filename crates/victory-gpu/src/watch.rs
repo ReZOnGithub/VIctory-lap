@@ -536,7 +536,14 @@ fn note_guarded(written: &mut Written, pages: impl IntoIterator<Item = (usize, u
 /// walking the pages between them costs less than another kernel call (a
 /// call that resets written pages costs 30-70 microseconds whatever the
 /// range).
-const AHEAD_GAP: usize = (8 << 20) / PAGE;
+/// `VICTORY_AHEAD_GAP_MB` sets it (8 unless set).
+fn ahead_gap() -> usize {
+    static GAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *GAP.get_or_init(|| {
+        let mb = std::env::var("VICTORY_AHEAD_GAP_MB").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(8).clamp(1, 1024);
+        (mb << 20) / PAGE
+    })
+}
 /// The most one asking covers (its answer needs 8 bytes per 4 KiB page).
 const AHEAD_MAX: usize = (1 << 30) / PAGE;
 
@@ -588,7 +595,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         let mut last = pieces[i].1;
         let mut k = i + 1;
         while k < pieces.len()
-            && pieces[k].0 <= last + AHEAD_GAP
+            && pieces[k].0 <= last + ahead_gap()
             && last.max(pieces[k].1) - first <= AHEAD_MAX
         {
             last = last.max(pieces[k].1);
