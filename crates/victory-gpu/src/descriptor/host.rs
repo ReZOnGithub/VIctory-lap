@@ -4110,12 +4110,37 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
             return null_like(desc[..10].try_into().unwrap_or(&[0; 10]), at);
         }
         View::Constant(..) => {
-            let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC::default();
-            // SAFETY: a slot of our heap; a zero location makes a null view.
-            return unsafe { host.device.CreateConstantBufferView(Some(&desc), at) };
+            let make = |slot: D3D12_CPU_DESCRIPTOR_HANDLE| {
+                let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC::default();
+                // SAFETY: a slot of a heap of ours; a zero location makes a null view.
+                unsafe { host.device.CreateConstantBufferView(Some(&desc), slot) };
+            };
+            if !copy_null(20, at, make) {
+                make(at);
+            }
+            return;
         }
         _ => return null_view(at),
     };
+    // Null unordered views by kind ([`copy_null`]): 21 a buffer's, 22 a
+    // texture's of no dimension named, 23 + the dimension otherwise.
+    let kind = if buffer { 21 } else { dimension.map_or(22, |d| 23 + d.min(30)) };
+    let make_uav = |slot: D3D12_CPU_DESCRIPTOR_HANDLE| {
+        let desc = if buffer {
+            D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_UINT,
+                ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                ..Default::default()
+            }
+        } else {
+            null_uav_desc(dimension)
+        };
+        // SAFETY: a slot of a heap of ours; a null resource is allowed with a desc.
+        unsafe { host.device.CreateUnorderedAccessView(None::<&ID3D12Resource>, None::<&ID3D12Resource>, Some(&desc), slot) };
+    };
+    if copy_null(kind, at, make_uav) {
+        return;
+    }
     let desc = if buffer {
         D3D12_UNORDERED_ACCESS_VIEW_DESC {
             Format: DXGI_FORMAT_R32_UINT,
@@ -4179,6 +4204,14 @@ fn null_uav_desc(dimension: Option<u32>) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
 /// A buffer view that reads zeros (raw, as translated shaders mostly read
 /// buffers).
 fn null_buffer_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+    if copy_null(1, at, null_buffer_view_made) {
+        return;
+    }
+    null_buffer_view_made(at);
+}
+
+/// [`null_buffer_view`] made in place.
+fn null_buffer_view_made(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     let Some(host) = host() else { return };
     let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
         Format: DXGI_FORMAT_R32_TYPELESS,
@@ -4206,6 +4239,17 @@ fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     if !TEXTURES.contains(&words[1]) {
         return null_view(at);
     }
+    // Made from `words[1]` alone (the dimension): one null view each.
+    let dimension = words[1];
+    if copy_null(dimension, at, |slot| null_like_made(dimension, slot)) {
+        return;
+    }
+    null_like_made(dimension, at);
+}
+
+/// [`null_like`] of dimension `dimension` made in place.
+fn null_like_made(dimension: u32, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+    let words = &[dimension, dimension, 0, 0, 0, 0, 0, 0, 0, 0];
     let Some(host) = host() else { return };
     // One mip, one slice or cube, plane 0: fields a null view still checks.
     let mut w = [0u32; 10];
@@ -4231,19 +4275,19 @@ fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 /// view; null buffer views there did not stop the world's low-address
 /// page faults (2026-11-24, run w10), so they are not the cause.
 fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
-    let Some(host) = host() else { return };
     // One null view made once, copied into each slot
     // (`VICTORY_NULL_COPY`, on unless `0`): the heap sync nulls some 7,000
     // slots a frame, each a whole view creation in the driver (about 2 us
     // a slot in run qs1, 14 ms a frame of the sync's jobs).
-    if null_copy()
-        && let Some(src) = null_source(&host.device)
-    {
-        // SAFETY: both handles name one CBV/SRV/UAV slot: ours, made once,
-        // in a heap that is not shader-visible, and the caller's.
-        unsafe { host.device.CopyDescriptorsSimple(1, at, src, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) };
+    if copy_null(0, at, null_view_made) {
         return;
     }
+    null_view_made(at);
+}
+
+/// [`null_view`] made in place.
+fn null_view_made(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+    let Some(host) = host() else { return };
     let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
         Format: DXGI_FORMAT_R8G8B8A8_UNORM,
         ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
@@ -4267,43 +4311,53 @@ fn null_copy() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_NULL_COPY").is_none_or(|v| v != "0"))
 }
 
-/// The null view [`null_view`] copies: made once in a CPU-only heap of one
-/// slot (kept for the process's life). `None` if the heap could not be made.
-fn null_source(device: &ID3D12Device) -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
-    struct Held(Option<(ID3D12DescriptorHeap, D3D12_CPU_DESCRIPTOR_HANDLE)>);
-    // SAFETY: a descriptor heap may be used from any thread; this one is
-    // only read (copied from) after it is made.
-    unsafe impl Send for Held {}
-    unsafe impl Sync for Held {}
-    static NULL: std::sync::OnceLock<Held> = std::sync::OnceLock::new();
-    NULL.get_or_init(|| {
+/// The null views [`copy_null`] copies, made once each in a CPU-only heap
+/// of [`NULL_KINDS`] slots (kept for the process's life), by kind.
+const NULL_KINDS: u32 = 64;
+
+struct NullHeap {
+    heap: Option<ID3D12DescriptorHeap>,
+    start: usize,
+    step: usize,
+    made: [std::sync::OnceLock<()>; NULL_KINDS as usize],
+}
+// SAFETY: a descriptor heap may be used from any thread; each slot is
+// written once (under its `OnceLock`) and only read (copied from) after.
+unsafe impl Send for NullHeap {}
+unsafe impl Sync for NullHeap {}
+
+/// Copies the null view of `kind` into `at`, making it first with `make`
+/// (into our slot) if it was not made yet. False (nothing done) when
+/// switched off or without the heap: the caller makes the view itself.
+fn copy_null(kind: u32, at: D3D12_CPU_DESCRIPTOR_HANDLE, make: impl FnOnce(D3D12_CPU_DESCRIPTOR_HANDLE)) -> bool {
+    if !null_copy() || kind >= NULL_KINDS {
+        return false;
+    }
+    let Some(host) = host() else { return false };
+    static NULLS: std::sync::OnceLock<NullHeap> = std::sync::OnceLock::new();
+    let nulls = NULLS.get_or_init(|| {
         let desc = D3D12_DESCRIPTOR_HEAP_DESC {
             Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-            NumDescriptors: 1,
+            NumDescriptors: NULL_KINDS,
             Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
             NodeMask: 0,
         };
         // SAFETY: a plain descriptor heap of ours.
-        let heap: Option<ID3D12DescriptorHeap> = unsafe { device.CreateDescriptorHeap(&desc) }.ok();
-        Held(heap.map(|heap| {
-            // SAFETY: the heap's first slot.
-            let at = unsafe { heap.GetCPUDescriptorHandleForHeapStart() };
-            let view = D3D12_SHADER_RESOURCE_VIEW_DESC {
-                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-                ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
-                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                    Texture2D: D3D12_TEX2D_SRV { MipLevels: 1, ..Default::default() },
-                },
-            };
-            // SAFETY: a slot of our heap; a null resource is allowed with a desc.
-            unsafe { device.CreateShaderResourceView(None::<&ID3D12Resource>, Some(&view), at) };
-            (heap, at)
-        }))
-    })
-    .0
-    .as_ref()
-    .map(|h| h.1)
+        let heap: Option<ID3D12DescriptorHeap> = unsafe { host.device.CreateDescriptorHeap(&desc) }.ok();
+        // SAFETY: plain queries of our heap and device.
+        let start = heap.as_ref().map_or(0, |h| unsafe { h.GetCPUDescriptorHandleForHeapStart() }.ptr);
+        let step = unsafe { host.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) } as usize;
+        NullHeap { heap, start, step, made: [const { std::sync::OnceLock::new() }; NULL_KINDS as usize] }
+    });
+    if nulls.heap.is_none() {
+        return false;
+    }
+    let src = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: nulls.start + kind as usize * nulls.step };
+    nulls.made[kind as usize].get_or_init(|| make(src));
+    // SAFETY: both handles name one CBV/SRV/UAV slot: ours, made above,
+    // and the caller's.
+    unsafe { host.device.CopyDescriptorsSimple(1, at, src, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) };
+    true
 }
 
 #[cfg(test)]
