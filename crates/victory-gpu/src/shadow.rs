@@ -1058,6 +1058,74 @@ fn card_dirty_one(shadow: &Arc<Shadow>, sent_as: u64, fetched: u64) -> Option<Ve
     }
 }
 
+/// Diagnostics: per copy in the card's memory (start), its length, the
+/// changed runs of title bytes merged under flights' shader writes, the
+/// pages looked at for it, the bytes of the declared ranges they lay in;
+/// and, from the landings, its declared pieces and those the card's
+/// compare flagged (shaders really wrote them). Said every 5 s, the copies
+/// with the most runs first: whether title writes meet shader writes in
+/// the same pieces, or only in ranges declared wider than written.
+#[cfg(feature = "diagnostics")]
+static UNDER: Mutex<Option<(std::time::Instant, std::collections::HashMap<u64, [u64; 6]>)>> = Mutex::new(None);
+
+#[cfg(feature = "diagnostics")]
+fn under_with(start: u64, len: u64, f: impl FnOnce(&mut [u64; 6])) {
+    let mut g = UNDER.lock().unwrap_or_else(|e| e.into_inner());
+    let (since, map) = g.get_or_insert_with(|| (std::time::Instant::now(), std::collections::HashMap::new()));
+    let e = map.entry(start).or_insert([len, 0, 0, 0, 0, 0]);
+    f(e);
+    if since.elapsed() >= std::time::Duration::from_secs(5) {
+        let mut all: Vec<(u64, [u64; 6])> = map.drain().collect();
+        all.sort_by_key(|(_, v)| std::cmp::Reverse(v[1]));
+        let top: Vec<String> = all
+            .iter()
+            .take(8)
+            .map(|(at, v)| {
+                format!(
+                    "{at:#x}+{:#x}: {} runs in {} pages under declared ranges of {} KB; landed: {} declared pieces, {} flagged written",
+                    v[0],
+                    v[1],
+                    v[2],
+                    v[3] >> 10,
+                    v[4],
+                    v[5]
+                )
+            })
+            .collect();
+        let (runs, pieces, flagged) =
+            all.iter().fold((0u64, 0u64, 0u64), |a, (_, v)| (a.0 + v[1], a.1 + v[4], a.2 + v[5]));
+        tracing::info!(
+            "title bytes under shader writes, by copy, over 5 s: {runs} runs in all; landed pieces {pieces}, {flagged} of them flagged \
+             written by shaders; the copies with the most runs: {top:?}"
+        );
+        *since = std::time::Instant::now();
+    }
+}
+
+/// [`UNDER`]: a page of copy `start` merged under writes with `runs` runs,
+/// inside a declared stretch of `busy` bytes.
+#[cfg(feature = "diagnostics")]
+fn under_note(start: u64, len: u64, runs: u64, busy: u64) {
+    under_with(start, len, |e| {
+        e[1] += runs;
+        e[2] += 1;
+        e[3] = e[3].max(busy);
+    });
+}
+
+/// [`UNDER`]: a landing of copy `start` looked at `pieces` declared pieces,
+/// `flagged` of them written by shaders.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn under_landed(start: u64, len: u64, pieces: u64, flagged: u64) {
+    if pieces == 0 {
+        return;
+    }
+    under_with(start, len, |e| {
+        e[4] += pieces;
+        e[5] += flagged;
+    });
+}
+
 /// Ranges in order, those that overlap or touch as one.
 fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     ranges.sort_unstable();
@@ -5537,6 +5605,8 @@ impl Shadow {
                     // which only the submitting thread writes.
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                     let runs = joined_over(changed_runs(title, held), merge_gap());
+                    #[cfg(feature = "diagnostics")]
+                    under_note(self.start, self.len, runs.len() as u64, (e - a) as u64);
                     if runs.len() > *runs_left {
                         crate::cpuwait::stale_why(crate::cpuwait::stale::RUNS);
                         return true;
@@ -6360,6 +6430,12 @@ impl Shadow {
     /// more hash passes and 300 more compare passes a frame over such
     /// copies, and the send-and-hash lists took 19.7 ms of the card a frame
     /// where they had taken 10.9.
+    /// The copy's title start and length (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn span_diag(&self) -> (u64, u64) {
+        (self.start, self.len)
+    }
+
     pub(crate) fn card_hashed(&self) -> Option<u64> {
         static WHOLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let size = self.card.as_ref()?.size;

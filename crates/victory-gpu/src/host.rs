@@ -2428,6 +2428,8 @@ struct CardWork {
     fetch: Prelude,
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
+    /// [`CARD_SCATTER`]'s root signature and pipeline, if it compiled.
+    scatter: Option<(ID3D12RootSignature, ID3D12PipelineState)>,
     /// One dword per piece compared, set where the piece differs: PC
     /// memory, mapped (buffer, mapping, bytes).
     differs: (ID3D12Resource, usize, u64),
@@ -2795,6 +2797,75 @@ void main(uint3 group : SV_GroupID, uint t : SV_GroupIndex) {
 /// same scene (the card meter's "send-and-hash lists" in the frame log).
 /// Runs 105-110 found no change in the frame, but the card was not the
 /// frame's limit then.
+/// The byte-exact scatter of small sends into a copy in the card's memory
+/// ([`card_scatter`]): one thread per range of `runs` (offset, bytes, in
+/// the copy), each dword of it merged into `dst` from the CPU's side `src`
+/// (same offsets) by an atomic and of the bytes outside the range and an
+/// atomic or of the range's own: ranges that share a dword compose, and no
+/// byte outside a range is touched (a shader's write in flight beside it
+/// stays).
+pub(crate) const CARD_SCATTER: &str = r#"
+#define RS "RootConstants(num32BitConstants=1, b0), SRV(t0), SRV(t1), UAV(u0)"
+cbuffer Count : register(b0) {
+    uint count;
+};
+ByteAddressBuffer runs : register(t0);
+ByteAddressBuffer src : register(t1);
+RWByteAddressBuffer dst : register(u0);
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    uint i = id.x;
+    if (i >= count) return;
+    uint2 r = runs.Load2(i * 8u);
+    uint lo = r.x;
+    uint hi = r.x + r.y;
+    [loop]
+    for (uint w = lo & ~3u; w < hi; w += 4u) {
+        uint a = max(lo, w);
+        uint b = min(hi, w + 4u);
+        uint m = 0u;
+        [loop]
+        for (uint k = a; k < b; k++) {
+            m |= 0xFFu << ((k - w) * 8u);
+        }
+        uint s = src.Load(w);
+        uint was;
+        dst.InterlockedAnd(w, ~m, was);
+        dst.InterlockedOr(w, s & m, was);
+    }
+}
+"#;
+
+/// Whether ranges of at most [`CARD_SCATTER_MOST`] bytes sent up to a copy
+/// in the card's memory go in one dispatch of [`CARD_SCATTER`] per copy
+/// instead of a copy each (`VICTORY_CARD_SCATTER=1`; off by default).
+///
+/// Run sc1 (with `VICTORY_MERGE_RUNS=65536`): 17.8 million ranges in 85,000
+/// dispatches, the stale settles 2.0 -> 0.4 a frame, but the bookkeeping of
+/// some 60,000 ranges a frame cost as much (frame even), and blocky dark
+/// squares showed on a character's shirt. Not proven to be the scatter
+/// rather than the merges a cap that high lets through.
+///
+/// Title bytes put in under flights' shader writes come in tens of
+/// thousands of runs of a few bytes, nearly all in two buffers (run u1:
+/// the 174 MB pool and a 640 KB buffer, each run its own changed bytes; the
+/// shaders declare those buffers whole but wrote 1 to 10 % of the pieces).
+/// A copy each cost about 0.77 us to record, and past `VICTORY_MERGE_RUNS`
+/// of them the flights were settled instead (two settles a frame, 18 ms).
+/// Here a range costs 8 bytes of a table in upload memory; the merge is
+/// exact to the byte, as the copies were.
+fn card_scatter() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_SCATTER").is_some_and(|v| v == "1"))
+}
+
+/// The longest range [`card_scatter`] takes.
+const CARD_SCATTER_MOST: usize = 256;
+
+/// Since the start: ranges scattered, and dispatches.
+static CARD_SCATTERED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 /// Whether ranges of at most [`CARD_IMMEDIATE_MOST`] bytes sent up to a
 /// copy in the card's memory go as immediate writes of their dwords
 /// (`WriteBufferImmediate`, read from the CPU's side when the list is
@@ -7815,6 +7886,7 @@ impl Host {
                 fetch: list()?,
                 root,
                 pso,
+                scatter: if card_scatter() { self.make_card_scatter() } else { None },
                 differs: (differs, data as usize, RESULTS),
                 fetched: None,
                 taken: 0,
@@ -7822,6 +7894,73 @@ impl Host {
                 stage_wait: None,
                 inflight: if inflight_fetch() { self.make_card_inflight(RESULTS) } else { None },
             })
+        }
+    }
+
+    /// [`CARD_SCATTER`]'s root signature and pipeline; `None` (and a copy a
+    /// range, as before) if it does not compile.
+    fn make_card_scatter(&self) -> Option<(ID3D12RootSignature, ID3D12PipelineState)> {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        let made = (|| -> windows::core::Result<(ID3D12RootSignature, ID3D12PipelineState)> {
+            let mut code: Option<ID3DBlob> = None;
+            let mut errors: Option<ID3DBlob> = None;
+            // SAFETY: the source and names live through the call; the out
+            // pointers are ours.
+            let compiled = unsafe {
+                D3DCompile(
+                    CARD_SCATTER.as_ptr().cast(),
+                    CARD_SCATTER.len(),
+                    windows::core::s!("card scatter"),
+                    None,
+                    None,
+                    windows::core::s!("main"),
+                    windows::core::s!("cs_5_1"),
+                    0,
+                    0,
+                    &mut code,
+                    Some(&mut errors),
+                )
+            };
+            if let Err(e) = compiled {
+                if let Some(errors) = errors {
+                    // SAFETY: the blob's own bytes.
+                    let text = unsafe {
+                        String::from_utf8_lossy(std::slice::from_raw_parts(errors.GetBufferPointer().cast::<u8>(), errors.GetBufferSize()))
+                            .into_owned()
+                    };
+                    tracing::warn!(errors = %text, "the card scatter did not compile");
+                }
+                return Err(e);
+            }
+            let code = code.ok_or_else(windows::core::Error::empty)?;
+            // SAFETY: the blob's own bytes; the root signature is inside
+            // the shader.
+            unsafe {
+                let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+                let root: ID3D12RootSignature = self.device.CreateRootSignature(0, bytes)?;
+                let pso: ID3D12PipelineState = self.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: bytes.as_ptr().cast(),
+                        BytecodeLength: bytes.len(),
+                    },
+                    ..Default::default()
+                })?;
+                Ok((root, pso))
+            }
+        })();
+        match made {
+            Ok(made) => {
+                tracing::info!(
+                    "small sends to copies in the card's memory go in one dispatch per copy (VICTORY_CARD_SCATTER, ranges up to {CARD_SCATTER_MOST} bytes)"
+                );
+                Some(made)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "no card scatter: small sends stay a copy each");
+                None
+            }
         }
     }
 
@@ -8132,6 +8271,9 @@ impl Host {
                         };
                         // The segment of the list the copy's last send is in.
                         let mut last_send = None;
+                        // Whether the copy was last written by the scatter
+                        // (unordered access) rather than a copy.
+                        let mut scattered = false;
                         if let Some(staging) = staging {
                             // Ranges of a few bytes as immediate writes of
                             // their dwords ([`card_immediate`]), the rest as
@@ -8142,7 +8284,16 @@ impl Host {
                             let base = shadow.buffer.GetGPUVirtualAddress();
                             let mut words: Vec<D3D12_WRITEBUFFERIMMEDIATE_PARAMETER> = Vec::new();
                             let mut copied = false;
+                            // [`card_scatter`]: the small ranges, for one
+                            // dispatch after the copies.
+                            let scatter = if landed.is_none() && list2.is_none() { work.scatter.as_ref() } else { None };
+                            let mut small: Vec<[u32; 2]> = Vec::new();
                             for &(a, b) in ranges {
+                                if scatter.is_some() && b - a <= CARD_SCATTER_MOST {
+                                    small.push([a as u32, (b - a) as u32]);
+                                    crate::shadow::CARD_STATS[0].fetch_add((b - a) as u64, Ordering::Relaxed);
+                                    continue;
+                                }
                                 if list2.is_some() && b - a <= CARD_IMMEDIATE_MOST {
                                     let mut word = Vec::new();
                                     let mut off = a & !3;
@@ -8186,6 +8337,46 @@ impl Host {
                                     list2.WriteBufferImmediate(chunk.len() as u32, chunk.as_ptr(), None);
                                 }
                                 CARD_IMMEDIATES[1].fetch_add(words.len() as u64, Ordering::Relaxed);
+                            }
+                            if let Some((root, pso)) = scatter
+                                && !small.is_empty()
+                            {
+                                // From the copies' destination state, or from
+                                // the common state (the buffer's first use in
+                                // the list), to unordered access.
+                                crate::barstat::record(&list, crate::barstat::Why::Submission, &[transition(
+                                    &shadow.buffer,
+                                    if copied { D3D12_RESOURCE_STATE_COPY_DEST } else { D3D12_RESOURCE_STATE_COMMON },
+                                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                )]);
+                                list.SetComputeRootSignature(root);
+                                list.SetPipelineState(pso);
+                                list.SetComputeRootShaderResourceView(2, staging.GetGPUVirtualAddress());
+                                list.SetComputeRootUnorderedAccessView(3, base);
+                                let mut left: &[[u32; 2]] = &small;
+                                while !left.is_empty() {
+                                    let Some((chunk, offset, n)) = stage.take(self, (left.len() * 8) as u64) else {
+                                        fail(format_args!("no upload memory for the card scatter's table"));
+                                    };
+                                    let count = (n as usize / 8).min(left.len());
+                                    if count == 0 {
+                                        continue;
+                                    }
+                                    let (data, gpu) = (stage.chunks[chunk].0.data, stage.chunks[chunk].0.gpu);
+                                    // SAFETY: room just taken in a mapped
+                                    // chunk the plan keeps until its
+                                    // submission has run.
+                                    std::ptr::copy_nonoverlapping(left.as_ptr().cast::<u8>(), (data + offset as usize) as *mut u8, count * 8);
+                                    let constants = [count as u32];
+                                    list.SetComputeRoot32BitConstants(0, 1, constants.as_ptr().cast(), 0);
+                                    list.SetComputeRootShaderResourceView(1, gpu + offset);
+                                    list.Dispatch((count as u32).div_ceil(64), 1, 1);
+                                    CARD_SCATTERED[1].fetch_add(1, Ordering::Relaxed);
+                                    left = &left[count..];
+                                }
+                                CARD_SCATTERED[0].fetch_add(small.len() as u64, Ordering::Relaxed);
+                                scattered = true;
+                                last_send = Some(stage.segments);
                             }
                         } else {
                             // A mirror (`crate::shadow::no_pc_copy`): the bytes
@@ -8237,7 +8428,7 @@ impl Host {
                         if last_send == Some(stage.segments) {
                             crate::barstat::record(&list, crate::barstat::Why::Submission, &[transition(
                                 &shadow.buffer,
-                                D3D12_RESOURCE_STATE_COPY_DEST,
+                                if scattered { D3D12_RESOURCE_STATE_UNORDERED_ACCESS } else { D3D12_RESOURCE_STATE_COPY_DEST },
                                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                             )]);
                         }
@@ -9222,6 +9413,14 @@ impl Host {
                 let mut flags: Vec<(usize, u32, bool)> = Vec::new();
                 for r in &plan.ranges {
                     let copy = Arc::as_ptr(&r.shadow) as usize;
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        let flagged = (0..r.span.pieces)
+                            .filter(|&p| differs.get((r.at + p) as usize).is_some_and(|&f| f != 0))
+                            .count() as u64;
+                        let (st, ln) = r.shadow.span_diag();
+                        crate::shadow::under_landed(st, ln, u64::from(r.span.pieces), flagged);
+                    }
                     for p in 0..r.span.pieces {
                         let at = (r.at + p) as usize;
                         let (Some(&flag), Some(&entry)) = (differs.get(at), table.get(at)) else {
@@ -14645,6 +14844,11 @@ impl Meter {
                     if rehash_runs() { "on" } else { "off" },
                     CARD_IMMEDIATES[0].load(Ordering::Relaxed),
                     CARD_IMMEDIATES[1].load(Ordering::Relaxed)
+                );
+                tracing::info!(
+                    "small sends scattered (VICTORY_CARD_SCATTER) since the start: {} ranges in {} dispatches",
+                    CARD_SCATTERED[0].load(Ordering::Relaxed),
+                    CARD_SCATTERED[1].load(Ordering::Relaxed)
                 );
             }
         }
