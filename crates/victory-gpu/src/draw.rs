@@ -1157,6 +1157,16 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         .left(address)
         .min(if srv { limit } else { 1 << 16 });
     let gpu = shadow.gpu(address);
+    // Renderer port 1 on a card that reads the PC's memory slowly: the
+    // constants copied into the card's memory before the list.
+    if !srv
+        && shadow.is_placed()
+        && crate::port::stage_cbv()
+        && crate::port::touches(address as usize, len as usize)
+        && let Some(staged) = list.stage_constant_now(&shadow.buffer, shadow.offset(address), len)
+    {
+        return Some(staged);
+    }
     if srv || gpu % 256 == 0 {
         shadow.refresh(list, address, len);
         return Some(gpu);

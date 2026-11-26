@@ -192,7 +192,9 @@ fn open_region(device: &ID3D12Device, at: u64, end: u64) -> Result<Region, (usiz
     }
     // SAFETY: the section of a view the title has; the runtime keeps its
     // handle open while a view of it is there, and the range is inside it.
-    let view = unsafe { mem::MapViewOfFile(section as _, mem::FILE_MAP_WRITE, (offset >> 32) as u32, offset as u32, bytes as usize) }.Value as usize;
+    let view = aligned_view(section, offset, bytes as usize)
+        // SAFETY: as above.
+        .unwrap_or_else(|| unsafe { mem::MapViewOfFile(section as _, mem::FILE_MAP_WRITE, (offset >> 32) as u32, offset as u32, bytes as usize) }.Value as usize);
     if view == 0 {
         return Err((5, format!("no view of the stretch: {}", std::io::Error::last_os_error())));
     }
@@ -223,6 +225,51 @@ fn open_region(device: &ID3D12Device, at: u64, end: u64) -> Result<Region, (usiz
             Err((5, format!("refused by the host: {e}")))
         }
     }
+}
+
+/// The alignment of our view of a ported stretch (`VICTORY_PORT_VIEW_ALIGN_MB`,
+/// 1024 unless set; 0: none, any address the system gives).
+///
+/// Why: on an NVIDIA card (RTX 5070) the title's own work on the card took
+/// 2.2 times as long with the heap in place when our view happened to lie
+/// at an address 1 GiB aligned (run pc3: 123 ms a frame on the card) and
+/// 4.5 times when it lay at an ordinary 64 KiB one (runs pc2, pc4, ps2:
+/// ~270 ms). A view aligned that far lets the card map the PC's pages with
+/// its large pages; with small ones every read across the bus misses its
+/// translation first.
+fn view_align() -> usize {
+    static MB: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MB.get_or_init(|| std::env::var("VICTORY_PORT_VIEW_ALIGN_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1024)) << 20
+}
+
+/// A view of `bytes` of `section` from `offset`, at an address aligned to
+/// [`view_align`]; `None` when not asked for or refused.
+fn aligned_view(section: usize, offset: u64, bytes: usize) -> Option<usize> {
+    let align = view_align();
+    if align < (64 << 10) || !align.is_power_of_two() {
+        return None;
+    }
+    // Free room for it, aligned (reserved then let go: what the system
+    // gives next in that gap is ours to map; nothing else of ours maps meanwhile).
+    // SAFETY: a plain reservation, released at once.
+    let room = unsafe { mem::VirtualAlloc(std::ptr::null(), bytes + align, mem::MEM_RESERVE, mem::PAGE_NOACCESS) } as usize;
+    if room == 0 {
+        return None;
+    }
+    // SAFETY: our reservation.
+    unsafe { mem::VirtualFree(room as *mut _, 0, mem::MEM_RELEASE) };
+    let at = room.next_multiple_of(align);
+    // SAFETY: the section of a view the title has (its handle is open), the
+    // range inside it, at an address that was free just now.
+    let view = unsafe {
+        mem::MapViewOfFileEx(section as _, mem::FILE_MAP_WRITE, (offset >> 32) as u32, offset as u32, bytes, at as *const _)
+    }
+    .Value as usize;
+    if view == 0 {
+        tracing::warn!(align, error = %std::io::Error::last_os_error(), "renderer port 1: no aligned view of the stretch: one at any address");
+        return None;
+    }
+    Some(view)
 }
 
 /// Whether every page of `[at, at + len)` is committed.
@@ -262,9 +309,19 @@ pub(crate) fn forget(at: usize, len: usize) {
 }
 
 /// Whether `[at, at + len)` touches ported memory (a quick look).
-fn touches(at: usize, len: usize) -> bool {
+pub(crate) fn touches(at: usize, len: usize) -> bool {
     let hi = BOUNDS[1].load(Ordering::Relaxed);
     hi != 0 && (at as u64) < hi && (at as u64).saturating_add(len as u64) > BOUNDS[0].load(Ordering::Relaxed)
+}
+
+/// Whether root constant views into ported memory are copied by the card
+/// into memory of its own before their list (`VICTORY_PORT_STAGE_CBV=1`):
+/// on a card that reads the PC's memory slowly (NVIDIA: run pc3, every draw
+/// 2.4 times as long with the heap in place), the draws read their
+/// constants from the card's memory instead of across the bus.
+pub(crate) fn stage_cbv() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PORT_STAGE_CBV").is_some_and(|v| v == "1"))
 }
 
 /// A fill of upload memory read `len` bytes at `src` on the CPU.
@@ -286,6 +343,10 @@ pub(crate) fn copied(dst: usize, src: usize, len: usize) {
 /// For the frame-rate line: what is in place, and what of ours read or
 /// wrote it on the CPU per frame.
 pub(crate) fn log(frames: f64) {
+    if stage_cbv() {
+        let v: Vec<u64> = crate::host::STAGE_STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+        tracing::info!(staged = v[0], reused = v[1], no_room = v[2], "renderer port 1: root constant views staged into the card's memory since the start (VICTORY_PORT_STAGE_CBV)");
+    }
     if !on() {
         return;
     }

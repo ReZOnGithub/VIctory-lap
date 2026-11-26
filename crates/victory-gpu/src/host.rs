@@ -11608,6 +11608,10 @@ pub(crate) struct Staged {
 /// Bytes of a list's staged constants ([`Staged`]); more go the old way.
 const STAGED_BYTES: u64 = 4 << 20;
 
+/// Since the start: constants staged, staged ones reused in the same list,
+/// refused for want of room ([`HostList::stage_constant_now`]).
+pub(crate) static STAGE_STATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
 /// Consecutive single-record mesh indirect calls of one pipeline whose
 /// clamped records lie `step` bytes apart in one scratch buffer: one
 /// `ExecuteIndirect` of `count` records.
@@ -11641,6 +11645,12 @@ impl HostList {
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_STAGED_CONSTANTS").is_some_and(|v| v == "1")) {
             return None;
         }
+        self.stage_constant_now(source, offset, len)
+    }
+
+    /// [`HostList::stage_constant`] whatever its switch says (renderer
+    /// port 1's constants, `crate::port::stage_cbv`).
+    pub(crate) fn stage_constant_now(&self, source: &ID3D12Resource, offset: u64, len: u64) -> Option<u64> {
         let mut staged = self.staged.lock().unwrap_or_else(|e| e.into_inner());
         if staged.buffer.is_none() {
             let buffer = host()?.uav_buffer(STAGED_BYTES)?;
@@ -11649,11 +11659,18 @@ impl HostList {
             staged.gpu = unsafe { buffer.GetGPUVirtualAddress() };
             staged.buffer = Some(buffer);
         }
+        // The same bytes staged already for this list: theirs.
+        if let Some(&(_, _, at, _)) = staged.copies.iter().find(|c| c.1 == offset && c.3 == len && c.0 == *source) {
+            STAGE_STATS[1].fetch_add(1, Ordering::Relaxed);
+            return Some(staged.gpu + at);
+        }
         let at = staged.used.next_multiple_of(256);
         let room = len.max(1).next_multiple_of(256);
         if at + room > STAGED_BYTES {
+            STAGE_STATS[2].fetch_add(1, Ordering::Relaxed);
             return None;
         }
+        STAGE_STATS[0].fetch_add(1, Ordering::Relaxed);
         staged.used = at + room;
         staged.copies.push((source.clone(), offset, at, len));
         Some(staged.gpu + at)
