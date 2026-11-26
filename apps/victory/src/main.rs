@@ -159,6 +159,7 @@ const FAST_DEFAULTS: &[(&str, &str)] = &[
     // write: the refreshes 142 -> 101 MB a frame, 6.7 fps (run f2); the
     // title's faults still open whole blocks (`1` drew a stretched mesh).
     ("VICTORY_FINE_GUARDS", "own"),
+    ("VICTORY_PORT_DESCRIPTORS", "1"),
     ("VICTORY_ASYNC_TEXTURES", "4"),
     ("VICTORY_ASYNC_TEXTURES_MB", "256"),
     ("VICTORY_STAGING_POOL_MB", "128"),
