@@ -95,6 +95,93 @@ impl Made {
     }
 }
 
+/// The host resource each slot of a [`HostHeap`] views ([`HostHeap::kept`]),
+/// one atomic pointer a slot: the slot's resource changes with a swap and
+/// no lock. Under one lock over all slots the heap sync's jobs stood in a
+/// line at every slot they made (run p6: a quarter of their waiting).
+/// Readers only compare pointers ([`KeptSlots::shows`]); a resource taken
+/// out goes to `crate::host::retire`, as before.
+pub(crate) struct KeptSlots(Vec<std::sync::atomic::AtomicPtr<std::ffi::c_void>>);
+
+impl KeptSlots {
+    fn new(n: usize) -> Self {
+        KeptSlots((0..n).map(|_| std::sync::atomic::AtomicPtr::new(std::ptr::null_mut())).collect())
+    }
+
+    /// Puts `resource` into slot `i` and gives back what it held (past the
+    /// slots: nothing, and `resource` let go, as the vector did).
+    fn swap(&self, i: usize, resource: Option<ID3D12Resource>) -> Option<ID3D12Resource> {
+        let slot = self.0.get(i)?;
+        let raw = resource.map_or(std::ptr::null_mut(), windows::core::Interface::into_raw);
+        let old = slot.swap(raw, std::sync::atomic::Ordering::AcqRel);
+        // SAFETY: every pointer in a slot is a reference `into_raw` gave up,
+        // taken back exactly once, here or in `drop`.
+        (!old.is_null()).then(|| unsafe { <ID3D12Resource as windows::core::Interface>::from_raw(old) })
+    }
+
+    /// The pointer slot `i` holds (null: nothing): compared, never used.
+    fn raw(&self, i: usize) -> Option<*mut std::ffi::c_void> {
+        self.0.get(i).map(|s| s.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    /// Whether slot `i` holds the resource `raw` (not null).
+    fn shows(&self, i: usize, raw: *mut std::ffi::c_void) -> bool {
+        !raw.is_null() && self.raw(i) == Some(raw)
+    }
+}
+
+impl Drop for KeptSlots {
+    fn drop(&mut self) {
+        for slot in &mut self.0 {
+            let raw = std::mem::replace(slot.get_mut(), std::ptr::null_mut());
+            if !raw.is_null() {
+                // SAFETY: as in `swap`.
+                drop(unsafe { <ID3D12Resource as windows::core::Interface>::from_raw(raw) });
+            }
+        }
+    }
+}
+
+/// A set of slot numbers in [`SHARDS`] shards by number, each behind a
+/// lock of its own ([`HostHeap::buffers`], [`HostHeap::changed`]): a slot's
+/// change takes its shard alone.
+pub(crate) struct ShardedSet(Vec<Mutex<std::collections::BTreeSet<u32>>>);
+
+const SHARDS: usize = 64;
+
+impl ShardedSet {
+    fn new() -> Self {
+        ShardedSet((0..SHARDS).map(|_| Mutex::default()).collect())
+    }
+
+    fn shard(&self, i: u32) -> std::sync::MutexGuard<'_, std::collections::BTreeSet<u32>> {
+        self.0[i as usize % SHARDS].lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn contains(&self, i: u32) -> bool {
+        self.shard(i).contains(&i)
+    }
+
+    /// The members that pass `keep`, in order.
+    fn sorted(&self, keep: impl Fn(u32) -> bool) -> Vec<u32> {
+        let mut out: Vec<u32> = Vec::new();
+        for shard in &self.0 {
+            out.extend(shard.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().filter(|&i| keep(i)));
+        }
+        out.sort_unstable();
+        out
+    }
+
+    /// Every member, taken out.
+    fn take_all(&self) -> Vec<u32> {
+        let mut out: Vec<u32> = Vec::new();
+        for shard in &self.0 {
+            out.extend(std::mem::take(&mut *shard.lock().unwrap_or_else(|e| e.into_inner())));
+        }
+        out
+    }
+}
+
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
@@ -146,7 +233,7 @@ pub(crate) struct HostHeap {
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
     /// read there is a GPU page fault (the console reads stale memory).
-    kept: Mutex<Vec<Option<ID3D12Resource>>>,
+    kept: KeptSlots,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
@@ -174,10 +261,10 @@ pub(crate) struct HostHeap {
     /// (and its memory a host copy) only when something reads it: a draw
     /// through a table, or [`HostHeap::buffer_slots`] for shaders that pick
     /// buffers from the whole heap.
-    buffers: Mutex<std::collections::BTreeSet<u32>>,
+    buffers: ShardedSet,
     /// Of those and of the slots that left the set: the ones written since
     /// [`HostHeap::buffer_changes`] last took them.
-    changed: Mutex<std::collections::HashSet<u32>>,
+    changed: ShardedSet,
     /// Title slots holding a view of a texture the title may fill itself (a
     /// placed texture, a texture object), with the frame from which they
     /// are due: such a texture is uploaded when a draw reads it through a
@@ -1159,13 +1246,13 @@ impl HostHeap {
             drawn_key: (0..if sampler || sync_tables() < 2 { 0 } else { count })
                 .map(|_| std::sync::atomic::AtomicU64::new(0))
                 .collect(),
-            kept: Mutex::new(vec![None; (count + extra) as usize]),
+            kept: KeptSlots::new((count + extra) as usize),
             next: Mutex::new((0, vec![false; DYNAMIC as usize])),
             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
-            buffers: Mutex::default(),
-            changed: Mutex::default(),
+            buffers: ShardedSet::new(),
+            changed: ShardedSet::new(),
             textures: Mutex::new(TextureQueue { marks: Some(in_sets.clone()), ..TextureQueue::default() }),
             tabled: (0..if sampler { 0 } else { count })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
@@ -1543,12 +1630,7 @@ impl HostHeap {
         // made anew here, with the card full. `made` first, then `kept`,
         // as `mirror` takes them.
         self.made.get(index as usize).is_some_and(|made| made != 0 && made == key)
-            && self
-                .kept
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(index as usize)
-                .is_some_and(Option::is_some)
+            && self.kept.raw(index as usize).is_some_and(|raw| !raw.is_null())
     }
 
     /// Levels on demand (`crate::tiles`): makes again the host slots of the
@@ -1727,8 +1809,7 @@ impl HostHeap {
             found.retain(|&(_, index)| !placed.by_slot.contains_key(&index) && !placed.first.contains_key(&index));
         }
         if !found.is_empty() {
-            let buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
-            found.retain(|&(_, index)| !buffers.contains(&index));
+            found.retain(|&(_, index)| !self.buffers.contains(index));
         }
         found.into_iter().map(|(tag, _)| tag).collect()
     }
@@ -1816,14 +1897,12 @@ impl HostHeap {
 
     /// The title slots that hold buffer views.
     pub(crate) fn buffer_slots(&self) -> Vec<u32> {
-        let buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
-        buffers.iter().copied().collect()
+        self.buffers.sorted(|_| true)
     }
 
     /// The title slots that hold buffer views and pass `keep`.
     pub(crate) fn buffer_slots_where(&self, keep: impl Fn(u32) -> bool) -> Vec<u32> {
-        let buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
-        buffers.iter().copied().filter(|&i| keep(i)).collect()
+        self.buffers.sorted(keep)
     }
 
     /// For each of `slots` (title slot, record key as [`HostHeap::mirror`]
@@ -1831,15 +1910,12 @@ impl HostHeap {
     /// that record and still views that buffer: what a pass resolved for
     /// it then is what it shows now. Under one lock of each.
     pub(crate) fn still_made(&self, slots: &[(u32, u64, &ID3D12Resource)]) -> Vec<bool> {
-        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         slots
             .iter()
             .map(|&(index, key, buffer)| {
                 key != 0
                     && self.made.get(index as usize) == Some(key)
-                    && kept.get(index as usize).and_then(Option::as_ref).is_some_and(|shown| {
-                        windows::core::Interface::as_raw(shown) == windows::core::Interface::as_raw(buffer)
-                    })
+                    && self.kept.shows(index as usize, windows::core::Interface::as_raw(buffer))
             })
             .collect()
     }
@@ -1847,8 +1923,7 @@ impl HostHeap {
     /// The title slots whose buffer view was written, or went, since the
     /// last call.
     pub(crate) fn buffer_changes(&self) -> Vec<u32> {
-        let mut changed = self.changed.lock().unwrap_or_else(|e| e.into_inner());
-        std::mem::take(&mut *changed).into_iter().collect()
+        self.changed.take_all()
     }
 
     /// Records what title slot `index` now holds for shaders that pick
@@ -1938,7 +2013,9 @@ impl HostHeap {
         let was = if stride.is_none() && !self.in_sets.may(index, IN_BUFFERS) {
             false
         } else {
-            let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+            // The slot's shard alone: the heap sync's jobs each take their
+            // own slots, and one lock over the set had them in a line.
+            let mut buffers = self.buffers.shard(index);
             if stride.is_some() {
                 self.in_sets.set(index, IN_BUFFERS);
                 buffers.insert(index);
@@ -1953,10 +2030,7 @@ impl HostHeap {
         // second time at the next pass for nothing (some 20,000 slots a
         // frame in the world). `VICTORY_HEAP_PASS_ECHO=1`: marked as before.
         if was && !(PASS_SLOT.get() == index && !pass_echo()) {
-            self.changed
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(index);
+            self.changed.shard(index).insert(index);
         }
         stale
     }
@@ -2004,11 +2078,7 @@ impl HostHeap {
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
         // A running submission may still read the old resource through
         // this slot: retired, after the lock is let go.
-        let old = {
-            let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-            kept.get_mut(index as usize).and_then(|slot| std::mem::replace(slot, resource))
-        };
-        if let Some(old) = old {
+        if let Some(old) = self.kept.swap(index as usize, resource) {
             crate::host::retire(old);
         }
     }
@@ -2481,10 +2551,7 @@ impl HostHeap {
         if nulled.is_empty() {
             return;
         }
-        let olds: Vec<ID3D12Resource> = {
-            let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-            nulled.iter().filter_map(|&i| kept.get_mut(i as usize).and_then(Option::take)).collect()
-        };
+        let olds: Vec<ID3D12Resource> = nulled.iter().filter_map(|&i| self.kept.swap(i as usize, None)).collect();
         for old in olds {
             crate::host::retire(old);
         }
@@ -2509,12 +2576,9 @@ impl HostHeap {
                 unsafe { (*data as *mut u32).add(index as usize).write_volatile(0) };
             }
         }
-        let was: Vec<u32> = {
-            let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
-            nulled.iter().copied().filter(|i| buffers.remove(i)).collect()
-        };
-        if !was.is_empty() {
-            self.changed.lock().unwrap_or_else(|e| e.into_inner()).extend(was);
+        let was: Vec<u32> = nulled.iter().copied().filter(|&i| self.buffers.shard(i).remove(&i)).collect();
+        for i in was {
+            self.changed.shard(i).insert(i);
         }
     }
 
@@ -2728,9 +2792,11 @@ impl HostHeap {
     /// that is brought up to date for it).
     #[cfg(feature = "diagnostics")]
     pub(crate) fn shows(&self, index: u32, buffer: &ID3D12Resource) -> Option<bool> {
-        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-        let shown = kept.get(index as usize)?.as_ref()?;
-        Some(windows::core::Interface::as_raw(shown) == windows::core::Interface::as_raw(buffer))
+        let shown = self.kept.raw(index as usize)?;
+        if shown.is_null() {
+            return None;
+        }
+        Some(shown == windows::core::Interface::as_raw(buffer))
     }
 
     /// What the queue of textures picked by index knows of title slot
@@ -5123,7 +5189,7 @@ mod record_key_tests {
         assert_eq!(noops(&[(0, 3), (1, 4)]), vec![0]);
         // A slot in the buffer set (the buffer pass would hear of it) is
         // not passed over either.
-        heap.buffers.lock().unwrap_or_else(|e| e.into_inner()).insert(3);
+        heap.buffers.shard(3).insert(3);
         assert!(noops(&[(0, 3)]).is_empty());
     }
 }

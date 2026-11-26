@@ -5909,6 +5909,21 @@ impl Shadow {
         }
     }
 
+    /// The dword at offset `offset` (a multiple of 4) of the CPU's side of
+    /// a copy in the card's memory, for a send of a few bytes as an
+    /// immediate write (`crate::host`'s `card_immediate`); `None` past the
+    /// copy's buffer or without a CPU side of its own.
+    pub(crate) fn side_word(&self, offset: usize) -> Option<u32> {
+        let card = self.card.as_ref()?;
+        if card.staging.is_none() || offset + 4 > card.size as usize || self.data.is_null() {
+            return None;
+        }
+        // SAFETY: inside the CPU side's mapping (checked above); a dword the
+        // submitting thread or the landing thread may be writing reads as
+        // one of the values it had.
+        Some(unsafe { self.data.add(offset).cast::<u32>().read_unaligned() })
+    }
+
     /// With [`wide_copy`]: where title address `address` (inside the
     /// buffer) is in the copy's mapping.
     pub(crate) fn host_at(&self, address: usize) -> usize {

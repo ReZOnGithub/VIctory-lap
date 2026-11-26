@@ -2795,6 +2795,34 @@ void main(uint3 group : SV_GroupID, uint t : SV_GroupIndex) {
 /// same scene (the card meter's "send-and-hash lists" in the frame log).
 /// Runs 105-110 found no change in the frame, but the card was not the
 /// frame's limit then.
+/// Whether ranges of at most [`CARD_IMMEDIATE_MOST`] bytes sent up to a
+/// copy in the card's memory go as immediate writes of their dwords
+/// (`WriteBufferImmediate`, read from the CPU's side when the list is
+/// recorded) instead of a copy each (`VICTORY_CARD_IMMEDIATE=1`; off by
+/// default). Run i1 (with `VICTORY_MERGE_RUNS=65536`): about 0.26 us a
+/// range against 0.77 for a copy, but 65,000 ranges a frame cost more than
+/// the settles they saved, and a pale column stood in the sky in the
+/// pictures (not seen in other runs; not proven to be this).
+///
+/// Title bytes put in under flights' shader writes come in tens of
+/// thousands of runs of a few bytes (run d4: 29,031 runs, 0.12 MB in all, a
+/// frame); each was a `CopyBufferRegion` of its own (about 0.6 us to
+/// record), and past `VICTORY_MERGE_RUNS` of them the flights were settled
+/// instead (1.3 to 2 settles a frame, 7 ms each). A dword widens a run to
+/// its 4-byte edges: the bytes beside it are the CPU side's, which is what
+/// the card holds there unless a shader wrote a single byte of the same
+/// dword in flight.
+fn card_immediate() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_IMMEDIATE").is_some_and(|v| v == "1"))
+}
+
+/// The longest range sent as immediate writes ([`card_immediate`]).
+const CARD_IMMEDIATE_MOST: usize = 64;
+
+/// Since the start: ranges sent as immediate writes, and their dwords.
+static CARD_IMMEDIATES: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 fn rehash_runs() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_REHASH_RUNS").is_none_or(|v| v != "0"))
@@ -8105,16 +8133,59 @@ impl Host {
                         // The segment of the list the copy's last send is in.
                         let mut last_send = None;
                         if let Some(staging) = staging {
+                            // Ranges of a few bytes as immediate writes of
+                            // their dwords ([`card_immediate`]), the rest as
+                            // copies, first: a copy takes the buffer from the
+                            // common state to a copy's destination, where
+                            // the writes need it.
+                            let list2 = if landed.is_none() && card_immediate() { list.cast::<ID3D12GraphicsCommandList2>().ok() } else { None };
+                            let base = shadow.buffer.GetGPUVirtualAddress();
+                            let mut words: Vec<D3D12_WRITEBUFFERIMMEDIATE_PARAMETER> = Vec::new();
+                            let mut copied = false;
                             for &(a, b) in ranges {
+                                if list2.is_some() && b - a <= CARD_IMMEDIATE_MOST {
+                                    let mut word = Vec::new();
+                                    let mut off = a & !3;
+                                    while off < b {
+                                        match shadow.side_word(off) {
+                                            Some(value) => word.push(D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: base + off as u64, Value: value }),
+                                            None => break,
+                                        }
+                                        off += 4;
+                                    }
+                                    if off >= b {
+                                        words.extend(word);
+                                        crate::shadow::CARD_STATS[0].fetch_add((b - a) as u64, Ordering::Relaxed);
+                                        CARD_IMMEDIATES[0].fetch_add(1, Ordering::Relaxed);
+                                        last_send = Some(stage.segments);
+                                        continue;
+                                    }
+                                }
                                 // Upstream's `VICTORY_QUEUE2` bit 2: out of
                                 // the landing buffer the copy queue filled.
                                 match &landed {
                                     Some(landing) => list.CopyBufferRegion(&shadow.buffer, a as u64, landing, at, (b - a) as u64),
                                     None => list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64),
                                 }
+                                copied = true;
                                 at += (b - a) as u64;
                                 crate::shadow::CARD_STATS[0].fetch_add((b - a) as u64, Ordering::Relaxed);
                                 last_send = Some(stage.segments);
+                            }
+                            if let Some(list2) = &list2
+                                && !words.is_empty()
+                            {
+                                if !copied {
+                                    crate::barstat::record(&list, crate::barstat::Why::Submission, &[transition(
+                                        &shadow.buffer,
+                                        D3D12_RESOURCE_STATE_COMMON,
+                                        D3D12_RESOURCE_STATE_COPY_DEST,
+                                    )]);
+                                }
+                                for chunk in words.chunks(4096) {
+                                    list2.WriteBufferImmediate(chunk.len() as u32, chunk.as_ptr(), None);
+                                }
+                                CARD_IMMEDIATES[1].fetch_add(words.len() as u64, Ordering::Relaxed);
                             }
                         } else {
                             // A mirror (`crate::shadow::no_pc_copy`): the bytes
@@ -14570,8 +14641,10 @@ impl Meter {
             if passes + compares > 0.0 {
                 tracing::info!(
                     "our passes over copies in the card's memory per frame: {passes:.0} hash passes over {pieces:.0} pieces after \
-                     ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}), {compares:.0} compare passes",
-                    if rehash_runs() { "on" } else { "off" }
+                     ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}), {compares:.0} compare passes; since the                      start {} ranges sent as {} immediate dwords (VICTORY_CARD_IMMEDIATE)",
+                    if rehash_runs() { "on" } else { "off" },
+                    CARD_IMMEDIATES[0].load(Ordering::Relaxed),
+                    CARD_IMMEDIATES[1].load(Ordering::Relaxed)
                 );
             }
         }
