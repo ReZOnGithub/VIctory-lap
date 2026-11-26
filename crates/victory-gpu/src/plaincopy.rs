@@ -47,11 +47,53 @@ core::arch::global_asm!(
     "    ret",
 );
 
+// The same contract with streaming stores ([`copy_stream`]): rcx to (32-byte
+// aligned), rdx from, r8 bytes (a multiple of 128, not 0). Loads of the
+// source lie between `victory_copy_stream_begin` and `_end`: a read fault
+// there continues at `victory_copy_stream_fault`, which returns 0. Only
+// ymm0-ymm3 are used (volatile in the Windows x64 convention); the upper
+// halves are cleared on the way out.
+#[cfg(target_arch = "x86_64")]
+core::arch::global_asm!(
+    ".globl victory_copy_stream",
+    ".globl victory_copy_stream_begin",
+    ".globl victory_copy_stream_end",
+    ".globl victory_copy_stream_fault",
+    "victory_copy_stream:",
+    "victory_copy_stream_begin:",
+    "    vmovdqu ymm0, [rdx]",
+    "    vmovdqu ymm1, [rdx + 32]",
+    "    vmovdqu ymm2, [rdx + 64]",
+    "    vmovdqu ymm3, [rdx + 96]",
+    "    vmovntdq [rcx], ymm0",
+    "    vmovntdq [rcx + 32], ymm1",
+    "    vmovntdq [rcx + 64], ymm2",
+    "    vmovntdq [rcx + 96], ymm3",
+    "    add rdx, 128",
+    "    add rcx, 128",
+    "    sub r8, 128",
+    "    jnz victory_copy_stream_begin",
+    "victory_copy_stream_end:",
+    "    sfence",
+    "    vzeroupper",
+    "    mov eax, 1",
+    "    ret",
+    "victory_copy_stream_fault:",
+    "    sfence",
+    "    vzeroupper",
+    "    xor eax, eax",
+    "    ret",
+);
+
 #[cfg(target_arch = "x86_64")]
 unsafe extern "C" {
     fn victory_copy_guarded(to: *mut u8, from: *const u8, len: usize) -> u32;
     static victory_copy_guarded_at: u8;
     static victory_copy_guarded_fault: u8;
+    fn victory_copy_stream(to: *mut u8, from: *const u8, len: usize) -> u32;
+    static victory_copy_stream_begin: u8;
+    static victory_copy_stream_end: u8;
+    static victory_copy_stream_fault: u8;
 }
 
 /// Whether copies of title memory into host memory are made in place
@@ -141,15 +183,23 @@ fn install() {
         // SAFETY: the system passes the exception being dispatched and the
         // context it will continue with.
         let (r, context) = unsafe { (&*(*info).ExceptionRecord, &mut *(*info).ContextRecord) };
-        // Only at the copy's own instruction.
-        if context.Rip != (&raw const victory_copy_guarded_at) as u64 {
+        // Only at the copy's own instruction, or among the streaming copy's
+        // loads (its stores go to memory of ours, which is always there).
+        let at = context.Rip;
+        let plain = at == (&raw const victory_copy_guarded_at) as u64;
+        let stream = at >= (&raw const victory_copy_stream_begin) as u64 && at < (&raw const victory_copy_stream_end) as u64;
+        if !plain && !stream {
             return EXCEPTION_CONTINUE_SEARCH;
         }
         const READ: usize = 0;
         let read = r.NumberParameters >= 1 && r.ExceptionInformation[0] == READ;
         let gone = (r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION || r.ExceptionCode == EXCEPTION_IN_PAGE_ERROR) && read;
         if gone || r.ExceptionCode == EXCEPTION_GUARD_PAGE {
-            context.Rip = (&raw const victory_copy_guarded_fault) as u64;
+            context.Rip = if plain {
+                (&raw const victory_copy_guarded_fault) as u64
+            } else {
+                (&raw const victory_copy_stream_fault) as u64
+            };
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         EXCEPTION_CONTINUE_SEARCH
@@ -208,6 +258,54 @@ pub(crate) fn copy(to: *mut u8, from: *const u8, len: usize) -> bool {
     whole
 }
 
+/// [`copy`] for a destination nothing on this processor reads soon (a host
+/// copy the card takes its bytes from, upload memory): with streaming
+/// stores where it can (`VICTORY_COPY_STREAM=1`; off by default: run n1
+/// streamed some 35 MB a frame and the moves took as long, 11.5 against
+/// 11.2 ms; the
+/// destination 32-byte aligned, a multiple of 128 bytes, a processor with
+/// AVX), else as [`copy`].
+///
+/// The refreshes move some 100 MB a frame into host copies, bound by the
+/// memory's speed (about 8 GB/s on nine threads, run q4) beside the card's
+/// own reads over the bus. A plain store first reads each destination line
+/// into the cache (read for ownership) and pushes other lines out; the
+/// card reads these bytes next, not this processor, so the stream skips
+/// both.
+pub(crate) fn copy_stream(to: *mut u8, from: *const u8, len: usize) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let streams = *ON.get_or_init(|| {
+            std::env::var_os("VICTORY_COPY_STREAM").is_some_and(|v| v == "1") && std::arch::is_x86_feature_detected!("avx")
+        });
+        if streams && on() && len >= 4096 && len % 128 == 0 && (to as usize) % 32 == 0 {
+            if faulted_lately(from as usize, len) {
+                COUNT[3].fetch_add(1, Relaxed);
+                return false;
+            }
+            install();
+            // SAFETY: the destination is the caller's to write, 32-byte
+            // aligned and a multiple of 128 bytes long (checked); a source
+            // page that is not there ends the copy with 0 ([`install`]).
+            let whole = unsafe { victory_copy_stream(to, from, len) != 0 };
+            if whole {
+                COUNT[0].fetch_add(1, Relaxed);
+                COUNT[1].fetch_add(len as u64, Relaxed);
+                STREAMED.fetch_add(len as u64, Relaxed);
+            } else {
+                COUNT[2].fetch_add(1, Relaxed);
+                note_fault(from as usize, len);
+            }
+            return whole;
+        }
+    }
+    copy(to, from, len)
+}
+
+/// Since the start: bytes moved by [`copy_stream`]'s streaming stores.
+pub(crate) static STREAMED: AtomicU64 = AtomicU64::new(0);
+
 /// With [`on`]: copies `len` bytes, fewer than [`LEAST`], of title memory
 /// at `from` into host memory at `to`, for a caller that is NOT asking
 /// whether the page is there but expects it to be (a list's fill of upload
@@ -254,8 +352,9 @@ pub(crate) fn line(frames: f64) {
         "copies of title memory made in place per frame (VICTORY_COPY_PLAIN=1): {copies:.0}, {:.1} MB; {gone:.1} met a page \
          that was not there and went through the kernel's copy; left to the kernel's copy untried: {lately:.0} whose source \
          faulted in the last two seconds, {small:.0} of under {LEAST} bytes; fills of under {LEAST} bytes made in place \
-         (VICTORY_FILLS_PLAIN): {fills:.0}",
-        bytes / 1e6
+         (VICTORY_FILLS_PLAIN): {fills:.0}; streamed since the start (VICTORY_COPY_STREAM): {} MB",
+        bytes / 1e6,
+        STREAMED.load(Relaxed) >> 20
     );
 }
 
