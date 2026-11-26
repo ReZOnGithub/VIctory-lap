@@ -432,6 +432,22 @@ fn tally(s: S, n: u64) {
     SPLIT[s as usize].fetch_add(n, Relaxed);
 }
 
+/// One call in this many is timed on the hot paths ([`sampled`]).
+pub(crate) const SAMPLE: u64 = 16;
+
+/// Whether this call is one of the timed ones (every [`SAMPLE`]th on this
+/// thread).
+pub(crate) fn sampled() -> bool {
+    thread_local! {
+        static N: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+    N.with(|n| {
+        let v = n.get().wrapping_add(1);
+        n.set(v);
+        v % SAMPLE == 0
+    })
+}
+
 /// Adds the nanoseconds since `since` to `s`.
 fn tally_since(s: S, since: std::time::Instant) {
     tally(s, since.elapsed().as_nanos() as u64);
@@ -1104,20 +1120,29 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let locking = std::time::Instant::now();
+    // Timed on every 16th call only, counted sixteen times: some 28,000
+    // calls a frame each read the clock four times for these counters
+    // alone (profile p12: 1.5 % of the submitting thread in the clock).
+    let timed = sampled();
+    let locking = timed.then(std::time::Instant::now);
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    tally_since(S::LockNs, locking);
+    if let Some(at) = locking {
+        tally(S::LockNs, at.elapsed().as_nanos() as u64 * SAMPLE);
+    }
     let j = &mut *j;
     // Asked ahead with the submission's other ranges: the journal has it.
     // View memory asked ahead ([`views_once`]) answers only an asker that
     // would ask the guards.
-    let started = std::time::Instant::now();
+    let looking = timed.then(std::time::Instant::now);
     if j.ahead.covers(first, last, guarded) {
         let answer = Some((j.ahead_asked, j.written.range(first, last)));
         tally(S::JournalN, 1);
-        tally_since(S::JournalNs, started);
+        if let Some(at) = looking {
+            tally(S::JournalNs, at.elapsed().as_nanos() as u64 * SAMPLE);
+        }
         return answer;
     }
+    let started = std::time::Instant::now();
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
     let mut granularity = 0;

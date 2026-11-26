@@ -6058,9 +6058,11 @@ impl Shadow {
     fn plan_runs(&self, parts: &[(usize, usize)], runs: &mut Vec<(usize, usize)>) {
         for &(from, to) in parts {
             if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
-                let asking = std::time::Instant::now();
+                let asking = crate::watch::sampled().then(std::time::Instant::now);
                 let writes = crate::watch::writes(from, to, true);
-                REFRESH_SPLIT[0].fetch_add(asking.elapsed().as_micros() as u64, Ordering::Relaxed);
+                if let Some(at) = asking {
+                    REFRESH_SPLIT[0].fetch_add(at.elapsed().as_nanos() as u64 * crate::watch::SAMPLE / 1000, Ordering::Relaxed);
+                }
                 if let Some((now, written)) = writes {
                     self.watched.store(1, Ordering::Relaxed);
                     let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
