@@ -2884,6 +2884,33 @@ const CARD_SCATTER_MOST: usize = 256;
 /// Since the start: ranges scattered, and dispatches.
 static CARD_SCATTERED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+/// The unit hash buffers are made and pooled in (a committed buffer takes
+/// 64 KiB however small it is).
+const HASH_GRAIN: u64 = 64 << 10;
+
+/// Hash buffers let go by copies, by their size ([`Host::hash_buffer`]).
+static HASH_POOL: Mutex<Vec<(u64, PooledHash)>> = Mutex::new(Vec::new());
+
+/// The most buffers [`HASH_POOL`] keeps.
+const HASH_POOL_MOST: usize = 2048;
+
+/// Since the start: hash buffers taken from the pool, and made new.
+static HASH_POOL_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+struct PooledHash(ID3D12Resource);
+// SAFETY: a D3D12 resource (free-threaded), behind the pool's lock.
+unsafe impl Send for PooledHash {}
+
+/// A copy in the card's memory went (nothing holds it, so no list runs
+/// with it): its hash buffer, made for `bytes` of hashes, goes to the pool.
+pub(crate) fn hash_buffer_back(bytes: u64, buffer: ID3D12Resource) {
+    let bucket = bytes.max(1).next_multiple_of(HASH_GRAIN);
+    let mut pool = HASH_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    if pool.len() < HASH_POOL_MOST {
+        pool.push((bucket, PooledHash(buffer)));
+    }
+}
+
 /// Whether ranges of at most [`CARD_IMMEDIATE_MOST`] bytes sent up to a
 /// copy in the card's memory go as immediate writes of their dwords
 /// (`WriteBufferImmediate`, read from the CPU's side when the list is
@@ -8132,11 +8159,7 @@ impl Host {
         // its bytes from before, whole.
         let mut whole: Vec<Arc<crate::shadow::Shadow>> = Vec::new();
         for (shadow, _) in &declared {
-            if shadow.card_make_before(|size| {
-                let before = self.uav_buffer(crate::shadow::card_hash_bytes(size))?;
-                name(&before, || "title buffer on the card, hashes of its pieces".into());
-                Some(before)
-            }) {
+            if shadow.card_make_before(|size| self.hash_buffer(crate::shadow::card_hash_bytes(size))) {
                 whole.push(shadow.clone());
                 if !dirty.iter().any(|(s, _)| Arc::ptr_eq(s, shadow)) {
                     dirty.push((shadow.clone(), Vec::new()));
@@ -14864,9 +14887,11 @@ impl Meter {
                     CARD_IMMEDIATES[1].load(Ordering::Relaxed)
                 );
                 tracing::info!(
-                    "small sends scattered (VICTORY_CARD_SCATTER) since the start: {} ranges in {} dispatches",
+                    "small sends scattered (VICTORY_CARD_SCATTER) since the start: {} ranges in {} dispatches; hash buffers taken                      from the pool {}, made new {}",
                     CARD_SCATTERED[0].load(Ordering::Relaxed),
-                    CARD_SCATTERED[1].load(Ordering::Relaxed)
+                    CARD_SCATTERED[1].load(Ordering::Relaxed),
+                    HASH_POOL_STATS[0].load(Ordering::Relaxed),
+                    HASH_POOL_STATS[1].load(Ordering::Relaxed)
                 );
             }
         }
@@ -15705,6 +15730,29 @@ impl Host {
 
     /// A device-local buffer shaders may write (unordered access) and indirect
     /// execution may read, starting in the common state.
+    /// A buffer of at least `bytes` for a copy's piece hashes in the card's
+    /// memory: one let go by a copy before ([`hash_buffer_back`]) if one of
+    /// that size is there, else a new one. Each copy's first declared
+    /// shader writes made one (a committed resource, some 50 us), and the
+    /// title's transient pool makes new copies all along: 3 to 5 ms a frame
+    /// on the submitting thread (run p9). A buffer taken again is hashed
+    /// whole before it is used, as a new one is.
+    fn hash_buffer(&self, bytes: u64) -> Option<ID3D12Resource> {
+        let bucket = bytes.max(1).next_multiple_of(HASH_GRAIN);
+        let pooled = {
+            let mut pool = HASH_POOL.lock().unwrap_or_else(|e| e.into_inner());
+            pool.iter().rposition(|(b, _)| *b == bucket).map(|i| pool.swap_remove(i).1)
+        };
+        if let Some(PooledHash(buffer)) = pooled {
+            HASH_POOL_STATS[0].fetch_add(1, Ordering::Relaxed);
+            return Some(buffer);
+        }
+        HASH_POOL_STATS[1].fetch_add(1, Ordering::Relaxed);
+        let buffer = self.uav_buffer(bucket)?;
+        name(&buffer, || "title buffer on the card, hashes of its pieces".into());
+        Some(buffer)
+    }
+
     pub(crate) fn uav_buffer(&self, size: u64) -> Option<ID3D12Resource> {
         MADE[4].fetch_add(1, Ordering::Relaxed);
         MADE[5].fetch_add(size, Ordering::Relaxed);

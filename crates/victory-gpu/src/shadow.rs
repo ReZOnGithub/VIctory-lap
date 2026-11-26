@@ -139,6 +139,16 @@ struct Card {
     size: u64,
 }
 
+impl Drop for Card {
+    fn drop(&mut self) {
+        // Nothing holds the copy any more, so no list runs with its hashes:
+        // the buffer is made use of again (`crate::host::hash_buffer_back`).
+        if let Some(before) = self.before.get_mut().unwrap_or_else(|e| e.into_inner()).take() {
+            crate::host::hash_buffer_back(card_hash_bytes(self.size), before);
+        }
+    }
+}
+
 /// Whether the host copies of big title buffers are in the card's own
 /// memory (on by default since run 75 showed it holds: the BVH skinning
 /// list went from 50.5 to 4.5 ms on the card; `VICTORY_CARD_BUFFERS=0`
