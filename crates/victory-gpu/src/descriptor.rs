@@ -302,6 +302,9 @@ fn sync_heaps_avoiding(avoid: Option<&[(usize, usize)]>, due_left: bool) {
                 if wide {
                     let mut bytes = vec![0u8; to - from];
                     if crate::host::read_into(from as *const u8, &mut bytes) {
+                        // One buffer for all its pieces (each piece had a
+                        // copy of its own: about 2.5 ms a frame, run p7).
+                        let bytes = std::sync::Arc::new(bytes);
                         pages += 1;
                         // In pieces of `sync_piece` records, cut where a
                         // record starts: a page's records are all of one
@@ -324,7 +327,8 @@ fn sync_heaps_avoiding(avoid: Option<&[(usize, usize)]>, due_left: bool) {
                                 mirrored_count,
                                 from: a,
                                 to: b,
-                                bytes: bytes[a - from..b - from].to_vec(),
+                                bytes: bytes.clone(),
+                                at: a - from,
                             });
                             a = b;
                         }
@@ -515,7 +519,10 @@ struct SyncPage {
     mirrored_count: u32,
     from: usize,
     to: usize,
-    bytes: Vec<u8>,
+    /// The page's bytes as read, shared by its pieces, and where this
+    /// piece's (`from`) begins in them.
+    bytes: std::sync::Arc<Vec<u8>>,
+    at: usize,
 }
 
 /// The records of one page of a shader-visible heap, `bytes` being title
@@ -706,7 +713,7 @@ fn mirror_wide(work: Vec<SyncPage>) -> (u64, u64) {
         // SAFETY: a host heap of a registered (live) heap, under the
         // heaps' lock the caller holds until every job is done.
         let host = unsafe { &*(page.host as *const host::HostHeap) };
-        sync_page(host, page.start, page.step, page.mirrored_count, page.from, page.to, &page.bytes, None)
+        sync_page(host, page.start, page.step, page.mirrored_count, page.from, page.to, &page.bytes[page.at..], None)
     };
     let jobs_n = sync_wide().max(1);
     // A few pages are not worth the threads.
