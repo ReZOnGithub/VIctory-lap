@@ -1,20 +1,50 @@
-# victory-lap
+# VIctory-lap
 
 A performance fork of [fxceless/victory-fork](https://github.com/fxceless/victory-fork),
 itself a fork of [VIctory](https://github.com/Marvisak/VIctory). Nearly
 everything here is their work: the compatibility layer, the translator, the
 host copies, the write watch, the landing thread and the measurements this
 fork builds on. All credit to Marvisak and the VIctory contributors, and to
-fxceless and the victory-fork contributors. victory-lap only adds frame-rate
+fxceless and the victory-fork contributors. VIctory-lap only adds frame-rate
 work on top: lock-free descriptor heap slots and sharded sets, a lookup cache
 race fix, pooled card hash buffers, finer page guards (`VICTORY_FINE_GUARDS=own`),
 striped locks between the stale checks and the landing thread, and a set of
 measured-and-off experiments (submission batching, streaming copies, card
 scatter merges), each documented where it lives in the code.
 
-Measured here on a first prison scene of about 5,000 draws a frame (RTX 5070,
-diagnostics build, 3-minute scripted runs): from 4.9 to about 7.1 frames a
-second.
+## Performance reached
+
+Measured on one PC (RTX 5070, 32 GB RAM), in the first prison scene at about
+5,000 draws a frame, with 3-minute scripted runs (the average of the last six
+5-second readings). The release build measures the same as the diagnostics
+build (7.17 fps, run rel1).
+
+| | Frames a second | ms a frame | µs a draw |
+|---|---|---|---|
+| Start (victory-fork defaults on this PC) | 4.87 | 205 | ~41 |
+| **VIctory-lap now** | **7.1** (peaks 7.4) | **~141** | **~28** |
+
+That is about **+46 % frame rate** (-31 % frame time) at equal draws. Where
+the gains came from, largest first: every title buffer's copy in the card's
+memory with table copies on the card (GPU 100 to 51 ms a frame), lock-free
+descriptor heap slots and sharded sets (heap sync 33 to 25 ms), the lookup
+cache from victory-fork with its race fix, finer page guards
+(`VICTORY_FINE_GUARDS=own`, refreshes 142 to 101 MB a frame), pipeline waits
+capped at 30 ms, pooled card hash buffers, and striped locks between the
+stale checks and the landing thread (stale checks 12.9 to 7.8 ms).
+
+Where the frame goes now (~141 ms): about 115 ms of our preparing on the
+thread that submits (copies of what the title wrote, ~44; asking Windows what
+was written, ~23; the descriptor heap sync, ~23; waiting for flights to land,
+~17; stale checks, ~8), and the card busy about 65-70 ms. 30 frames a second
+needs both under 33 ms: the next steps are a different way to track title
+writes and leaner translated shaders (about 2.4 times the console's
+instructions, as victory-fork measured).
+
+Tried and measured at no gain (all off by default, documented where they
+live): submission batching (`VICTORY_BATCH`), async submit with presents
+behind the line (corrupts), streaming stores, card scatter merges, 720p,
+lazy barriers, AVX2 builds.
 
 ---
 
