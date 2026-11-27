@@ -724,6 +724,12 @@ fn nv_defaults() {
         // The heaps' records in finer rounds (A/B at the boat, run ab1: a
         // frame 1 ms shorter of 59).
         ("VICTORY_SYNC_FINE", "1"),
+        // What shaders write into buffers of 16 MB and more is not brought
+        // down into the title's memory (one of 20 MB came down whole every
+        // frame at the boat and nothing of the title read it): 17.4 to
+        // 19.3 fps, runs h7 and h11. `VICTORY_LAND_NOT_MB=100000` brings
+        // everything down again, if a scene needs it.
+        ("VICTORY_LAND_NOT_MB", "16"),
     ];
     for &(name, value) in SET {
         if std::env::var_os(name).is_none() {

@@ -5196,6 +5196,30 @@ impl Host {
                 }
             }
         }
+        // `VICTORY_LAND_NOT_MB=<n>`: what shaders wrote into copies of n MB
+        // and more is not brought down into title memory at all (unset: all
+        // of it is, as before; the launcher's settings say 16). At the
+        // title's boat mission one buffer of 20 MB came down whole every
+        // frame, 31 MB a frame in all, and was looked through again by the
+        // next refresh; without it 8 MB come down, the frame is 5 ms shorter
+        // of 57 and the picture the same (runs h7, h9, h11). What it risks:
+        // a scene where the title's CPU reads such a buffer sees it as it
+        // was before the shaders wrote. Bringing it down when the title
+        // first touches it would be the whole answer.
+        {
+            static LEAST: OnceLock<u64> = OnceLock::new();
+            let least = *LEAST.get_or_init(|| {
+                std::env::var("VICTORY_LAND_NOT_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).map_or(u64::MAX, |mb| mb << 20)
+            });
+            if least != u64::MAX {
+                pieces.retain(|p| p.0.span().1 < least);
+                total = 0;
+                for piece in &mut pieces {
+                    piece.3 = total;
+                    total += (piece.2 - piece.1) as u64;
+                }
+            }
+        }
         if land::on() {
             // In the order they are landed, each byte of a copy once.
             let keys: Vec<land::Piece> =

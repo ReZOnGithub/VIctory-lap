@@ -36,7 +36,7 @@ Tested on one machine: Windows 10, Ryzen 7 3700X, 32 GB RAM, **GeForce RTX
 | | |
 |---|---|
 | How far it plays | Boot, menus, the prison opening and its cutscenes, on to **the first boat mission** (driving the boat in open water), where testing is now |
-| Frame rate at the boat mission | **17 fps** (17.3 to 17.5 at 3,450 draws a frame) |
+| Frame rate at the boat mission | **19 fps** (19.1 to 19.8 at 3,450 draws a frame) |
 | Frame rate in the prison opening | about 9 fps (4,500 draws a frame) |
 | Menus and videos | 30 to 60 fps |
 | Memory | 24 to 27 GB of private memory: a 32 GB PC pages now and then; 64 GB is comfortable |
@@ -75,7 +75,8 @@ under Windows 10 it crashed at boot, then ran at 2.5 fps. Step by step:
 | The title's 30 fps pacing replaced by a 60 fps one | | 12 to 14 |
 | mimalloc, write-watch askings spread over threads, smaller fixes | | 14.0 to 14.6 |
 | The release build (link-time optimized) instead of the `diag` one | | 16.0 to 16.5 |
-| Sends on a thread of their own; D3D12 breadcrumbs off; the write watch asked early | | **17.3 to 17.5** |
+| Sends on a thread of their own; D3D12 breadcrumbs off; the write watch asked early | | 17.3 to 17.5 |
+| What shaders write into buffers of 16 MB and more is no longer read back into the title's memory (`VICTORY_LAND_NOT_MB`) | | **19.1 to 19.8** |
 
 - **Windows 10 boot fix:** the Agility SDK export (`apps/victory/build.rs`,
   `src/agility.rs`). Without it Windows 10's D3D12 refuses the boot screen's
@@ -83,6 +84,11 @@ under Windows 10 it crashed at boot, then ran at 2.5 fps. Step by step:
 - **The fastest settings are the defaults** (`nv_defaults` in
   `apps/victory/src/run.rs`; `VICTORY_NV_DEFAULTS=0` turns them off). Every
   `VICTORY_...` switch is described in a comment where it is read.
+- **A shortcut to know of:** `VICTORY_LAND_NOT_MB=16` (a default here) leaves
+  what shaders write into buffers of 16 MB and more on the card. Nothing in
+  the scenes played reads those on the CPU, and the picture is the same; if
+  a later scene looks wrong, run with `VICTORY_LAND_NOT_MB=100000` and tell
+  us.
 - **Not usable on NVIDIA:** renderer ports 1 and 5 (`VICTORY_PORT_CONSTANTS`,
   `VICTORY_PORT_CBV`, the title's memory read in place by the card): the card
   reads the PC's memory several times slower, and the picture is black with
