@@ -250,6 +250,19 @@ fn ask(what: &str, from: u32) {
     use windows_sys::Win32::System::Threading::{
         GetCurrentThreadId, OpenThread, THREAD_SET_LIMITED_INFORMATION,
     };
+    // Threads a frame waits for (and those their work is shared with) run
+    // ahead of the ones that translate the title's list calls
+    // (`VICTORY_BOOST`, on unless `0`): the process keeps 7 of 8 cores busy
+    // at the boat (run bop2), and the thread that prepares submissions, which
+    // sets the frame, stood in line with them for a processor.
+    if from <= 2 {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *ON.get_or_init(|| std::env::var_os("VICTORY_BOOST").is_none_or(|v| v != "0")) {
+            use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL};
+            // SAFETY: the calling thread's own priority.
+            unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) };
+        }
+    }
     if stage() < from {
         return;
     }
