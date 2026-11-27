@@ -30,6 +30,12 @@ mod compose;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
+
+/// Without the diagnostics' counting allocator (`copystat`): mimalloc, as
+/// that one uses beneath its counters.
+#[cfg(not(all(windows, feature = "diagnostics")))]
+#[global_allocator]
+static HEAP: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod faultbook;
 #[cfg(windows)]
