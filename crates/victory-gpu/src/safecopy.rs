@@ -39,6 +39,52 @@ std::arch::global_asm!(
     "mov rsi, r10",
     "mov rdi, r11",
     "ret",
+    // The same by 32-byte loads and stores (`copy_wide`): rcx destination,
+    // rdx source, r8 bytes; eax: whether all were copied. Its last block
+    // ends with the bytes (it may lie over the one before); under 32 bytes
+    // go as above. rsi and rdi are kept as above, for the same failing exit
+    // code.
+    ".globl victory_safe_copy_wide",
+    ".globl victory_safe_copy_wide_at",
+    ".globl victory_safe_copy_wide_after",
+    ".globl victory_safe_copy_wide_failed",
+    "victory_safe_copy_wide:",
+    "mov r10, rsi",
+    "mov r11, rdi",
+    "cmp r8, 32",
+    "jb 5f",
+    "lea r9, [r8 - 32]",
+    "xor eax, eax",
+    "victory_safe_copy_wide_at:",
+    "2:",
+    "cmp rax, r9",
+    "jae 3f",
+    "vmovdqu ymm0, ymmword ptr [rdx + rax]",
+    "vmovdqu ymmword ptr [rcx + rax], ymm0",
+    "add rax, 32",
+    "jmp 2b",
+    "3:",
+    "vmovdqu ymm0, ymmword ptr [rdx + r9]",
+    "vmovdqu ymmword ptr [rcx + r9], ymm0",
+    "jmp 6f",
+    "5:",
+    "mov rdi, rcx",
+    "mov rsi, rdx",
+    "mov rcx, r8",
+    "rep movsb",
+    "victory_safe_copy_wide_after:",
+    "6:",
+    "vzeroupper",
+    "mov eax, 1",
+    "mov rsi, r10",
+    "mov rdi, r11",
+    "ret",
+    "victory_safe_copy_wide_failed:",
+    "vzeroupper",
+    "xor eax, eax",
+    "mov rsi, r10",
+    "mov rdi, r11",
+    "ret",
     ".globl victory_safe_put",
     ".globl victory_safe_put_at",
     ".globl victory_safe_put_after",
@@ -175,6 +221,10 @@ std::arch::global_asm!(
 
 unsafe extern "system" {
     fn victory_safe_copy(dst: *mut u8, src: *const u8, len: usize) -> u32;
+    fn victory_safe_copy_wide(dst: *mut u8, src: *const u8, len: usize) -> u32;
+    fn victory_safe_copy_wide_at();
+    fn victory_safe_copy_wide_after();
+    fn victory_safe_copy_wide_failed();
     fn victory_safe_copy_at();
     fn victory_safe_copy_after();
     fn victory_safe_copy_failed();
@@ -398,7 +448,26 @@ pub(crate) fn on() -> bool {
 pub(crate) unsafe fn copy(dst: *mut u8, src: *const u8, len: usize) -> bool {
     // SAFETY: a fault on either side leaves through the failing exit
     // ([`failing_exit`]); the rest is the caller's.
-    unsafe { victory_safe_copy(dst, src, len) != 0 }
+    unsafe {
+        if copy_wide() {
+            victory_safe_copy_wide(dst, src, len) != 0
+        } else {
+            victory_safe_copy(dst, src, len) != 0
+        }
+    }
+}
+
+/// Whether [`copy`] goes by 32-byte loads and stores instead of one
+/// `rep movsb` (`VICTORY_COPY_WIDE=1`; off: no gain in the title, runs h1 and h3, 15.1 and 15.0 fps). A Ryzen 7 3700X (Zen 2)
+/// runs `rep movsb` at 3 GB/s where source and destination lie 13 bytes
+/// apart in their lines, and at 0.5 to 1.2 GB/s under 256 bytes; the loads
+/// and stores go at 8.5 and 2 to 3 GB/s wherever they lie (a measurement
+/// beside the title, 2026-11-27). A frame at the title's boat mission has
+/// 22,700 such copies, 82 MB, a third of what the threads that share a
+/// submission's copies did (run bop3).
+fn copy_wide() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COPY_WIDE").is_some_and(|v| v == "1") && std::is_x86_feature_detected!("avx"))
 }
 
 /// For the fault handler: where a fault at instruction `at` is to go on, if
@@ -407,6 +476,10 @@ pub(crate) fn failing_exit(at: usize) -> Option<usize> {
     let (from, to) = (victory_safe_copy_at as *const () as usize, victory_safe_copy_after as *const () as usize);
     if (from..to).contains(&at) {
         return Some(victory_safe_copy_failed as *const () as usize);
+    }
+    let (from, to) = (victory_safe_copy_wide_at as *const () as usize, victory_safe_copy_wide_after as *const () as usize);
+    if (from..to).contains(&at) {
+        return Some(victory_safe_copy_wide_failed as *const () as usize);
     }
     let (from, to) = (victory_safe_put_at as *const () as usize, victory_safe_put_after as *const () as usize);
     if (from..to).contains(&at) {
