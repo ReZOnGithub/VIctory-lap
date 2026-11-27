@@ -8260,6 +8260,20 @@ struct Batch {
     /// `ahead` holds everything the submission refreshes
     /// ([`Batch::refresh_front`]).
     front: bool,
+    /// Copies (by address) brought up to date in this submission since our
+    /// last write of title memory, and the range ([`refresh_once`]).
+    current: ByCopy<(usize, usize)>,
+}
+
+/// Whether a copy brought up to date earlier in a submission is not queued
+/// again for what it covers, until a step of ours writes title memory
+/// (`VICTORY_REFRESH_ONCE`, on unless `0`). Each of a submission's ~40
+/// flushes queued the copies its draws bind afresh: ~11,000 a frame, ~9,500
+/// of them found to copy nothing, each under the copy's and the journal's
+/// locks (run bl33).
+fn refresh_once() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_ONCE").is_none_or(|v| v != "0"))
 }
 
 /// Whether the copies that a submission's shaders write are brought up to
@@ -8657,6 +8671,9 @@ impl Batch {
         if self.ahead.get(&key).is_some_and(|&(from, to)| from <= address && end <= to) {
             return;
         }
+        if refresh_once() && self.current.get(&key).is_some_and(|&(from, to)| from <= address && end <= to) {
+            return;
+        }
         match self.index.get(&key) {
             Some(&at) => {
                 let r = &mut self.refreshes[at];
@@ -8681,6 +8698,9 @@ impl Batch {
             return;
         };
         let (shadow, from, to) = self.refreshes.swap_remove(at);
+        if refresh_once() {
+            self.note_current(std::sync::Arc::as_ptr(&shadow) as usize, from, to);
+        }
         // The last entry took its place.
         if let Some(moved) = self.refreshes.get(at) {
             self.index.insert(std::sync::Arc::as_ptr(&moved.0) as usize, at);
@@ -8722,7 +8742,18 @@ impl Batch {
     fn title_written(&mut self) {
         self.flush();
         self.ahead.clear();
+        self.current.clear();
         self.textures.clear();
+    }
+
+    /// `[from, to)` of the copy at `key` was brought up to date ([`refresh_once`]).
+    fn note_current(&mut self, key: usize, from: usize, to: usize) {
+        let e = self.current.entry(key).or_insert((from, to));
+        if from <= e.1 && to >= e.0 {
+            *e = (e.0.min(from), e.1.max(to));
+        } else if to - from > e.1 - e.0 {
+            *e = (from, to);
+        }
     }
 
     /// Before the steps of `runs` ([`refresh_front`]), a new part of the
@@ -8983,6 +9014,13 @@ impl Batch {
     }
 
     fn flush_all(&mut self) {
+        if refresh_once() {
+            let done: Vec<(usize, usize, usize)> =
+                self.refreshes.iter().map(|(s, from, to)| (std::sync::Arc::as_ptr(s) as usize, *from, *to)).collect();
+            for (key, from, to) in done {
+                self.note_current(key, from, to);
+            }
+        }
         // Most of a flush's copies are as they were: they are told so here,
         // from what the submission's asking found, before anything is asked
         // and any thread woken. (Thousands of them, the heap's buffer views

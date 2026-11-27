@@ -57,6 +57,7 @@ pub fn run(
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
+    nv_defaults();
     let fsr = fsr_4k::FsrPreset::requested()?;
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let mut prepared = victory_loader::prepare(&original)?;
@@ -640,4 +641,58 @@ mod cpu_check_tests {
 #[cfg(not(windows))]
 pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console) -> Result<()> {
     anyhow::bail!("running titles requires Windows")
+}
+
+/// The settings measured fastest on an RTX 5070 (Windows 10, 32 GB, the
+/// prison scene, warm caches: 2.5 to ~8.8 fps, runs bl15 to bl37), each set
+/// only where the user has not set it. `VICTORY_NV_DEFAULTS=0`: none of them.
+/// `--console series-s` is faster still (less memory; a 1080p picture).
+fn nv_defaults() {
+    if std::env::var_os("VICTORY_NV_DEFAULTS").is_some_and(|v| v == "0") {
+        return;
+    }
+    const SET: &[(&str, &str)] = &[
+        // scripts/play.ps1's settings.
+        ("VICTORY_TEXTURE_NO_WAIT", "1"),
+        ("VICTORY_RELAY", "2"),
+        ("VICTORY_WIDE_BACK", "1"),
+        ("VICTORY_CARD_REHASH_RUNS", "1"),
+        ("VICTORY_JOIN_COPIES", "1"),
+        ("VICTORY_INDIRECT_WINDOW", "1"),
+        ("VICTORY_RELAY_COPY", "1"),
+        ("VICTORY_CARD_STEPS", "2"),
+        ("VICTORY_INDIRECT_BATCH", "2"),
+        ("VICTORY_MAP_THREADS", "1"),
+        ("VICTORY_TITLE_PRIORITIES", "0"),
+        ("VICTORY_CARD_AWAKE", "1"),
+        ("VICTORY_SHOW_AFTER", "1"),
+        ("VICTORY_AMBIENT", "0.8"),
+        ("VICTORY_THIN", "1"),
+        ("VICTORY_JOIN_PARTS", "8"),
+        ("VICTORY_UPLOAD_AHEAD", "1"),
+        // Renderer ports that hold on NVIDIA (1 and 5 draw black there).
+        ("VICTORY_PORT_DESCRIPTORS", "1"),
+        ("VICTORY_PORT_GUARD", "1"),
+        ("VICTORY_PORT_JOURNAL", "1"),
+        // Measured here.
+        ("VICTORY_CARD_BUFFERS_MIN_KB", "64"),
+        ("VICTORY_CARD_BUFFERS_MB", "3072"),
+        ("VICTORY_WAIT_RESIDENT", "0"),
+        ("VICTORY_LAND_SKIP", "1"),
+        ("VICTORY_LAND_THREADS", "6"),
+        ("VICTORY_PIPELINE_WAIT_MS", "30"),
+        ("VICTORY_HEAP_RECHECK", "0"),
+        ("VICTORY_REUPLOAD_WHEN_FULL", "0"),
+        ("VICTORY_WIDE_MERGE", "1"),
+        ("VICTORY_WIDE_FILLS", "1"),
+        ("VICTORY_WIDE_TEXTURES", "1"),
+        ("VICTORY_DECLARE_ONCE", "0"),
+    ];
+    for &(name, value) in SET {
+        if std::env::var_os(name).is_none() {
+            // SAFETY: before any thread of the title or ours reads the
+            // environment.
+            unsafe { std::env::set_var(name, value) };
+        }
+    }
 }

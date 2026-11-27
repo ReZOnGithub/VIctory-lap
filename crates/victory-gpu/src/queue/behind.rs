@@ -386,10 +386,18 @@ impl<W: Work> Lane<W> {
         while runs > 0 && !forced {
             let next = {
                 let mut state = self.lock();
-                let at = state.items.iter().position(|e| e.queue == entry.queue && e.number < limit);
+                // With [`join_queues`]: the next in the line whatever its
+                // queue (the host runs every queue's work on one queue, in
+                // the line's order, so taking it along keeps that order).
+                let at = if join_queues() {
+                    state.items.iter().position(|e| e.number < limit)
+                } else {
+                    state.items.iter().position(|e| e.queue == entry.queue && e.number < limit)
+                };
                 at.and_then(|at| Some((at, state.items.remove(at)?)))
             };
             let Some((at, next)) = next else {
+                join_end(0);
                 break;
             };
             // (Back where it was: parts of one submission share a number.)
@@ -401,6 +409,7 @@ impl<W: Work> Lane<W> {
                     continue;
                 }
                 state.items.insert(at, next);
+                join_end(1);
                 break;
             }
             let Entry { number, queue, what, mark: theirs } = next;
@@ -434,6 +443,26 @@ impl<W: Work> Lane<W> {
         self.moved.notify_all();
         true
     }
+}
+
+/// Whether parts of other queues' submissions are taken along in the line's
+/// order (`VICTORY_JOIN_QUEUES=1`; off by default). The title's graphics and
+/// compute queues wait for each other's fences, which ended every join at
+/// the other queue's part: ~14 of ~28 parts a frame were joined (run bl39),
+/// and each part prepared alone paid the asking, the refreshes and the card
+/// copies' passes again.
+/// Why joins ended, since the start: nothing behind, a part not unfolded yet,
+/// a value wait not met, a fence wait not met, the caps or the host, a
+/// present, lists being translated, another kind. Said with the line.
+pub(crate) static JOIN_END: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+
+fn join_end(i: usize) {
+    JOIN_END[i].fetch_add(1, Relaxed);
+}
+
+fn join_queues() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_JOIN_QUEUES").is_some_and(|v| v == "1"))
 }
 
 type Recordings = std::sync::Arc<[std::sync::Arc<crate::list::thin::Recording>]>;
@@ -569,11 +598,13 @@ impl Work for Job {
                     || crate::host::late_met_known(wait) == Some(true)
                     || hosts().any(|list| crate::host::will_meet(list, wait));
                 if !met {
+                    join_end(2);
                     return Err(next);
                 }
             }
             &Job::Wait(fence, value) => {
                 if crate::fence::completed(fence as This) < value && !signals.iter().any(|&(f, v)| f == fence && v >= value) {
+                    join_end(3);
                     return Err(next);
                 }
             }
@@ -581,10 +612,22 @@ impl Work for Job {
             Job::Run(_, more, order) => {
                 let runs: Vec<&crate::host::HostList> = order.iter().map(|&i| more[i].host()).collect();
                 if count >= most || lists.1.len() + runs.len() > most_lists || !crate::host::joinable(hosts(), &runs) {
+                    join_end(4);
                     return Err(next);
                 }
             }
-            Job::Joined(..) | Job::Present(..) | Job::Lists(..) => return Err(next),
+            Job::Present(..) => {
+                join_end(5);
+                return Err(next);
+            }
+            Job::Lists(..) => {
+                join_end(6);
+                return Err(next);
+            }
+            Job::Joined(..) => {
+                join_end(7);
+                return Err(next);
+            }
         }
         let taken = std::mem::replace(self, Job::Wait(0, 0));
         let (queue, mut lists, mut order, mut parts, mut signals) = match taken {
@@ -933,7 +976,7 @@ pub(super) fn line(frames: f64) {
         "submissions prepared by a thread of ours, per frame (VICTORY_ASYNC_SUBMIT): {:.1} in {:.1} presents, {:.1} in the line \
          when one was added (at most {:.0}); that thread worked {:.1} ms; threads of the title waited {:.1} ms for room in the \
          line, {:.1} ms at presents, {:.1} ms in {:.1} drains; waits not met at a present {:.2}; {:.1} of the \
-         submissions were prepared together with the one before them (VICTORY_JOIN_PARTS)",
+         submissions were prepared together with the one before them (VICTORY_JOIN_PARTS); joins ended since the start (nothing, folded, value, fence, caps/host, present, lists, joined): {:?}",
         s[RUNS] / frames,
         s[PRESENTS] / frames,
         s[DEPTH] / s[RUNS].max(1.0),
@@ -944,7 +987,8 @@ pub(super) fn line(frames: f64) {
         ms(DRAINING),
         s[DRAINS] / frames,
         s[FORCED] / frames,
-        s[JOINED] / frames
+        s[JOINED] / frames,
+        JOIN_END.iter().map(|c| c.load(Relaxed)).collect::<Vec<_>>()
     );
 }
 
