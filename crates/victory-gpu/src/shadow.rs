@@ -5671,26 +5671,54 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
         return None;
     }
     EXACT_STATS[0].fetch_add(1, Ordering::Relaxed);
-    let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
-    let (tick, map) = &mut *guard;
-    *tick += 1;
-    let now = *tick;
-    if let Some((shadow, used)) = map.get_mut(&(address, len)) {
-        *used = now;
-        shadow.used.store(crate::host::moment(), Ordering::Relaxed);
-        return Some(shadow.clone());
+    /// The map's size at which idle copies are looked for next: twice what
+    /// was left the last time, so that a map of copies all still held is not
+    /// gone through whole at every new view (profile bp2 / timeline bt2 on an
+    /// RTX 5070: the recording threads stood 70-84 ms at a time on this lock).
+    static PRUNE_AT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(MANY);
+    {
+        let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+        let (tick, map) = &mut *guard;
+        *tick += 1;
+        let now = *tick;
+        if let Some((shadow, used)) = map.get_mut(&(address, len)) {
+            *used = now;
+            shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+            return Some(shadow.clone());
+        }
+        if map.len() >= PRUNE_AT.load(Ordering::Relaxed) {
+            // Held by the map alone (no list), its buffer by the copy alone (no
+            // slot shows it), and not asked for lately.
+            // Taken out under the lock, dropped after it: each drop frees a
+            // buffer in the driver (timeline bt3: 687 ms of recording-thread
+            // waits on this lock in 3 frames).
+            let idle: Vec<(u64, u64)> = map
+                .iter()
+                .filter(|(_, (shadow, used))| {
+                    !(Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now)
+                })
+                .map(|(k, _)| *k)
+                .collect();
+            let gone: Vec<_> = idle.iter().filter_map(|k| map.remove(k)).collect();
+            PRUNE_AT.store((map.len() * 2).max(MANY), Ordering::Relaxed);
+            drop(guard);
+            crate::host::drop_later_any(Box::new(gone));
+        }
     }
-    if map.len() >= MANY {
-        // Held by the map alone (no list), its buffer by the copy alone (no
-        // slot shows it), and not asked for lately.
-        map.retain(|_, (shadow, used)| {
-            Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now
-        });
-    }
+    // The buffer made without the lock: a system call, which every other
+    // view's lookup stood behind.
     let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+    let (tick, map) = &mut *guard;
+    let now = *tick;
+    // Another thread made the same meanwhile: theirs, ours goes.
+    if let Some((shadow, used)) = map.get_mut(&(address, len)) {
+        *used = now;
+        return Some(shadow.clone());
+    }
     let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
     map.insert((address, len), (shadow.clone(), now));
     EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);

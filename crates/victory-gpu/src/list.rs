@@ -158,6 +158,8 @@ pub(crate) fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut
     f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
     #[cfg(feature = "diagnostics")]
     crate::copystat::recorded(started);
+    #[cfg(feature = "diagnostics")]
+    crate::profile::seen(crate::profile::Seen::Record);
 }
 
 /// The submission of `lists` has run: each gives its descriptor tables'
@@ -247,6 +249,63 @@ const IDLE_MOST: (usize, u64) = (512, 256 << 20);
 fn pools() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_POOL").is_none_or(|v| v != "0"))
+}
+
+/// With [`pools`] (`VICTORY_SWAP_RESET`, on unless `0`): the host list of
+/// title list `this`, if pristine (`HostList::mark_pristine`), is replaced by
+/// an idle one (reset and open), and the pristine one is reset and made idle
+/// on a thread of ours. Whether it was.
+#[cfg(windows)]
+fn swap_reset(this: This) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_SWAP_RESET").is_none_or(|v| v != "0")) || !pools() {
+        return false;
+    }
+    if !host_list(this).is_some_and(|h| h.is_pristine()) {
+        return false;
+    }
+    let idle = {
+        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+        let taken = idle.0.pop();
+        if let Some(Idle(_, bytes)) = &taken {
+            idle.1 -= bytes;
+        }
+        taken
+    };
+    let Some(Idle(fresh, _)) = idle else { return false };
+    let list = this.cast_mut().cast::<List>();
+    // SAFETY: one of our lists, in its reset: nothing records into it or
+    // submits it meanwhile.
+    let Some(old) = (unsafe { (*list).host.replace(fresh) }) else { return true };
+    struct Sent(crate::host::HostList);
+    // SAFETY: D3D12 objects are free-threaded; the list is ours alone now.
+    unsafe impl Send for Sent {}
+    static TO: std::sync::OnceLock<Option<std::sync::mpsc::Sender<Sent>>> = std::sync::OnceLock::new();
+    let to = TO.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<Sent>();
+        std::thread::Builder::new()
+            .name("victory-list-reset".into())
+            .spawn(move || {
+                for Sent(host) in rx {
+                    host.reset();
+                    let bytes = host.scratch_kept();
+                    let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+                    if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
+                        idle.0.push(Idle(host, bytes));
+                        idle.1 += bytes;
+                    }
+                }
+            })
+            .ok()
+            .map(|_| tx)
+    });
+    match to {
+        Some(to) => {
+            let _ = to.send(Sent(old));
+        }
+        None => drop(old),
+    }
+    true
 }
 
 /// A host list open for recording: one that has run, as a title's list is
@@ -408,8 +467,11 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
             continue;
         };
         // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
+        // reset, which wants it closed (and the title may submit the list
+        // again before that, which runs it empty). Its allocator was reset
+        // already: that reset needs only the list's (`HostList::mark_pristine`).
         fresh.close();
+        fresh.mark_pristine();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
@@ -480,8 +542,11 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             continue;
         };
         // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
+        // reset, which wants it closed (and the title may submit the list
+        // again before that, which runs it empty). Its allocator was reset
+        // already: that reset needs only the list's (`HostList::mark_pristine`).
         fresh.close();
+        fresh.mark_pristine();
         let list = this.cast_mut().cast::<List>();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
@@ -687,10 +752,19 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         list.gate.clear();
     }
     #[cfg(windows)]
-    with_state(this, |host, state| {
-        host.reset();
-        state.reset(pipeline);
-    });
+    {
+        // A host list handed over at submission and not used since: one
+        // reset already (an idle one) takes its place, and it is reset on a
+        // thread of ours (`swap_reset`). The driver's list reset was the
+        // largest part of the title's recording threads' time.
+        let swapped = swap_reset(this);
+        with_state(this, |host, state| {
+            if !swapped {
+                host.reset();
+            }
+            state.reset(pipeline);
+        });
+    }
     crate::pipeline::bound(pipeline);
     #[cfg(not(windows))]
     let _ = this;

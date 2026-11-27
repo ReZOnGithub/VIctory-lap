@@ -1317,6 +1317,13 @@ fn give_batch_buffers(buffers: Vec<ID3D12Resource>) {
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
     allocator: ID3D12CommandAllocator,
+    /// Upload buffers of [`HostList::upload`] taken from [`UPLOAD_POOL`],
+    /// given back at the reset.
+    pooled: Mutex<Vec<Pooled>>,
+    /// Reset and open with nothing recorded, handed to a title list whose
+    /// next call is its reset ([`HostList::mark_pristine`]): that reset has
+    /// nothing to do.
+    pristine: std::sync::atomic::AtomicBool,
     /// With barriers held and joined (`rec`).
     pub(crate) list: rec::Rec,
     /// Work for submission time, in recorded order.
@@ -2408,6 +2415,126 @@ enum Step {
 /// What a list does on the CPU when it is submitted: copies between host
 /// memory regions (title buffers, upload buffers and buffer copies), and
 /// the upload buffers its GPU commands read, kept until the list is reset.
+/// An upload buffer of [`HostList::upload`]'s pool: mapped for good.
+struct Pooled {
+    buffer: ID3D12Resource,
+    data: usize,
+    class: u64,
+    shared: bool,
+}
+// SAFETY: D3D12 objects are free-threaded; the mapping stays valid while
+// the buffer lives, and only the list holding it writes through it.
+unsafe impl Send for Pooled {}
+
+/// The least size class of the pool.
+const UPLOAD_LEAST: u64 = 64 << 10;
+/// The most bytes the pool keeps free.
+const UPLOAD_POOL_MOST: u64 = 768 << 20;
+
+/// Free upload buffers by kind (shared or upload heap) and size class.
+#[derive(Default)]
+struct UploadPool {
+    free: std::collections::HashMap<(bool, u64), Vec<Pooled>>,
+    bytes: u64,
+}
+
+impl UploadPool {
+    fn take(&mut self, shared: bool, class: u64) -> Option<Pooled> {
+        let p = self.free.get_mut(&(shared, class))?.pop()?;
+        self.bytes -= p.class;
+        Some(p)
+    }
+    fn give(&mut self, p: Pooled) {
+        if self.bytes + p.class > UPLOAD_POOL_MOST {
+            return;
+        }
+        self.bytes += p.class;
+        self.free.entry((p.shared, p.class)).or_default().push(p);
+    }
+}
+
+static UPLOAD_POOL: std::sync::LazyLock<Mutex<UploadPool>> = std::sync::LazyLock::new(|| Mutex::new(UploadPool::default()));
+/// Since the start: uploads served from the pool, buffers made for it.
+pub(crate) static UPLOAD_POOL_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Whether [`HostList::upload`] takes its buffers from a pool
+/// (`VICTORY_UPLOAD_POOL`, on unless `0`).
+///
+/// Why: one buffer was made for every texture copy the title records and
+/// destroyed at the list's reset; on an RTX 5070 the system's allocation
+/// calls (create 1.5 s, destroy 1.4 s of a 4-minute run, all inside the
+/// title's list calls) were the largest cost of its recording threads
+/// (profile bp1).
+fn upload_pool() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_UPLOAD_POOL").is_none_or(|v| v != "0"))
+}
+
+/// Drops `what` on a thread of ours ([`drop_later_on`]; here when switched
+/// off): for state the title's threads let go of in bulk at a list's reset
+/// (`crate::draw::State::reset`: 38 % of the recording threads' time in
+/// profile bp2, freeing thousands of small tables).
+pub(crate) fn drop_later_any(what: Box<dyn std::any::Any>) {
+    struct Sent(#[allow(dead_code)] Box<dyn std::any::Any>);
+    // SAFETY: what is sent is state of ours whose parts are shared across
+    // threads already (`Arc`s, plain data, free-threaded D3D12 objects).
+    unsafe impl Send for Sent {}
+    static TO: OnceLock<Option<std::sync::mpsc::Sender<Sent>>> = OnceLock::new();
+    if !drop_later_on() {
+        return;
+    }
+    let to = TO.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<Sent>();
+        std::thread::Builder::new()
+            .name("victory-dropper-state".into())
+            .spawn(move || {
+                for d in rx {
+                    drop(d);
+                }
+            })
+            .ok()
+            .map(|_| tx)
+    });
+    if let Some(to) = to {
+        let _ = to.send(Sent(what));
+    }
+}
+
+/// Whether a reset list's recorded steps are dropped on a thread of ours
+/// (`VICTORY_DROP_LATER`, on unless `0`).
+fn drop_later_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DROP_LATER").is_none_or(|v| v != "0"))
+}
+
+/// Drops `deferred` on the dropping thread (made on first use), or here
+/// when switched off or the thread is gone.
+fn drop_later(deferred: Deferred) {
+    /// D3D12 objects are free-threaded; the steps' closures are `Send`.
+    struct Sent(#[allow(dead_code)] Deferred);
+    // SAFETY: as said above; nothing else holds what the list recorded.
+    unsafe impl Send for Sent {}
+    static TO: OnceLock<Option<std::sync::mpsc::Sender<Sent>>> = OnceLock::new();
+    if !drop_later_on() {
+        return;
+    }
+    let to = TO.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<Sent>();
+        std::thread::Builder::new()
+            .name("victory-dropper".into())
+            .spawn(move || {
+                for d in rx {
+                    drop(d);
+                }
+            })
+            .ok()
+            .map(|_| tx)
+    });
+    if let Some(to) = to {
+        let _ = to.send(Sent(deferred));
+    }
+}
+
 #[derive(Default)]
 struct Deferred {
     /// Destination, source, bytes.
@@ -4293,6 +4420,8 @@ impl Host {
                 );
             }
             Ok(HostList {
+                pooled: Mutex::new(Vec::new()),
+                pristine: std::sync::atomic::AtomicBool::new(false),
                 allocator,
                 list: rec::Rec::new(list),
                 deferred: Mutex::default(),
@@ -5701,6 +5830,8 @@ impl Host {
         let called = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::submission_begins();
+        #[cfg(feature = "diagnostics")]
+        crate::profile::seen(crate::profile::Seen::Submit);
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut stage = crate::timeline::span("submit: the submission lock");
@@ -6579,14 +6710,50 @@ impl HostList {
 
     /// Only after the list's last submission finished (every one is waited
     /// for).
+    /// This list was just reset (or made) and nothing will record into it
+        /// before the title's reset of the list holding it: that reset skips
+    /// the driver's (`VICTORY_PRISTINE_LISTS`, on unless `0`). Each recycled
+    /// list was closed empty and reset a second time in the driver, on the
+    /// title's recording threads (profile bp3 on an RTX 5070: list Reset and
+    /// Close were 63 % of those threads' time inside list calls).
+    /// Whether [`HostList::mark_pristine`] holds.
+    pub(crate) fn is_pristine(&self) -> bool {
+        self.pristine.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn mark_pristine(&self) -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        let on = *ON.get_or_init(|| std::env::var_os("VICTORY_PRISTINE_LISTS").is_none_or(|v| v != "0"));
+        if on {
+            self.pristine.store(true, Ordering::Release);
+        }
+        on
+    }
+
     pub(crate) fn reset(&self) {
         self.changed_something();
+        // Allocator reset already, nothing recorded with it since (an empty
+        // list closed): only the list is reset.
+        let allocator_fresh = self.pristine.swap(false, Ordering::AcqRel);
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         let _resetting = crate::timeline::span("resetting a host list");
         self._alive.used();
         *self.coming.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *self.deferred() = Deferred::default();
+        // What the list recorded is let go on a thread of ours
+        // ([`drop_later`]): its steps' copies and closures took 44 % of a
+        // reset on the title's thread (profile bp1, RTX 5070).
+        drop_later(std::mem::take(&mut *self.deferred()));
+        // Every submission of the list has run: its upload buffers go back.
+        {
+            let given: Vec<Pooled> = std::mem::take(&mut *self.pooled.lock().unwrap_or_else(|e| e.into_inner()));
+            if !given.is_empty() {
+                let mut pool = UPLOAD_POOL.lock().unwrap_or_else(|e| e.into_inner());
+                for p in given {
+                    pool.give(p);
+                }
+            }
+        }
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -6614,9 +6781,13 @@ impl HostList {
         }
         // SAFETY: the list is not executing.
         let reset = unsafe {
-            self.allocator
-                .Reset()
-                .and_then(|()| self.list.Reset(&self.allocator, None))
+            if allocator_fresh {
+                self.list.Reset(&self.allocator, None)
+            } else {
+                self.allocator
+                    .Reset()
+                    .and_then(|()| self.list.Reset(&self.allocator, None))
+            }
         };
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
@@ -7259,7 +7430,26 @@ impl HostList {
     /// shortcut: one buffer per copy; pool them once uploads are frequent.
     pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         // With [`card_steps`] the card may be the one that fills it.
-        let (buffer, data) = if card_steps::stage() > 1 { host.shared_buffer(size)? } else { host.upload_buffer(size)? };
+        let shared = card_steps::stage() > 1;
+        if upload_pool() {
+            let class = size.max(UPLOAD_LEAST).next_power_of_two();
+            let found = UPLOAD_POOL.lock().unwrap_or_else(|e| e.into_inner()).take(shared, class);
+            let (buffer, data) = match found {
+                Some(p) => {
+                    UPLOAD_POOL_STATS[0].fetch_add(1, Ordering::Relaxed);
+                    (p.buffer, p.data as *mut u8)
+                }
+                None => {
+                    UPLOAD_POOL_STATS[1].fetch_add(1, Ordering::Relaxed);
+                    let (b, d) = if shared { host.shared_buffer(class)? } else { host.upload_buffer(class)? };
+                    name(&b, || format!("list upload (pooled) {class:#x}"));
+                    (b, d)
+                }
+            };
+            self.pooled.lock().unwrap_or_else(|e| e.into_inner()).push(Pooled { buffer: buffer.clone(), data: data as usize, class, shared });
+            return Some((buffer, data));
+        }
+        let (buffer, data) = if shared { host.shared_buffer(size)? } else { host.upload_buffer(size)? };
         name(&buffer, || format!("list upload {size:#x}"));
         self.deferred().hold_upload(buffer.clone(), size);
         Some((buffer, data))

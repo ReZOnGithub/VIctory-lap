@@ -943,6 +943,18 @@ pub(crate) struct Memory {
     /// Set when the memory came from the title's allocator, with these
     /// allocation attributes (it goes back there).
     attributes: Option<u64>,
+    /// Made with `VirtualAlloc` and write watch ([`watched_memory`]): goes
+    /// back with `VirtualFree`.
+    virt: bool,
+}
+
+/// Whether memory of ours for the title of 1 MiB or more is made write-watched
+/// (`VICTORY_WATCH_OWN_MEMORY`, on unless `0`). From the heap allocator it is
+/// not, and every refresh of a copy of it copied it whole: a 20 MB buffer
+/// shaders write, twice a frame, 42 MB and 9 ms a frame (run bl31, RTX 5070).
+fn watched_memory() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WATCH_OWN_MEMORY").is_none_or(|v| v != "0"))
 }
 
 pub type AllocRoutine = extern "system" fn(usize, u64) -> *mut c_void;
@@ -1020,6 +1032,7 @@ impl Memory {
             ptr,
             layout,
             attributes: Some(attributes),
+            virt: false,
         })
     }
 
@@ -1039,6 +1052,18 @@ impl Memory {
             .filter(|&(size, _)| size > 0)
             .and_then(|(size, align)| Layout::from_size_align(size, align).ok())
             .ok_or(E_INVALIDARG)?;
+        // Big and aligned to 64 KiB at most: pages of its own, write-watched
+        // (committed pages come zeroed).
+        #[cfg(windows)]
+        if watched_memory() && layout.size() >= 1 << 20 && layout.align() <= 64 << 10 {
+            use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+            const MEM_WRITE_WATCH: u32 = 0x20_0000;
+            // SAFETY: a plain allocation of ours.
+            let at = unsafe { VirtualAlloc(std::ptr::null(), layout.size(), MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) };
+            if let Some(ptr) = NonNull::new(at.cast::<u8>()) {
+                return Ok(Memory { ptr, layout, attributes: None, virt: true });
+            }
+        }
         // SAFETY: the size is non-zero.
         let ptr = NonNull::new(unsafe { alloc_zeroed(layout) }).ok_or(E_OUTOFMEMORY)?;
         // The big ones are named in the log: the memory line counts our own
@@ -1051,6 +1076,7 @@ impl Memory {
             ptr,
             layout,
             attributes: None,
+            virt: false,
         })
     }
 }
@@ -1059,6 +1085,12 @@ impl Drop for Memory {
     fn drop(&mut self) {
         match (self.attributes, ALLOCATOR.get()) {
             (Some(attributes), Some(&(_, free))) => free(self.ptr.as_ptr().cast(), attributes),
+            #[cfg(windows)]
+            _ if self.virt => {
+                use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+                // SAFETY: made in `new` with `VirtualAlloc`.
+                unsafe { VirtualFree(self.ptr.as_ptr().cast(), 0, MEM_RELEASE) };
+            }
             // SAFETY: allocated in `new` with this layout.
             _ => unsafe { dealloc(self.ptr.as_ptr(), self.layout) },
         }

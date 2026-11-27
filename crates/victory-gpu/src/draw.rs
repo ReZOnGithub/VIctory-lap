@@ -1016,7 +1016,8 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
 
 impl State {
     pub(crate) fn reset(&mut self, pipeline: This) {
-        *self = State::default();
+        // The old state let go of on a thread of ours (`crate::host::drop_later_any`).
+        crate::host::drop_later_any(Box::new(std::mem::take(self)));
         self.pipeline = pipeline as usize;
     }
 
