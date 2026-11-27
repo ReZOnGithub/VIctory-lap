@@ -2518,7 +2518,11 @@ pub(crate) fn send_flush() {
 fn land_not_least() -> u64 {
     static LEAST: OnceLock<u64> = OnceLock::new();
     *LEAST.get_or_init(|| {
-        std::env::var("VICTORY_LAND_NOT_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).map_or(u64::MAX, |mb| mb << 20)
+        // (`VICTORY_LAND_NOT_KB` says it finer and goes first. Not 0: with
+        // nothing brought down the title's picture went white at the boat,
+        // run h17; it reads small buffers, its exposure it seems.)
+        let of = |name: &str, shift: u32| std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).map(|n| n << shift);
+        of("VICTORY_LAND_NOT_KB", 10).or_else(|| of("VICTORY_LAND_NOT_MB", 20)).unwrap_or(u64::MAX)
     })
 }
 
