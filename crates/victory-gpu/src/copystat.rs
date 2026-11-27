@@ -981,9 +981,25 @@ fn log_memory() {
         made[4],
         mb(made[5]),
     );
+    let (placed_hits, placed_misses) = crate::resource::placed_cache_counts();
     tracing::info!(
-        "memory, placed textures: {} of them were asked for again with other filler words in their description          (one resource and host copy each since the filler left the key; VICTORY_PLACED_FILLER=1 keeps it)",
-        crate::resource::placed_filler_twins()
+        "memory, placed textures: {} of them were asked for again with other filler words in their description          (one resource and host copy each since the filler left the key; VICTORY_PLACED_FILLER=1 keeps it; counted only for asks the per-thread cache missed); per-thread cache since the last line (VICTORY_PLACED_CACHE): {} hits, {} misses",
+        crate::resource::placed_filler_twins(),
+        placed_hits,
+        placed_misses
+    );
+    let [view_hits, view_misses, view_wrong] = crate::descriptor::view_cache_counts();
+    tracing::info!(
+        "memory, table entries read: per-thread cache (VICTORY_VIEW_CACHE) {} hits, {} misses since the start; {} where it disagreed with the locked read (VICTORY_VIEW_CACHE=check; must be 0)",
+        view_hits,
+        view_misses,
+        view_wrong
+    );
+    let [loose_hits, loose_refused] = crate::shadow::loose_cache_counts();
+    tracing::info!(
+        "memory, windows outside buffers asked for: per-thread cache (VICTORY_LOOSE_CACHE=1) {} answers given, {} refused (window let go or windows changed) since the start",
+        loose_hits,
+        loose_refused
     );
     // What the line above leaves open: what is alive of the buffers "made
     // so far", what the windows hold and what holds them, and what our own

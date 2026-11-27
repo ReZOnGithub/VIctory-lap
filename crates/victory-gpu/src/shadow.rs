@@ -3409,6 +3409,21 @@ pub(crate) fn let_go_idle() {
                 (s.used.load(Ordering::Relaxed), key, Arc::as_ptr(s) as usize, s.len)
             })
             .collect();
+        // With the per-thread cache of windows (`VICTORY_LOOSE_CACHE`), a
+        // thread may hand a window out without this lock: what it
+        // remembered is of before now, and the windows are looked at again.
+        // Either that thread sees the count changed and does not hand it
+        // out, or it holds it now and the look below sees it held.
+        if loose_cache() && !eligible.is_empty() {
+            loose_changed();
+            eligible.retain(|(_, key, _, _)| {
+                map.get(key).is_some_and(|s| {
+                    Arc::strong_count(s) == 1
+                        && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
+                        && crate::host::references(&s.buffer) == 1
+                })
+            });
+        }
         eligible.sort_unstable_by_key(|&(used, _, _, _)| used);
         let victims = if keep == u64::MAX {
             (0..eligible.len()).collect()
@@ -5543,6 +5558,11 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
             .filter(|(key, shadow)| shadow.place.is_some() && key.0 + key.1 > at)
             .map(|(key, _)| *key)
             .collect();
+        // What threads remember of the windows (`VICTORY_LOOSE_CACHE`) is
+        // of before.
+        if loose_cache() && !keys.is_empty() {
+            loose_changed();
+        }
         gone.extend(keys.into_iter().filter_map(|key| map.remove(&key)));
     }
     {
@@ -5629,6 +5649,11 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             Some(_) => {}
             None => {
                 drop(map);
+                if loose_cache()
+                    && let Some(shadow) = loose_found(address, end, len <= 1, any)
+                {
+                    return Some(shadow);
+                }
                 return loose(address, end, len <= 1, any);
             }
         }
@@ -5930,6 +5955,130 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: std::sync::RwLock<BTreeMap<(u64, u64), Arc<Shadow>>> = std::sync::RwLock::new(BTreeMap::new());
 
+/// Whether [`lookup`] remembers on each thread the windows [`loose`] found
+/// on its shared path, as [`FOUND`] does for buffers (`VICTORY_LOOSE_CACHE=1`;
+/// off until checked: no window used after it was let go, the bop2 scene).
+/// `shadow::lookup` was 17.6 ms a frame of the translating threads at the
+/// boat (bop3), and more in scenes of many windows outside buffers. A hit
+/// trades the [`LOOSE`] read lock for an upgrade of the window's own count.
+///
+/// When an answer is stale: whenever [`LOOSE`] loses or changes an entry
+/// ([`let_go_idle`], [`in_place_let_go`]: the only places that remove
+/// any; entries are only added where none was), [`LOOSE_CHANGED`] goes up
+/// first, under the write lock; a remembered answer is of the count it was
+/// found at, and is good only while the count is still that after the
+/// window was taken hold of (the same handshake [`found`] makes).
+fn loose_cache() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LOOSE_CACHE").is_some_and(|v| v == "1"))
+}
+
+/// How often [`LOOSE`] lost entries with [`loose_cache`] on (see there).
+static LOOSE_CHANGED: AtomicU64 = AtomicU64::new(1);
+
+/// [`LOOSE`] (write-locked by the caller) is about to lose entries: what
+/// threads remember of it is of before. Then a fence, before the caller
+/// looks at whether any thread holds a window.
+fn loose_changed() {
+    LOOSE_CHANGED.fetch_add(1, Ordering::SeqCst);
+    std::sync::atomic::fence(Ordering::SeqCst);
+}
+
+/// An ask outside buffers (address, end, whether without a length, whether
+/// it may take any window), the count of [`LOOSE_CHANGED`] it was answered
+/// at, and the answer.
+type LooseFound = (u64, u64, bool, bool, u64, std::sync::Weak<Shadow>);
+
+thread_local! {
+    /// The last answers of [`loose`]'s shared path on this thread, by a hash
+    /// of the ask (`VICTORY_LOOSE_CACHE`).
+    static LOOSE_FOUND: std::cell::RefCell<Vec<LooseFound>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Hits and refusals on this thread not yet added to [`LOOSE_CACHE_COUNTS`].
+    static LOOSE_CACHE_LOCAL: std::cell::Cell<(u32, u32)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Counts a hit or a refusal of [`LOOSE_FOUND`], added to
+/// [`LOOSE_CACHE_COUNTS`] in batches of 1,024 (no shared line per ask).
+fn loose_count(hit: bool) {
+    LOOSE_CACHE_LOCAL.with(|local| {
+        let (mut hits, mut refused) = local.get();
+        if hit {
+            hits += 1;
+        } else {
+            refused += 1;
+        }
+        if hits + refused >= 1024 {
+            LOOSE_CACHE_COUNTS[0].fetch_add(u64::from(hits), Ordering::Relaxed);
+            LOOSE_CACHE_COUNTS[1].fetch_add(u64::from(refused), Ordering::Relaxed);
+            (hits, refused) = (0, 0);
+        }
+        local.set((hits, refused));
+    });
+}
+
+/// Answers given from [`LOOSE_FOUND`] since the start, and remembered
+/// answers not given (added in batches) (the window let go, or the count changed).
+static LOOSE_CACHE_COUNTS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// See [`LOOSE_CACHE_COUNTS`].
+#[cfg(feature = "diagnostics")]
+pub(crate) fn loose_cache_counts() -> [u64; 2] {
+    LOOSE_CACHE_COUNTS.each_ref().map(|c| c.load(Ordering::Relaxed))
+}
+
+/// What this thread remembers of an ask outside buffers, if no window was
+/// let go since; noted as [`loose`] notes a window it hands out.
+fn loose_found(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
+    let changed = LOOSE_CHANGED.load(Ordering::SeqCst);
+    let mut seen = false;
+    let shadow = LOOSE_FOUND.with_borrow(|f| {
+        let (a, e, u, n, at, shadow) = f.get(found_at(address, end))?;
+        seen = (*a, *e, *u, *n) == (address, end, unsized_ask, any);
+        (seen && *at == changed).then(|| shadow.upgrade()).flatten()
+    });
+    let Some(shadow) = shadow else {
+        if seen {
+            loose_count(false);
+        }
+        return None;
+    };
+    // Whoever lets windows go finds this one held now, or had changed the
+    // count before: then it is not handed out (`let_go_idle`).
+    std::sync::atomic::fence(Ordering::SeqCst);
+    if LOOSE_CHANGED.load(Ordering::SeqCst) != changed {
+        loose_count(false);
+        return None;
+    }
+    // As `loose` notes it (read first: the lines are shared by all
+    // recording threads).
+    let now = crate::host::moment();
+    if shadow.used.load(Ordering::Relaxed) != now {
+        shadow.used.store(now, Ordering::Relaxed);
+    }
+    if shadow.asked[0].load(Ordering::Relaxed) > address {
+        shadow.asked[0].fetch_min(address, Ordering::Relaxed);
+    }
+    if shadow.asked[1].load(Ordering::Relaxed) < end {
+        shadow.asked[1].fetch_max(end, Ordering::Relaxed);
+    }
+    if unsized_ask {
+        shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
+    }
+    loose_count(true);
+    Some(shadow)
+}
+
+/// Remembers an answer of [`loose`]'s shared path given while `changed` was
+/// the count of [`LOOSE_CHANGED`].
+fn loose_remember(address: u64, end: u64, unsized_ask: bool, any: bool, changed: u64, shadow: &Arc<Shadow>) {
+    LOOSE_FOUND.with_borrow_mut(|f| {
+        if f.is_empty() {
+            f.resize_with(FOUND_MOST, || (0, 0, false, false, 0, std::sync::Weak::new()));
+        }
+        f[found_at(address, end)] = (address, end, unsized_ask, any, changed, Arc::downgrade(shadow));
+    });
+}
+
 fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
     let (cell, _) = window_of(address, end, WINDOW);
     let named = window_of(address, end, if unsized_ask { WINDOW } else { window() });
@@ -5955,6 +6104,10 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
         if let Some(shadow) = map.get(&named) {
             note(shadow);
+            if loose_cache() {
+                // (Nobody changes the count while this lock is held.)
+                loose_remember(address, end, unsized_ask, any, LOOSE_CHANGED.load(Ordering::SeqCst), shadow);
+            }
             return Some(shadow.clone());
         }
     }

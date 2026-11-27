@@ -127,6 +127,8 @@ impl Target {
 /// The readback resources and the allocation the pixels belong to.
 pub(crate) struct Back {
     buffer: ID3D12Resource,
+    /// The bytes `buffer` was asked for with (its pool size class).
+    size: u64,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
     mips: u32,
@@ -137,6 +139,12 @@ pub(crate) struct Back {
 impl Back {
     pub(crate) fn range(&self) -> (usize, usize) {
         (self.ticket.at, self.ticket.end)
+    }
+
+    /// The read-back buffer and the size it was asked for, to be used
+    /// again (`crate::host`'s read-back pool, at a list's reset only).
+    pub(crate) fn into_buffer(self) -> (u64, ID3D12Resource) {
+        (self.size, self.buffer)
     }
 }
 
@@ -177,7 +185,7 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
             .checked_mul(u64::from(format.Depth))?;
         total = total.max(footprint.Offset.checked_add(pitched)?);
     }
-    let buffer = host.read_back_buffer(total)?;
+    let buffer = host.read_back_pooled(total)?;
     for (i, footprint) in footprints.iter().enumerate() {
         let to = D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: a borrowed pointer the location never releases.
@@ -194,7 +202,7 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
         // SAFETY: an open list; the texture is in the copy-source state.
         unsafe { list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
     }
-    Some(Back { buffer, footprints, rows, mips, layout: target.layout, ticket: target.ticket })
+    Some(Back { buffer, size: total, footprints, rows, mips, layout: target.layout, ticket: target.ticket })
 }
 
 /// Once the list has run, tile its texels back into the same title allocation.
@@ -244,7 +252,9 @@ pub(crate) fn land(back: &Back) {
     crate::host::copy_mapped(at as *mut u8, tiled.as_ptr(), size, true);
     let copied = COPIED.fetch_add(1, Ordering::Relaxed) + 1;
     if copied == 1 || copied.is_multiple_of(128) {
-        tracing::info!(copied, bytes = size, "texture readback landed");
+        let pool_taken = crate::host::READBACK_POOL_STATS[0].load(Ordering::Relaxed);
+        let pool_made = crate::host::READBACK_POOL_STATS[1].load(Ordering::Relaxed);
+        tracing::info!(copied, bytes = size, pool_taken, pool_made, "texture readback landed");
     }
 }
 

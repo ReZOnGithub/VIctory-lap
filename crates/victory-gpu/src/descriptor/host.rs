@@ -175,7 +175,7 @@ pub(crate) struct HostHeap {
     kept_some: Box<[std::sync::atomic::AtomicBool]>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
-    next: Mutex<(u32, Vec<bool>)>,
+    next: Mutex<(u32, Taken)>,
     /// How many dynamic slots are free (changed under `next`'s lock): with
     /// fewer than a table needs, the search is not made. Once the world
     /// had taken them all, every later table of the frame searched every
@@ -1445,7 +1445,7 @@ pub(crate) fn slot_story(slot: u32) -> String {
         let mut text = if index < host.count {
             format!("title slot {index}, made from {}", host.describe_slot(index).unwrap_or_default())
         } else {
-            let taken = host.next.lock().unwrap_or_else(|e| e.into_inner()).1.get((index - host.count) as usize).copied();
+            let taken = host.next.lock().unwrap_or_else(|e| e.into_inner()).1.get((index - host.count) as usize);
             format!("dynamic slot {} (taken {taken:?})", index - host.count)
         };
         if twin {
@@ -1608,6 +1608,89 @@ pub(crate) fn probe_view_limit() {
 /// table past them is made afresh in these slots like any other.
 pub(crate) const DYNAMIC: u32 = 1 << 18;
 
+/// Whether dynamic slots go back in batches and a one-slot table is found a
+/// word of the slot bitmap at a time (`VICTORY_DYN_BATCH=0`: one release per
+/// table and the slot-by-slot search, as before). Every table took the slots'
+/// lock and searched slot by slot under it; the relay gave back each of
+/// about 9,400 tables a frame on its own under the same lock (rt4: 9,395
+/// tables, 7.8 ms searching; base1 9,908 and 9.8 ms; bop2prof: 4.1 ms of
+/// `HostHeap::dynamic`'s 4.8 ms a frame waiting for the lock).
+pub(crate) fn dyn_batch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DYN_BATCH").is_none_or(|v| v != "0"))
+}
+
+/// Which dynamic slots are taken, a bit each (set: taken), so a free slot is
+/// found 64 at a time. Bits past `len` in the last word stay clear and are
+/// never handed out (every search ends at `len` or before).
+pub(crate) struct Taken {
+    words: Vec<u64>,
+    len: usize,
+}
+
+impl Taken {
+    fn new(len: usize) -> Self {
+        Self { words: vec![0; len.div_ceil(64)], len }
+    }
+
+    /// Slot `at`, or `None` past the end.
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+    fn get(&self, at: usize) -> Option<bool> {
+        (at < self.len).then(|| self.is(at))
+    }
+
+    fn is(&self, at: usize) -> bool {
+        self.words[at / 64] >> (at % 64) & 1 != 0
+    }
+
+    /// `f(word, mask)` for the words over `[start, end)` (`end <= len`).
+    fn each_word(start: usize, end: usize, mut f: impl FnMut(usize, u64)) {
+        let mut at = start;
+        while at < end {
+            let word = at / 64;
+            let low = at % 64;
+            let high = (end - word * 64).min(64);
+            let mask = if high - low == 64 { u64::MAX } else { ((1u64 << (high - low)) - 1) << low };
+            f(word, mask);
+            at = word * 64 + high;
+        }
+    }
+
+    /// Marks `[start, end)` taken or free.
+    fn fill(&mut self, start: usize, end: usize, taken: bool) {
+        let words = &mut self.words;
+        Self::each_word(start, end.min(self.len), |w, mask| {
+            if taken {
+                words[w] |= mask;
+            } else {
+                words[w] &= !mask;
+            }
+        });
+    }
+
+    /// How many of `[start, end)` are taken.
+    fn count(&self, start: usize, end: usize) -> u32 {
+        let mut n = 0;
+        Self::each_word(start, end.min(self.len), |w, mask| n += (self.words[w] & mask).count_ones());
+        n
+    }
+
+    /// The first free slot in `[start, end)` (`end <= len`).
+    fn first_free(&self, start: usize, end: usize) -> Option<usize> {
+        let mut at = start;
+        while at < end {
+            let word = at / 64;
+            let free = !self.words[word] & (u64::MAX << (at % 64));
+            if free != 0 {
+                let found = word * 64 + free.trailing_zeros() as usize;
+                return (found < end).then_some(found);
+            }
+            at = (word + 1) * 64;
+        }
+        None
+    }
+}
+
 /// [`DYNAMIC`] for a heap of `count` title slots whose null slot is `null`
 /// (0: none): up to four times as many where the host heap has the room (a
 /// host that takes more than [`PORTABLE_VIEWS`]; `VICTORY_DYNAMIC_SLOTS`
@@ -1754,7 +1837,7 @@ impl HostHeap {
             away: Mutex::default(),
             kept: (0..count + extra).map(|_| Mutex::new(None)).collect(),
             kept_some: (0..count + extra).map(|_| std::sync::atomic::AtomicBool::new(false)).collect(),
-            next: Mutex::new((0, vec![false; extra as usize])),
+            next: Mutex::new((0, Taken::new(extra as usize))),
             free: std::sync::atomic::AtomicU32::new(extra),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
@@ -1885,16 +1968,24 @@ impl HostHeap {
         let mut run = 0;
         let mut found = None;
         let mut last = usize::MAX;
-        for at in starts.take(if enough { usize::MAX } else { 0 }) {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
+        if n == 1 && dyn_batch() {
+            // One slot: the first free one from the cursor on, then from the
+            // start, a word at a time (what the walk below finds).
+            if enough {
+                found = taken.first_free(cursor, end).or_else(|| taken.first_free(0, second_end));
             }
-            last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
+        } else {
+            for at in starts.take(if enough { usize::MAX } else { 0 }) {
+                // A run cannot wrap past the end.
+                if at != last.wrapping_add(1) {
+                    run = 0;
+                }
+                last = at;
+                run = if taken.is(at) { 0 } else { run + 1 };
+                if run == n {
+                    found = Some(at + 1 - n);
+                    break;
+                }
             }
         }
         let Some(first) = found else {
@@ -1913,7 +2004,7 @@ impl HostHeap {
         };
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
-        taken[first..first + n].fill(true);
+        taken.fill(first, first + n, true);
         self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
         *next = ((first + n) % end) as u32;
         Some(self.count + first as u32)
@@ -2786,12 +2877,30 @@ impl HostHeap {
             return;
         };
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let end = (at + n).min(self.dynamic) as usize;
-        if let Some(slots) = guard.1.get_mut(at as usize..end) {
-            let given = slots.iter().filter(|taken| **taken).count() as u32;
+        self.release_locked(&mut guard.1, at, n);
+    }
+
+    /// [`HostHeap::release`] of several runs `(first, n)` under one lock of
+    /// the slots (`VICTORY_DYN_BATCH`).
+    pub(crate) fn release_many(&self, runs: &[(u32, u32)]) {
+        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        for &(first, n) in runs {
+            if let Some(at) = first.checked_sub(self.count) {
+                self.release_locked(&mut guard.1, at, n);
+            }
+        }
+    }
+
+    /// Gives back `n` dynamic slots from dynamic slot `at`, `next` locked.
+    fn release_locked(&self, taken: &mut Taken, at: u32, n: u32) {
+        let end = at.saturating_add(n).min(self.dynamic) as usize;
+        let at = at as usize;
+        // (As the slice of slots was before: a start past the end is none.)
+        if at <= end && end <= taken.len {
+            let given = taken.count(at, end);
             self.free.fetch_add(given, std::sync::atomic::Ordering::Relaxed);
             self.too_long.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
-            slots.fill(false);
+            taken.fill(at, end, false);
         }
     }
 

@@ -868,6 +868,23 @@ pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
     }
 }
 
+/// [`release_dynamic`] for several runs `(first, n)` of one heap: the heaps
+/// are looked up once and the slots' lock taken once
+/// ([`host::HostHeap::release_many`]).
+#[cfg(windows)]
+pub(crate) fn release_dynamic_many(heap: usize, runs: &[(u32, u32)]) {
+    if runs.is_empty() {
+        return;
+    }
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    if heaps.iter().any(|&(_, _, h)| h == heap)
+        // SAFETY: registered heaps are live (removed when dropped).
+        && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
+    {
+        host.release_many(runs);
+    }
+}
+
 /// Runs `f` with the host heap of the title's largest view heap, if there is
 /// one (nothing is waited for).
 #[cfg(windows)]
@@ -1255,6 +1272,8 @@ impl Views {
                     self.by_resource.entry(r).or_default().push(i);
                 }
                 self.index.insert(view, i);
+                // (A reused entry keeps the generation `forget` gave it.)
+                view_generation_set(i, self.list[i as usize].1);
                 i
             }
         };
@@ -1487,10 +1506,125 @@ pub(crate) fn forget(resource: usize) {
         views.index.remove(&view);
         // (Below the bits that say a record is no table entry.)
         views.list[i as usize].1 = ((generation + 1) & GENERATIONS).max(1);
+        view_generation_set(i, views.list[i as usize].1);
         // The view's other resource (a counter) keeps a stale entry, which
         // `forget` of that resource skips.
         views.free.push(i);
     }
+}
+
+/// What [`view_at`] does with its per-thread cache of table entries
+/// (`VICTORY_VIEW_CACHE`: `0` off, as before; `check` reads under the lock
+/// as before and counts where the cache would have said otherwise; else
+/// on).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ViewCache {
+    Off,
+    On,
+    Check,
+}
+
+/// See [`ViewCache`]. Every table entry a draw reads took the [`VIEWS`]
+/// read lock: 7.95 ms a frame of the translating threads at the boat in
+/// `view_at` (bop3), the lock's line shared with the submitting thread's
+/// mirror pass.
+fn view_cache() -> ViewCache {
+    static MODE: std::sync::OnceLock<ViewCache> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var_os("VICTORY_VIEW_CACHE") {
+        Some(v) if v == "0" => ViewCache::Off,
+        Some(v) if v == "check" => ViewCache::Check,
+        _ => ViewCache::On,
+    })
+}
+
+/// Table entries whose generation [`VIEW_GENERATIONS`] mirrors.
+const VIEW_GENERATIONS_HELD: usize = 1 << 20;
+
+/// The generation of each of the first [`VIEW_GENERATIONS_HELD`] table
+/// entries ([`Views::list`]), read without the lock by [`view_cached`].
+/// Fixed in size, so it never moves while read. Stored (Release) under the
+/// write lock wherever an entry's generation is set: [`forget`] when it
+/// bumps one, [`Views::entry`] when it makes or reuses one. 0: no entry.
+static VIEW_GENERATIONS: std::sync::LazyLock<Box<[std::sync::atomic::AtomicU32]>> =
+    std::sync::LazyLock::new(|| (0..VIEW_GENERATIONS_HELD).map(|_| std::sync::atomic::AtomicU32::new(0)).collect());
+
+/// Mirrors entry `i`'s generation into [`VIEW_GENERATIONS`] (with the
+/// [`VIEWS`] write lock held), when the cache is used.
+fn view_generation_set(i: u32, generation: u32) {
+    if view_cache() != ViewCache::Off
+        && let Some(at) = VIEW_GENERATIONS.get(i as usize)
+    {
+        at.store(generation, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Entries of the per-thread cache of [`view_at`] (direct-mapped by entry).
+const VIEW_CACHE_SLOTS: usize = 1024;
+
+thread_local! {
+    /// Table entries [`view_at`] read on this thread: (entry, generation,
+    /// view). Valid while the entry's generation in [`VIEW_GENERATIONS`] is
+    /// still the one cached: an entry's view changes only when it is
+    /// reused, after [`forget`] gave it a new generation (generations only
+    /// grow; they wrap after 2^30 forgets of one entry).
+    static VIEW_CACHED: std::cell::RefCell<Vec<Option<(u32, u32, View)>>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Hits and misses on this thread not yet added to [`VIEW_CACHE_COUNTS`].
+    static VIEW_CACHE_LOCAL: std::cell::Cell<(u32, u32)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// The per-thread view cache's hits, misses and (`check`) disagreements
+/// with the locked read since the start.
+static VIEW_CACHE_COUNTS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// See [`VIEW_CACHE_COUNTS`] (hits and misses are added in batches of 1,024).
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+pub(crate) fn view_cache_counts() -> [u64; 3] {
+    VIEW_CACHE_COUNTS.each_ref().map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// The view this thread read for entry `i` at `generation`, if the cache
+/// holds it and `generation` is still the entry's.
+fn view_cached(i: u32, generation: u32) -> Option<View> {
+    let found = (i as usize) < VIEW_GENERATIONS_HELD
+        && VIEW_GENERATIONS[i as usize].load(std::sync::atomic::Ordering::Acquire) == generation;
+    let found = found
+        .then(|| {
+            VIEW_CACHED.with_borrow(|c| match c.get(i as usize % VIEW_CACHE_SLOTS) {
+                Some(Some((at, g, view))) if *at == i && *g == generation => Some(view.clone()),
+                _ => None,
+            })
+        })
+        .flatten();
+    VIEW_CACHE_LOCAL.with(|local| {
+        let (mut hits, mut misses) = local.get();
+        if found.is_some() {
+            hits += 1;
+        } else {
+            misses += 1;
+        }
+        if hits + misses >= 1024 {
+            use std::sync::atomic::Ordering::Relaxed;
+            VIEW_CACHE_COUNTS[0].fetch_add(u64::from(hits), Relaxed);
+            VIEW_CACHE_COUNTS[1].fetch_add(u64::from(misses), Relaxed);
+            (hits, misses) = (0, 0);
+        }
+        local.set((hits, misses));
+    });
+    found
+}
+
+/// Remembers on this thread that entry `i` at `generation` is `view` (read
+/// under the lock just now).
+fn view_remember(i: u32, generation: u32, view: &View) {
+    if i as usize >= VIEW_GENERATIONS_HELD {
+        return;
+    }
+    VIEW_CACHED.with_borrow_mut(|c| {
+        if c.is_empty() {
+            c.resize(VIEW_CACHE_SLOTS, None);
+        }
+        c[i as usize % VIEW_CACHE_SLOTS] = Some((i, generation, view.clone()));
+    });
 }
 
 /// The view the record words `i` and `generation` name: the one they hold
@@ -1498,9 +1632,36 @@ pub(crate) fn forget(resource: usize) {
 fn view_at(i: u32, generation: u32) -> Option<View> {
     match generation >> KIND_SHIFT {
         0 => {
-            let views = views_read();
-            let (view, current) = views.list.get(i as usize)?;
-            (*current == generation).then(|| view.clone())
+            let mode = view_cache();
+            if mode == ViewCache::On
+                && let Some(view) = view_cached(i, generation)
+            {
+                return Some(view);
+            }
+            let found = {
+                let views = views_read();
+                let (view, current) = views.list.get(i as usize)?;
+                (*current == generation).then(|| view.clone())
+            };
+            match mode {
+                ViewCache::Off => {}
+                ViewCache::On => {
+                    if let Some(view) = &found {
+                        view_remember(i, generation, view);
+                    }
+                }
+                ViewCache::Check => {
+                    // What the cache would have said, against the locked read.
+                    let cached = view_cached(i, generation);
+                    if cached.is_some() && cached != found {
+                        VIEW_CACHE_COUNTS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    if let Some(view) = &found {
+                        view_remember(i, generation, view);
+                    }
+                }
+            }
+            found
         }
         CONSTANT => Some(constant_of(i, generation)),
         PLACED => views_read().placed_of(i, generation),

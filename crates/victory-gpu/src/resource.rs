@@ -3160,6 +3160,98 @@ pub(crate) fn texture_held(resource: This) -> Option<(u32, crate::texture::Diges
     *made_copy(resource)?.holds.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Whether [`texture_at`] first asks a per-thread cache of its answers
+/// (`VICTORY_PLACED_CACHE=0`: every ask takes the [`PLACED_TEXTURES`] lock,
+/// as before). That lock, and the [`PLACED_RAW`] one under it, were 17.4 ms
+/// a frame of the translating threads' 20.0 ms in `texture_at` at the boat,
+/// 16.1 of it waiting (bop3, 913 frames).
+///
+/// The cache holds found resources only, never a `None`. It needs no
+/// invalidation: [`PLACED_TEXTURES`] is only ever added to (its resources
+/// are kept for the run), so a resource once found for an address and key
+/// is the one the map gives for them for the rest of the run.
+#[cfg(windows)]
+fn placed_cache() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PLACED_CACHE").is_none_or(|v| v != "0"))
+}
+
+/// Entries of the per-thread cache of [`texture_at`] (direct-mapped).
+#[cfg(windows)]
+const PLACED_CACHE_SLOTS: usize = 512;
+
+#[cfg(windows)]
+thread_local! {
+    /// [`texture_at`]'s answers on this thread: (address, key, resource);
+    /// resource 0 for an empty entry.
+    static PLACED_CACHE: std::cell::RefCell<Vec<(u64, [u32; 14], usize)>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Hits and misses on this thread not yet added to [`PLACED_CACHE_COUNTS`].
+    #[cfg(feature = "diagnostics")]
+    static PLACED_CACHE_LOCAL: std::cell::Cell<(u32, u32)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// The per-thread cache's hits and misses since the last memory line.
+#[cfg(all(windows, feature = "diagnostics"))]
+static PLACED_CACHE_COUNTS: [std::sync::atomic::AtomicU64; 2] =
+    [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+
+/// The per-thread cache's hits and misses since last asked
+/// (`VICTORY_PLACED_CACHE`), counted on each thread and added in batches.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn placed_cache_counts() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (PLACED_CACHE_COUNTS[0].swap(0, Relaxed), PLACED_CACHE_COUNTS[1].swap(0, Relaxed))
+}
+
+#[cfg(windows)]
+fn placed_cache_slot(address: u64, key: &[u32; 14]) -> usize {
+    let mut h = address ^ (address >> 17);
+    for &w in key {
+        h = (h.rotate_left(5) ^ u64::from(w)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+    (h >> 32) as usize % PLACED_CACHE_SLOTS
+}
+
+/// The resource this thread found for `address` and `key` before, if the
+/// cache still holds it.
+#[cfg(windows)]
+fn placed_cached(address: u64, key: &[u32; 14]) -> Option<usize> {
+    let at = placed_cache_slot(address, key);
+    let found = PLACED_CACHE.with_borrow(|c| {
+        c.get(at).and_then(|&(a, k, r)| (r != 0 && a == address && k == *key).then_some(r))
+    });
+    #[cfg(feature = "diagnostics")]
+    PLACED_CACHE_LOCAL.with(|local| {
+        let (mut hits, mut misses) = local.get();
+        if found.is_some() {
+            hits += 1;
+        } else {
+            misses += 1;
+        }
+        if hits + misses >= 1024 {
+            use std::sync::atomic::Ordering::Relaxed;
+            PLACED_CACHE_COUNTS[0].fetch_add(u64::from(hits), Relaxed);
+            PLACED_CACHE_COUNTS[1].fetch_add(u64::from(misses), Relaxed);
+            (hits, misses) = (0, 0);
+        }
+        local.set((hits, misses));
+    });
+    found
+}
+
+/// Remembers on this thread that `address` and `key` have resource `r`
+/// (a resource of [`PLACED_TEXTURES`]).
+#[cfg(windows)]
+fn placed_remember(address: u64, key: &[u32; 14], r: usize) {
+    let at = placed_cache_slot(address, key);
+    PLACED_CACHE.with_borrow_mut(|c| {
+        if c.is_empty() {
+            c.resize(PLACED_CACHE_SLOTS, (0, [0; 14], 0));
+        }
+        c[at] = (address, *key, r);
+    });
+}
+
 /// The resource for a texture placed at `address` with the resource
 /// description `desc` (as words), made on first use.
 #[cfg(windows)]
@@ -3178,9 +3270,14 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         key[13] = 0;
     }
     let desc = &key;
+    let cached = placed_cache();
+    if cached && let Some(r) = placed_cached(address, desc) {
+        return Some(r as This);
+    }
     let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     // How many resources the filler alone would have added (a count for
-    // the log: `placed_filler_twins`).
+    // the log: `placed_filler_twins`; with the per-thread cache, only
+    // asks it did not answer are counted).
     if raw != key {
         let mut seen = PLACED_RAW.lock().unwrap_or_else(|e| e.into_inner());
         if seen.insert((address, raw)) {
@@ -3196,6 +3293,9 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         }
     }
     if let Some(&r) = map.get(&(address, *desc)) {
+        if cached {
+            placed_remember(address, desc, r);
+        }
         return Some(r as This);
     }
     // SAFETY: 56 bytes in the description's layout.
@@ -3217,6 +3317,9 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         return None;
     }
     map.insert((address, *desc), out as usize);
+    if cached {
+        placed_remember(address, desc, out as usize);
+    }
     crate::texture::placed_in_host_written(address, desc);
     resource(out)
         .host

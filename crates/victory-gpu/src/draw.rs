@@ -445,10 +445,42 @@ pub(crate) struct State {
 
 impl Drop for State {
     fn drop(&mut self) {
+        if crate::descriptor::host::dyn_batch() {
+            give_back_dynamic(&mut self.dynamic);
+            return;
+        }
         for &(heap, first, n) in &self.dynamic {
             crate::descriptor::release_dynamic(heap, first, n);
         }
     }
+}
+
+/// Gives back a list's dynamic slots (`VICTORY_DYN_BATCH`, on by default):
+/// sorted by heap and first slot, runs that touch joined, then each heap's
+/// runs under one look-up of the heaps and one lock of its slots. One at a
+/// time, the relay gave back each of about 9,400 tables a frame under two
+/// locks the threads that make tables wait on (rt4 9,395 tables, 7.8 ms
+/// searching; bop2prof: 4.1 of `HostHeap::dynamic`'s 4.8 ms under the lock).
+/// Empties `dynamic`.
+fn give_back_dynamic(dynamic: &mut Vec<(usize, u32, u32)>) {
+    dynamic.sort_unstable();
+    let mut runs: Vec<(u32, u32)> = Vec::new();
+    let mut at = 0;
+    while at < dynamic.len() {
+        let heap = dynamic[at].0;
+        runs.clear();
+        while let Some(&(h, first, n)) = dynamic.get(at)
+            && h == heap
+        {
+            match runs.last_mut() {
+                Some((f, m)) if f.checked_add(*m) == Some(first) => *m += n,
+                _ => runs.push((first, n)),
+            }
+            at += 1;
+        }
+        crate::descriptor::release_dynamic_many(heap, &runs);
+    }
+    dynamic.clear();
 }
 
 impl State {
@@ -467,8 +499,12 @@ impl State {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!("a list ran again after its descriptor tables were given back"));
         }
-        for (heap, first, n) in self.dynamic.drain(..) {
-            crate::descriptor::release_dynamic(heap, first, n);
+        if crate::descriptor::host::dyn_batch() {
+            give_back_dynamic(&mut self.dynamic);
+        } else {
+            for (heap, first, n) in self.dynamic.drain(..) {
+                crate::descriptor::release_dynamic(heap, first, n);
+            }
         }
         self.fresh_tables.clear();
         self.recording = 0;
@@ -3565,9 +3601,36 @@ impl State {
             };
             // Diagnostics: how many of the tables made afresh another list
             // made the same of in this frame already (a table kept across
-            // lists would spare those), said every 5 s.
+            // lists would spare those), said every 5 s. Only with
+            // `VICTORY_TABLE_SEEN=1` (see `table_seen`); otherwise just the
+            // counts, with relaxed atomics.
             #[cfg(feature = "diagnostics")]
-            {
+            if !table_seen() {
+                static MADE: AtomicU64 = AtomicU64::new(0);
+                static SLOTS: AtomicU64 = AtomicU64::new(0);
+                let made_before = MADE.fetch_add(1, Ordering::Relaxed);
+                SLOTS.fetch_add(u64::from(n), Ordering::Relaxed);
+                // The clock is looked at every 1,024th table, and only by a
+                // thread that finds the lock free.
+                if made_before % 1024 == 0 {
+                    static SINCE: std::sync::Mutex<Option<(std::time::Instant, u64)>> = std::sync::Mutex::new(None);
+                    if let Ok(mut g) = SINCE.try_lock() {
+                        let frame = crate::frame::current();
+                        let (since, first_frame) = *g.get_or_insert((std::time::Instant::now(), frame));
+                        if since.elapsed().as_secs() >= 5 {
+                            let f = frame.saturating_sub(first_frame).max(1) as f64;
+                            tracing::info!(
+                                "tables made afresh per frame: {:.0} ({:.0} slots); {:.0} found made in their list (VICTORY_TABLE_BY_CONTENT {}; VICTORY_TABLE_SEEN=1 also counts those another list made)",
+                                MADE.swap(0, Ordering::Relaxed) as f64 / f,
+                                SLOTS.swap(0, Ordering::Relaxed) as f64 / f,
+                                TABLE_HITS.swap(0, Ordering::Relaxed) as f64 / f,
+                                if table_by_content() { "on" } else { "off" }
+                            );
+                            *g = Some((std::time::Instant::now(), frame));
+                        }
+                    }
+                }
+            } else {
                 static SEEN: std::sync::Mutex<(u64, Option<std::collections::HashSet<(u64, u32, u64)>>, [u64; 4], Option<std::time::Instant>)> =
                     std::sync::Mutex::new((0, None, [0; 4], None));
                 let frame = crate::frame::current();
@@ -4450,6 +4513,18 @@ static TABLE_HITS: AtomicU64 = AtomicU64::new(0);
 fn table_by_content() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_TABLE_BY_CONTENT").is_some_and(|v| v == "1"))
+}
+
+/// Whether the "tables made afresh" line also counts the tables another list
+/// made the same of in the frame (`VICTORY_TABLE_SEEN=1`; off by default).
+/// That count takes one process-wide lock and a set insert for every fresh
+/// table: 10.2 ms a frame of the translating threads at the boat (bop3, about
+/// 9,300 tables a frame on 8 threads), for a figure that was 36 a frame (fg2)
+/// and has done its job. Off, the line keeps the made and slot counts.
+#[cfg(feature = "diagnostics")]
+fn table_seen() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TABLE_SEEN").is_some_and(|v| v == "1"))
 }
 
 /// Whether a table a list reads again, with nothing changed in the list

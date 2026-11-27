@@ -2982,6 +2982,54 @@ fn upload_pool() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_UPLOAD_POOL").is_none_or(|v| v != "0"))
 }
 
+/// The most read-back buffers of one size [`READBACK_POOL`] keeps.
+const READBACK_POOL_EACH: usize = 32;
+/// The most bytes [`READBACK_POOL`] keeps in all.
+const READBACK_POOL_MOST: u64 = 128 << 20;
+
+/// Free read-back buffers of texture copies back ([`crate::texback`]), by
+/// exact size, and the bytes they hold. Given back only at
+/// [`HostList::reset`], where every submission of the list has run, never
+/// from a `Drop` (a list's [`Deferred`] is also dropped on the dropper
+/// thread, with no tie to the card having finished).
+static READBACK_POOL: std::sync::LazyLock<Mutex<(std::collections::HashMap<u64, Vec<ID3D12Resource>>, u64)>> =
+    std::sync::LazyLock::new(|| Mutex::new((std::collections::HashMap::new(), 0)));
+/// Since the start: read-back buffers taken from [`READBACK_POOL`], and made.
+pub(crate) static READBACK_POOL_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Whether texture copies back take their read-back buffers from
+/// [`READBACK_POOL`] (`VICTORY_READBACK_POOL=0`: a new committed buffer
+/// each, let go with the list's records, as before). About 13 textures a
+/// frame are copied back at the boat (fg2: "texture readback landed"
+/// grows by about 290 a second), each a new committed read-back buffer made
+/// on a translating thread: `read_back_buffer` 15.8 ms a frame (bop3).
+/// What a pooled buffer held does not matter: every copy writes all the
+/// footprints `land` reads, and read-back buffers stay in COPY_DEST.
+fn readback_pool() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_READBACK_POOL").is_none_or(|v| v != "0"))
+}
+
+/// Gives the read-back buffers of `backs` (of a list being reset: every
+/// submission of it has run) to [`READBACK_POOL`], up to its caps.
+fn give_read_backs(backs: Vec<crate::texback::Back>) {
+    if backs.is_empty() {
+        return;
+    }
+    let mut pool = READBACK_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    for back in backs {
+        let (size, buffer) = back.into_buffer();
+        if pool.1 + size > READBACK_POOL_MOST {
+            continue;
+        }
+        let free = pool.0.entry(size).or_default();
+        if free.len() < READBACK_POOL_EACH {
+            free.push(buffer);
+            pool.1 += size;
+        }
+    }
+}
+
 /// Drops `what` on a thread of ours ([`drop_later_on`]; here when switched
 /// off): for state the title's threads let go of in bulk at a list's reset
 /// (`crate::draw::State::reset`: 38 % of the recording threads' time in
@@ -7619,7 +7667,15 @@ impl HostList {
         // What the list recorded is let go on a thread of ours
         // ([`drop_later`]): its steps' copies and closures took 44 % of a
         // reset on the title's thread (profile bp1, RTX 5070).
-        drop_later(std::mem::take(&mut *self.deferred()));
+        {
+            let mut deferred = self.deferred();
+            // Every submission of the list has run: its texture read-back
+            // buffers go back to the pool (`VICTORY_READBACK_POOL`).
+            if readback_pool() {
+                give_read_backs(std::mem::take(&mut deferred.texture_backs));
+            }
+            drop_later(std::mem::take(&mut *deferred));
+        }
         // Every submission of the list has run: its upload buffers go back.
         {
             let given: Vec<Pooled> = std::mem::take(&mut *self.pooled.lock().unwrap_or_else(|e| e.into_inner()));
@@ -10571,6 +10627,28 @@ impl Host {
                 None
             }
         }
+    }
+
+    /// [`Host::read_back_buffer`] for a texture copy back: one of that exact
+    /// size from [`READBACK_POOL`] when there is one (`VICTORY_READBACK_POOL`).
+    pub(crate) fn read_back_pooled(&self, size: u64) -> Option<ID3D12Resource> {
+        if !readback_pool() {
+            return self.read_back_buffer(size);
+        }
+        let found = {
+            let mut pool = READBACK_POOL.lock().unwrap_or_else(|e| e.into_inner());
+            let found = pool.0.get_mut(&size).and_then(Vec::pop);
+            if found.is_some() {
+                pool.1 -= size;
+            }
+            found
+        };
+        if found.is_some() {
+            READBACK_POOL_STATS[0].fetch_add(1, Ordering::Relaxed);
+            return found;
+        }
+        READBACK_POOL_STATS[1].fetch_add(1, Ordering::Relaxed);
+        self.read_back_buffer(size)
     }
 
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
