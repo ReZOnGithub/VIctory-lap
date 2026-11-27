@@ -39,6 +39,7 @@ minutes; nobody else has verified them.
 | In-game | Yes | Played from the start through the prison opening and its cutscenes into the first boat mission |
 | Frame rate in-game | **21 to 22 fps** | Boat mission, open water, 3,500 draws a frame: runs average 21.5 to 22.3 fps, single readings 20.3 to 22.7. Cutscenes 24 to 28 fps |
 | Frame rate in-game with DLSS frame generation (2x) | **43 to 44 fps shown** | Same scene: 21.5 to 22 frames rendered a second and as many generated (DLSS Quality, RTX 5070; Streamline reports 22 presents and 22 generated frames a second, status ok). Generated frames, not rendered ones |
+| Ray tracing (the title's own, `VICTORY_BVH_BUILDER=1`) | **Runs, 18 fps** | Same scene: 18.0 to 19.1 fps rendered; reflections of the bridge on the water and the shadows are there. Off by default |
 | 30 fps in-game, rendered | No | The card is busy two thirds of a frame at 22 fps; one CPU thread sets the rest |
 | Stable | Partly | Four-minute scripted runs repeat without a crash or a lost device; longer sessions were played by hand to the boat mission, not timed |
 
@@ -54,8 +55,8 @@ under "How it renders".
 - GPU: about 31 ms of work a frame, nine tenths of it the title's own lists.
 - Memory: 24 to 27 GB of private memory; a 32 GB PC pages now and then.
 - Picture: the faults listed under "How it renders".
-- Not tested here: ray tracing, AMD and Intel cards, Series X profile, play
-  beyond the first boat mission.
+- Not tested here: AMD and Intel cards, Series X profile, play beyond the
+  first boat mission; ray tracing only at the boat mission.
 
 Earlier in the same build: the prison opening ran at about 9 fps (4,500 draws
 a frame) before the later changes in the table below; it has not been
@@ -107,12 +108,12 @@ under Windows 10 it crashed at boot, then ran at 2.5 fps. Step by step:
 - **The fastest settings are the defaults** (`nv_defaults` in
   `apps/victory/src/run.rs`; `VICTORY_NV_DEFAULTS=0` turns them off). Every
   `VICTORY_...` switch is described in a comment where it is read.
-- **A shortcut to know of:** `VICTORY_LAND_NOT_KB=64` (a default here) leaves
-  what shaders write into buffers of 64 KB and more on the card. Nothing in
-  the scenes played reads those on the CPU, and the picture is the same
-  (small ones are read: with none brought down the picture goes white).
-  If a later scene looks wrong, run with `VICTORY_LAND_NOT_KB=100000000`
-  and tell us.
+- **A shortcut to know of:** `VICTORY_LAND_NOT_KB=1024` (a default here)
+  leaves what shaders write into buffers of 1 MB and more on the card.
+  Smaller ones are read by the title: with 64 KB its ray tracing fails at the
+  start and fewer textures arrive while moving; with none brought down the
+  picture goes white. `VICTORY_LAND_NOT_KB=64` is about 1 fps faster without
+  ray tracing; `VICTORY_LAND_NOT_KB=100000000` brings everything down.
 - **Not usable on NVIDIA:** renderer ports 1 and 5 (`VICTORY_PORT_CONSTANTS`,
   `VICTORY_PORT_CBV`, the title's memory read in place by the card): the card
   reads the PC's memory several times slower, and the picture is black with

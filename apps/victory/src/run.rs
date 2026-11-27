@@ -771,7 +771,12 @@ fn nv_defaults() {
         // captures k16 and k64). With nothing brought down the picture goes
         // white (h17). `VICTORY_LAND_NOT_KB=100000000` brings everything
         // down again, if a scene needs it.
-        ("VICTORY_LAND_NOT_KB", "64"),
+        // (1 MB, not the 64 KB that measured fastest without ray tracing:
+        // with 64 KB the title's ray tracing ends the title as the world
+        // comes up, run rt1, and fewer textures arrive while moving through
+        // the world, as seen in play; with ray tracing 128 KB is no faster
+        // than 1 MB, runs rt4 and rt6.)
+        ("VICTORY_LAND_NOT_KB", "1024"),
         // Textures in guarded memory are hashed again every 64th frame, not
         // every 8th, for changes their guard cannot see: 37 MB a frame
         // hashed at the boat, none such found; 4 MB with this, 21.0 to 21.9
