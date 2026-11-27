@@ -11,7 +11,7 @@ param(
     [switch]$Safe,
     [switch]$RayTracing,
     [ValidateSet('quality', 'balanced', 'performance')][string]$Fsr4K,
-    [ValidateSet('diag', 'release')][string]$Build = 'diag',
+    [ValidateSet('diag', 'release')][string]$Build = 'release',
     [hashtable]$More = @{}
 )
 $settings = @{

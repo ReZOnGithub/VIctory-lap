@@ -36,7 +36,7 @@ Tested on one machine: Windows 10, Ryzen 7 3700X, 32 GB RAM, **GeForce RTX
 | | |
 |---|---|
 | How far it plays | Boot, menus, the prison opening and its cutscenes, on to **the first boat mission** (driving the boat in open water), where testing is now |
-| Frame rate at the boat mission | **12 to 14 fps** (3,400 to 4,400 draws a frame; single readings up to 14.9) |
+| Frame rate at the boat mission | **16 fps** (16.0 to 16.5 at 3,500 to 3,600 draws a frame) |
 | Frame rate in the prison opening | about 9 fps (4,500 draws a frame) |
 | Menus and videos | 30 to 60 fps |
 | Memory | 24 to 27 GB of private memory: a 32 GB PC pages now and then; 64 GB is comfortable |
@@ -72,7 +72,9 @@ under Windows 10 it crashed at boot, then ran at 2.5 fps. Step by step:
 | The line looks again at once while it stands | | 8.0 |
 | Buffers of views' copies used again (`VICTORY_EXACT_POOL`) | | 10.5 to 12.9 |
 | Frame-critical threads above normal priority | | 11.9 to 13.1 |
-| The title's 30 fps pacing replaced by a 60 fps one | | **12 to 14** |
+| The title's 30 fps pacing replaced by a 60 fps one | | 12 to 14 |
+| mimalloc, write-watch askings spread over threads, smaller fixes | | 14.0 to 14.6 |
+| The release build (link-time optimized) instead of the `diag` one | | **16.0 to 16.5** |
 
 - **Windows 10 boot fix:** the Agility SDK export (`apps/victory/build.rs`,
   `src/agility.rs`). Without it Windows 10's D3D12 refuses the boot screen's
@@ -100,8 +102,9 @@ tools, and your own dump of the title.
 git clone https://github.com/ReZOnGithub/VIctory-lap
 cd VIctory-lap
 copy victory.example.toml victory.toml      # then set your paths, outside this folder
-cargo build --locked --profile diag -p victory --features diagnostics
-target\diagictory.exe run <path of your copy's executable> --execute --console series-s
+cargo build --locked --release -p victory --features diagnostics
+target
+eleaseictory.exe run <path of your copy's executable> --execute --console series-s
 ```
 
 That line is how the numbers above were measured: the settings are built in,

@@ -1636,6 +1636,8 @@ fn wide(jobs: Vec<Job>) {
     }
     let workers = workers();
     let _wide = crate::timeline::span("work spread over threads");
+    // (This thread takes one itself: no more threads woken than the others.)
+    let others = jobs.len() - 1;
     let left = Arc::new((Mutex::new(jobs.len()), std::sync::Condvar::new()));
     {
         let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
@@ -1652,7 +1654,13 @@ fn wide(jobs: Vec<Job>) {
             }));
         }
     }
-    workers.more.notify_all();
+    if others >= wide_threads() {
+        workers.more.notify_all();
+    } else {
+        for _ in 0..others {
+            workers.more.notify_one();
+        }
+    }
     loop {
         let job = workers.jobs.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
         match job {
