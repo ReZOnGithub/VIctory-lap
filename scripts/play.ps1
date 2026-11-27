@@ -11,7 +11,7 @@ param(
     [switch]$Safe,
     [switch]$RayTracing,
     [ValidateSet('quality', 'balanced', 'performance')][string]$Fsr4K,
-    [ValidateSet('diag', 'release')][string]$Build = 'release',
+    [ValidateSet('diag', 'release', 'pgo')][string]$Build = 'release',
     [hashtable]$More = @{}
 )
 $settings = @{
@@ -29,7 +29,8 @@ if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
 if ($Fsr4K) { $settings.VICTORY_FSR_4K = $Fsr4K.ToLowerInvariant() }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
-$victory = Join-Path $PSScriptRoot "..\target\$Build\victory.exe"
+# (-Build pgo: the profile-guided build of scripts\pgo.ps1.)
+$victory = Join-Path $PSScriptRoot $(if ($Build -eq 'pgo') { "..\target\pgo\release\victory.exe" } else { "..\target\$Build\victory.exe" })
 if (-not (Test-Path $victory)) { Write-Host "No $victory. Build it first (README.md)."; exit 1 }
 if (-not (Test-Path $Exe)) { Write-Host "No $Exe."; exit 1 }
 # (Other settings left over in this window go; where your files are stays.)

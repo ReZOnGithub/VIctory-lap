@@ -143,6 +143,11 @@ name, PCI vendor and device IDs, and dedicated VRAM. Set
 name to select it explicitly. With the launcher, pass
 `-More @{VICTORY_D3D12_ADAPTER='NVIDIA'}`.
 
+For 3 % more frames (21.0 to 21.7 fps at the boat mission here), a
+profile-guided build: `scripts\pgo.ps1 -Step train -Exe <path>` runs a
+counting build for some minutes while you play, `scripts\pgo.ps1 -Step build`
+builds from what it counted, and `scripts\play.ps1 -Build pgo` runs that.
+
 Before the first run, ahead of time (both can be stopped and go on later):
 
 ```powershell
