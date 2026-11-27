@@ -2513,6 +2513,24 @@ pub(crate) fn send_flush() {
     }
 }
 
+/// `VICTORY_LAND_NOT_MB` in bytes (`u64::MAX`: not set): see
+/// [`Host::relay_card_back`].
+fn land_not_least() -> u64 {
+    static LEAST: OnceLock<u64> = OnceLock::new();
+    *LEAST.get_or_init(|| {
+        std::env::var("VICTORY_LAND_NOT_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).map_or(u64::MAX, |mb| mb << 20)
+    })
+}
+
+/// Whether the card does not look for what shaders wrote in such copies
+/// either (`VICTORY_LAND_NOT_COMPARE`, on unless `0`): nothing of it is
+/// brought down, so the hashes before and the compare after the lists, of
+/// 20 MB a submission at the title's boat mission, find pieces for nobody.
+fn land_not_compare() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_NOT_COMPARE").is_none_or(|v| v != "0"))
+}
+
 /// A list to close beside, and what says it is done.
 struct Closing {
     list: ID3D12GraphicsCommandList,
@@ -4752,7 +4770,12 @@ impl Host {
         }
         // The ranges this submission's shaders may write, per copy.
         let declared: Vec<Declared> = declared.iter().filter(|(shadow, _)| shadow.carded()).cloned().collect();
-        let declared = if crate::picked::lands() { crate::picked::with(declared, &picked.written) } else { declared };
+        let mut declared = if crate::picked::lands() { crate::picked::with(declared, &picked.written) } else { declared };
+        // (Copies whose shader writes are not brought down are not looked
+        // through on the card either: `land_not_compare`.)
+        if land_not_compare() && land_not_least() != u64::MAX {
+            declared.retain(|(shadow, _)| shadow.span().1 < land_not_least());
+        }
         // (Of a copy with a declared range here, that says it.)
         let looked: Vec<&crate::picked::Range> =
             picked.looked.iter().filter(|l| !declared.iter().any(|(s, _)| Arc::ptr_eq(s, &l.0))).collect();
@@ -5207,10 +5230,7 @@ impl Host {
         // was before the shaders wrote. Bringing it down when the title
         // first touches it would be the whole answer.
         {
-            static LEAST: OnceLock<u64> = OnceLock::new();
-            let least = *LEAST.get_or_init(|| {
-                std::env::var("VICTORY_LAND_NOT_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).map_or(u64::MAX, |mb| mb << 20)
-            });
+            let least = land_not_least();
             if least != u64::MAX {
                 pieces.retain(|p| p.0.span().1 < least);
                 total = 0;
