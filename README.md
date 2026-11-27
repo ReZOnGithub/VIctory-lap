@@ -103,8 +103,7 @@ git clone https://github.com/ReZOnGithub/VIctory-lap
 cd VIctory-lap
 copy victory.example.toml victory.toml      # then set your paths, outside this folder
 cargo build --locked --release -p victory --features diagnostics
-target
-eleaseictory.exe run <path of your copy's executable> --execute --console series-s
+target\release\victory.exe run <path of your copy's executable> --execute --console series-s
 ```
 
 That line is how the numbers above were measured: the settings are built in,
@@ -137,8 +136,8 @@ name to select it explicitly. With the launcher, pass
 Before the first run, ahead of time (both can be stopped and go on later):
 
 ```powershell
-target\diag\victory.exe shaders <the shader archives>   # every shader translated, minutes
-target\diag\victory.exe warm --used                     # pipelines earlier runs drew with, for a new driver or build
+target\release\victory.exe shaders <the shader archives>   # every shader translated, minutes
+target\release\victory.exe warm --used                     # pipelines earlier runs drew with, for a new driver or build
 ```
 
 Commands, debugging switches and upstream's own description:
