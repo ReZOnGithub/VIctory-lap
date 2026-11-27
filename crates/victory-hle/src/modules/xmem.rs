@@ -258,6 +258,15 @@ const ALLOC_32BIT: u64 = 1 << 33;
 /// pointer handed out.
 const HEADER: usize = 2 * size_of::<usize>();
 
+/// The header's size word of a block made with `VirtualAlloc`
+/// ([`XMemAllocDefault`]).
+const WATCHED_BLOCK: usize = 1 << (usize::BITS - 1);
+
+fn watch_title_heap() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("VICTORY_WATCH_TITLE_HEAP").is_none_or(|v| v != "0"));
+    *ON
+}
+
 fn layout(size: usize, attributes: u64) -> Option<Layout> {
     // An alignment of at least 16 leaves room for the header.
     let align = 1usize << (attributes >> ALIGNMENT_SHIFT & 0x1f).max(4);
@@ -340,6 +349,25 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
     // console's; nothing seen builds ray-tracing structures in this memory
     // (the title uses its GPU heap). Sub-allocate from a
     // reservation below 2^40 if one does.
+    // Big blocks: pages of their own, write-watched, so the GPU side copies
+    // only what the title wrote (`VICTORY_WATCH_TITLE_HEAP`, on unless `0`).
+    // From the heap they were not watched and each refresh of a copy of one
+    // copied it whole: a 20 MB buffer twice a frame, 42 MB and 9 ms a frame
+    // (run bl32, RTX 5070). The size's top bit in the header says so.
+    if watch_title_heap() && layout.size() >= 1 << 20 {
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        let bytes = layout.size();
+        // SAFETY: a plain allocation of ours; committed pages come zeroed.
+        let base = unsafe { windows_sys::Win32::System::Memory::VirtualAlloc(std::ptr::null(), bytes, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) };
+        if !base.is_null() {
+            // SAFETY: as below, in our own pages.
+            unsafe {
+                let user = base.cast::<u8>().add(layout.align());
+                user.sub(HEADER).cast::<[usize; 2]>().write([bytes | WATCHED_BLOCK, layout.align()]);
+                return user.cast();
+            }
+        }
+    }
     // SAFETY: the layout has a non-zero size.
     let block = unsafe { alloc(layout) };
     if block.is_null() {
@@ -371,6 +399,10 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
         }
         let user = address.cast::<u8>();
         let [size, align] = user.sub(HEADER).cast::<[usize; 2]>().read();
+        if size & WATCHED_BLOCK != 0 {
+            VirtualFree(user.sub(align).cast(), 0, MEM_RELEASE);
+            return;
+        }
         dealloc(
             user.sub(align),
             Layout::from_size_align_unchecked(size, align),
