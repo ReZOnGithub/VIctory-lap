@@ -687,6 +687,9 @@ fn nv_defaults() {
         ("VICTORY_WIDE_FILLS", "1"),
         ("VICTORY_WIDE_TEXTURES", "1"),
         ("VICTORY_DECLARE_ONCE", "0"),
+        // The title's own 30 fps pacing held its frame back while the layer
+        // stood (boat mission, runs bo8/bo10: 22.8 to 19.3 us a draw).
+        ("VICTORY_FRAME_INTERVAL_MS", "16.667"),
     ];
     for &(name, value) in SET {
         if std::env::var_os(name).is_none() {
