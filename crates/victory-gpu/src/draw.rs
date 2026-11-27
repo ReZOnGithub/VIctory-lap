@@ -3490,12 +3490,24 @@ impl State {
                     // SAFETY: a descriptor slot in title memory.
                     h.add(unsafe { (at as *const [u32; 3]).read_unaligned() });
                 }
-                (table, n, h.0)
+                // With [`table_by_content`]: whatever its address.
+                (if table_by_content() { heap.start } else { table }, n, h.0)
             };
             // Who reads of it, and as what, as far as [`readable`] goes by it.
             let reader = (std::ptr::from_ref(plan) as usize, plan.direct.len(), STORES.get(), TESTED_DEPTH.get().0);
             if let Some(known) = self.fresh_tables.get_mut(&key) {
                 let first = known.first;
+                #[cfg(feature = "diagnostics")]
+                TABLE_HITS.fetch_add(1, Ordering::Relaxed);
+                // Another table of the same records: its own slots are a
+                // table's too (as where it is made, below).
+                if table_by_content()
+                    && let Some(title) = heap.index(table).filter(|first| first + n <= host.count())
+                {
+                    for k in (0..n).filter(|&k| n <= 64 || group.entry(k).is_some()) {
+                        host.slot_tabled(title + k);
+                    }
+                }
                 // This reader had it brought up to date, and nothing in the
                 // list changed since: nothing to do again.
                 let once = ready_once() && selected.is_empty() && !group.has_uav;
@@ -3551,6 +3563,40 @@ impl State {
                 made.push((slot, u32::MAX));
                 continue;
             };
+            // Diagnostics: how many of the tables made afresh another list
+            // made the same of in this frame already (a table kept across
+            // lists would spare those), said every 5 s.
+            #[cfg(feature = "diagnostics")]
+            {
+                static SEEN: std::sync::Mutex<(u64, Option<std::collections::HashSet<(u64, u32, u64)>>, [u64; 4], Option<std::time::Instant>)> =
+                    std::sync::Mutex::new((0, None, [0; 4], None));
+                let frame = crate::frame::current();
+                let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+                if g.0 != frame {
+                    g.0 = frame;
+                    g.1 = Some(Default::default());
+                    g.2[3] += 1;
+                }
+                let again = !g.1.get_or_insert_with(Default::default).insert(key);
+                g.2[0] += 1;
+                g.2[1] += u64::from(again);
+                g.2[2] += u64::from(n);
+                let since = *g.3.get_or_insert_with(std::time::Instant::now);
+                if since.elapsed().as_secs() >= 5 {
+                    let [made, again, slots, frames] = g.2;
+                    let f = frames.max(1) as f64;
+                    tracing::info!(
+                        "tables made afresh per frame: {:.0} ({:.0} slots), {:.0} of them the same as one another list made in the frame; {:.0} found made in their list (VICTORY_TABLE_BY_CONTENT {})",
+                        made as f64 / f,
+                        slots as f64 / f,
+                        again as f64 / f,
+                        TABLE_HITS.swap(0, Ordering::Relaxed) as f64 / f,
+                        if table_by_content() { "on" } else { "off" }
+                    );
+                    g.2 = [0; 4];
+                    g.3 = Some(std::time::Instant::now());
+                }
+            }
             self.fresh_tables.insert(key, FreshTable { first, epoch: 0, ready: Vec::new() });
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, first, n));
@@ -4359,6 +4405,22 @@ struct FreshTable {
     /// tested depth target.
     epoch: u64,
     ready: Vec<((usize, usize, bool, usize), bool)>,
+}
+
+/// Tables found made already in their list, since the last line.
+#[cfg(feature = "diagnostics")]
+static TABLE_HITS: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a list knows a table it made by its records alone, not by where
+/// the title has it (`VICTORY_TABLE_BY_CONTENT=1`; off: measured no fewer tables, run bo12, they differ by their constant buffers). The title's
+/// tables come from its frame allocator, a new address for every draw: 5,000
+/// to 9,700 tables of 50,000 to 78,000 slots were made afresh a frame at the
+/// boat (run bo11) for some 3,500 draws, each slot a view looked up, made or
+/// copied and kept: most of what the threads that translate the title's list
+/// calls did. Two tables of the same records show the same views.
+fn table_by_content() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TABLE_BY_CONTENT").is_some_and(|v| v == "1"))
 }
 
 /// Whether a table a list reads again, with nothing changed in the list
