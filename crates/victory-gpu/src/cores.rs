@@ -264,9 +264,20 @@ fn ask(what: &str, from: u32) {
             _ => 2,
         });
         if from <= upto {
-            use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL};
+            use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority};
+            // How far above (`VICTORY_BOOST_LEVEL`: 1 above normal, the
+            // default; 2 highest; 15 time critical). The title sets its own
+            // threads' priorities, above normal among them: a thread of ours
+            // woken for a share of a submission's work began it 0.5 to 1 ms
+            // late at the boat (timeline tl1), some 47 times a frame.
+            static LEVEL: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+            let level = *LEVEL.get_or_init(|| match std::env::var("VICTORY_BOOST_LEVEL").ok().as_deref() {
+                Some("2") => 2,
+                Some("15") => 15,
+                _ => 1,
+            });
             // SAFETY: the calling thread's own priority.
-            unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) };
+            unsafe { SetThreadPriority(GetCurrentThread(), level) };
         }
     }
     if stage() < from {
