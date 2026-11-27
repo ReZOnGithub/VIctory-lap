@@ -475,6 +475,9 @@ pub(crate) fn behind_line(frames: f64) {
         if let Some(line) = crate::watch::ask_marks_line(frames) {
             tracing::info!("{line}");
         }
+        if let Some(line) = crate::host::warm_line(frames) {
+            tracing::info!("{line}");
+        }
     }
 }
 

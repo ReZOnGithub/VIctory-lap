@@ -3272,6 +3272,12 @@ impl Shadow {
         watched != NOT_WATCHED && (watched != GUARDED || !crate::watch::light())
     }
 
+    /// Whether the kernel watches the copy's memory and no guard of ours
+    /// ever stood for it.
+    pub(crate) fn plainly_watched(&self) -> bool {
+        self.watched.load(Ordering::Relaxed) == 1
+    }
+
     /// The copy's own number (see the field).
     pub(crate) fn id(&self) -> u64 {
         self.id

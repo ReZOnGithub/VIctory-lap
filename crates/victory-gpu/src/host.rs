@@ -2441,6 +2441,28 @@ fn send_beside() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_SEND_BESIDE").is_none_or(|v| v != "0"))
 }
 
+/// Whether the list that brings the copies in the card's memory up to date
+/// goes to the queue on the sending thread too (`VICTORY_SEND_SYNC_BESIDE=1`;
+/// off): the driver's part of it was 1 ms a frame of the thread that
+/// prepares submissions, and that thread waited for the sending thread's
+/// line to be empty before it (profile bop4). Not with the copy queue of
+/// `upq`, which goes to the queue from here.
+fn send_sync_beside() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| send_beside() && !upq::on() && std::env::var_os("VICTORY_SEND_SYNC_BESIDE").is_some_and(|v| v == "1"))
+}
+
+/// A flush of so many copies at most looks at them on the thread that
+/// prepares the submission, and refreshes up to three of them there
+/// (`VICTORY_FLUSH_SMALL=<n>`; 0, the default: on the threads beside from
+/// four on, as renderer port #6 has it). Waking the threads for a handful of
+/// copies that mostly need nothing took longer than the looks: flushes of
+/// 2.7 ms for 0.7 ms of work (timeline tl1).
+fn flush_small() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_FLUSH_SMALL").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+}
+
 /// A send for the sending thread.
 struct Sending(Box<dyn FnOnce()>);
 // SAFETY: D3D12 queues, lists and fences are free-threaded; the lists are
@@ -2511,6 +2533,196 @@ pub(crate) fn send_flush() {
     while line.2 < given {
         line = sender.done.wait(line).unwrap_or_else(|e| e.into_inner());
     }
+}
+
+/// Whether the copies the next submissions in the line refresh are brought
+/// up to date beside the one being prepared (`VICTORY_WARM=1`; off), by a
+/// thread of its own ("victory-warm").
+///
+/// The thread that prepares submissions sets the frame at the title's boat
+/// mission, and a third of what it does for each is asking the kernel what
+/// the title wrote and copying that (profile bop4: 6.8 and 8.9 ms of its 36
+/// a frame). But the submission it comes to has been in the line for some
+/// 20 ms, and what the title wrote for it was written before. So the same
+/// asking and the same refreshes are made ahead here, as any thread's are;
+/// when the preparing thread comes to the submission, its asking finds the
+/// pieces asked about since the submission was queued (`crate::watch`'s
+/// marks, which this turns on) and its refreshes find nothing new. What the
+/// title writes after this is found then as it always was: nothing depends
+/// on this having run.
+pub(crate) fn warm_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WARM").is_some_and(|v| v == "1"))
+}
+
+/// Which halves of the warming run (`VICTORY_WARM_PARTS`, 3 unless set): 1
+/// its asking, 2 its refreshes.
+pub(crate) fn warm_parts() -> u32 {
+    static PARTS: OnceLock<u32> = OnceLock::new();
+    *PARTS.get_or_init(|| std::env::var("VICTORY_WARM_PARTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(3))
+}
+
+/// Copies and their ranges (from, to) for the warming thread.
+type Warming = Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>;
+// (A `Shadow` is shared between threads as it is: the submitting thread's
+// helpers refresh them too.)
+struct WarmLine(Mutex<std::sync::mpsc::Sender<Warming>>);
+
+/// Since the last frame line: submissions warmed, copies looked at, copies
+/// refreshed, bytes copied, microseconds.
+pub(crate) static WARMED: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// What `lists`, a submission in the line, refreshes is given to the
+/// warming thread ([`warm_on`]).
+pub(crate) fn warm<'a>(lists: impl Iterator<Item = &'a HostList>) {
+    if !warm_on() {
+        return;
+    }
+    // Not while the title loads its world (`VICTORY_WARM_AFTER_S`, 120 unless
+    // set, counted from the first call): with copies refreshed beside it
+    // then, the title ended itself in six runs of eight (w1 to w10).
+    {
+        static BEGAN: OnceLock<std::time::Instant> = OnceLock::new();
+        static AFTER: OnceLock<u64> = OnceLock::new();
+        let after = *AFTER.get_or_init(|| std::env::var("VICTORY_WARM_AFTER_S").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(120));
+        if BEGAN.get_or_init(std::time::Instant::now).elapsed().as_secs() < after {
+            return;
+        }
+    }
+    let mut spans: ByCopy<usize> = ByCopy::default();
+    let mut all: Warming = Vec::new();
+    for list in lists {
+        for step in &list.deferred().copies {
+            if let Step::Refresh(shadow, address, len) = step {
+                match spans.get(&(std::sync::Arc::as_ptr(shadow) as usize)) {
+                    Some(&at) => {
+                        let s = &mut all[at];
+                        (s.1, s.2) = (s.1.min(*address), s.2.max(*address + *len));
+                    }
+                    None => {
+                        spans.insert(std::sync::Arc::as_ptr(shadow) as usize, all.len());
+                        all.push((shadow.clone(), *address, *address + *len));
+                    }
+                }
+            }
+        }
+    }
+    if all.is_empty() {
+        return;
+    }
+    static LINE: OnceLock<WarmLine> = OnceLock::new();
+    let line = LINE.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<Warming>();
+        let _ = std::thread::Builder::new().name("victory-warm".into()).spawn(move || {
+            crate::cores::keep_helper_on_fast_cores("victory-warm");
+            // The copies of the last submissions given, by copy: what the
+            // title writes into them goes on being copied here between the
+            // submissions (`VICTORY_WARM_EVERY_MS`, 3 unless set; 0: only
+            // when a submission is given). The preparing thread is some 14
+            // submissions behind the title and takes all the title wrote
+            // so far at each refresh: without this there was a megabyte a
+            // frame left to take ahead of it, of 34 (run w8).
+            let every = std::env::var("VICTORY_WARM_EVERY_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(3);
+            let mut recent: std::collections::VecDeque<Warming> = std::collections::VecDeque::new();
+            let mut last_given = std::time::Instant::now();
+            loop {
+                // (`VICTORY_WARM_AFTER_S`, 120 unless set: not before the
+                // process has run so long. While the title loaded its world
+                // the copying between submissions ended the title, by its
+                // own hand: runs w9.)
+                static BEGAN: OnceLock<std::time::Instant> = OnceLock::new();
+                let began = *BEGAN.get_or_init(std::time::Instant::now);
+                static AFTER: OnceLock<u64> = OnceLock::new();
+                let after = *AFTER.get_or_init(|| std::env::var("VICTORY_WARM_AFTER_S").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(120));
+                let between = every != 0 && began.elapsed().as_secs() >= after;
+                let given = if !between || recent.is_empty() || last_given.elapsed().as_millis() > 200 {
+                    match rx.recv() {
+                        Ok(spans) => Some(spans),
+                        Err(_) => break,
+                    }
+                } else {
+                    match rx.recv_timeout(std::time::Duration::from_millis(every)) {
+                        Ok(spans) => Some(spans),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                };
+                let spans: Warming = match given {
+                    Some(spans) => {
+                        last_given = std::time::Instant::now();
+                        recent.push_back(spans.clone());
+                        if recent.len() > 4 {
+                            recent.pop_front();
+                        }
+                        spans
+                    }
+                    None => {
+                        // Again, everything given lately, each copy once.
+                        let mut by: ByCopy<usize> = ByCopy::default();
+                        let mut all: Warming = Vec::new();
+                        for (shadow, from, to) in recent.iter().flatten() {
+                            match by.get(&(std::sync::Arc::as_ptr(shadow) as usize)) {
+                                Some(&at) => {
+                                    let s = &mut all[at];
+                                    (s.1, s.2) = (s.1.min(*from), s.2.max(*to));
+                                }
+                                None => {
+                                    by.insert(std::sync::Arc::as_ptr(shadow) as usize, all.len());
+                                    all.push((shadow.clone(), *from, *to));
+                                }
+                            }
+                        }
+                        WARMED[0].fetch_sub(1, Ordering::Relaxed);
+                        all
+                    }
+                };
+                let began = std::time::Instant::now();
+                let _warming = crate::timeline::span("warming: a submission's copies");
+                // One asking for what lies close together, as a submission's
+                // own; then each copy from the journal.
+                let ranges: Vec<(usize, usize)> = spans.iter().filter(|s| s.0.asked_ahead()).map(|s| (s.1, s.2)).collect();
+                crate::watch::warm_ask(&ranges);
+                let (mut refreshed, mut bytes) = (0u64, 0u64);
+                if warm_parts() & 2 != 0 {
+                    for (shadow, from, to) in &spans {
+                        // Not copies of view memory: their refresh guards
+                        // the title's pages, and the title may still be
+                        // writing them (a submission behind a wait): the
+                        // title ended itself as the world came up, runs w1,
+                        // w2 and w5.
+                        if (shadow.plainly_watched() || warm_parts() & 4 != 0) && crate::watch::warm_holds(*from, *to) && !shadow.nothing_new(*from, *to - *from) {
+                            bytes += shadow.update(*from, *to - *from) as u64;
+                            refreshed += 1;
+                        }
+                    }
+                }
+                crate::watch::warm_done();
+                WARMED[0].fetch_add(1, Ordering::Relaxed);
+                WARMED[1].fetch_add(spans.len() as u64, Ordering::Relaxed);
+                WARMED[2].fetch_add(refreshed, Ordering::Relaxed);
+                WARMED[3].fetch_add(bytes, Ordering::Relaxed);
+                WARMED[4].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+            }
+        });
+        WarmLine(Mutex::new(tx))
+    });
+    let _ = line.0.lock().unwrap_or_else(|e| e.into_inner()).send(all);
+}
+
+/// For the frame line.
+pub(crate) fn warm_line(frames: f64) -> Option<String> {
+    if !warm_on() {
+        return None;
+    }
+    let of = |i: usize| WARMED[i].swap(0, Ordering::Relaxed) as f64 / frames;
+    Some(format!(
+        "warming (VICTORY_WARM) per frame: {:.1} submissions, {:.0} copies looked at, {:.0} refreshed, {:.1} MB, {:.1} ms of its thread",
+        of(0),
+        of(1),
+        of(2),
+        of(3) / 1e6,
+        of(4) / 1e3
+    ))
 }
 
 /// `VICTORY_LAND_NOT_MB` in bytes (`u64::MAX`: not set): see
@@ -4809,8 +5021,12 @@ impl Host {
         // (Of a copy with a declared range here, that says it.)
         let looked: Vec<&crate::picked::Range> =
             picked.looked.iter().filter(|l| !declared.iter().any(|(s, _)| Arc::ptr_eq(s, &l.0))).collect();
-        // (Behind the lists of the submission before: `send_beside`.)
-        send_flush();
+        // (Behind the lists of the submission before: `send_beside`. With
+        // `send_sync_beside` what goes to the queue here goes by that
+        // thread as well, in its order.)
+        if !send_sync_beside() {
+            send_flush();
+        }
         // With the relay: the order of the queue is held from here until
         // what is taken is on the queue, and the taking is numbered.
         let mut order = relay().then(|| QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
@@ -4969,7 +5185,18 @@ impl Host {
                         }
                     }
                     list.Close()?;
-                    self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                    let list: ID3D12CommandList = list.cast()?;
+                    if send_sync_beside() {
+                        // (In the line's order: behind the lists of the
+                        // submission before, ahead of this one's.)
+                        send_later(Box::new(move || {
+                            if let Some(host) = host() {
+                                host.queue.ExecuteCommandLists(&[Some(list)]);
+                            }
+                        }));
+                    } else {
+                        self.queue.ExecuteCommandLists(&[Some(list)]);
+                    }
                     Ok(())
                 })()
             };
@@ -5387,6 +5614,9 @@ impl Host {
                 // In the order of the queue: the sends of title bytes so
                 // far are ahead of this fetch, every later one behind it.
                 let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+                // (The sends counted so far are on the queue, not in the
+                // sending thread's line.)
+                send_flush();
                 self.queue.ExecuteCommandLists(&lists);
                 let after = *order;
                 drop(order);
@@ -8216,6 +8446,7 @@ impl HostList {
                     // submission's one asking ends, later refreshes ask anew.
                     if matches!(step, Step::Run(_)) {
                         crate::watch::ask_once_end();
+                        crate::watch::wrote_unnoted();
                     }
                     #[cfg(feature = "diagnostics")]
                     {
@@ -9273,7 +9504,8 @@ impl Batch {
         const FEW: usize = 256;
         let light = crate::watch::light();
         // Renderer port #6: looked at on the threads beside, below.
-        let beside = light && crate::watch::port_guard_plan() && wide_refresh() && self.refreshes.len() >= 4;
+        let beside =
+            light && crate::watch::port_guard_plan() && wide_refresh() && self.refreshes.len() >= 4 && self.refreshes.len() > flush_small();
         if light && self.refreshes.len() <= FEW && !beside {
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]

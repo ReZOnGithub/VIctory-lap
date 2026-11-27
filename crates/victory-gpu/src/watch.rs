@@ -773,10 +773,76 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
 // `VICTORY_ASK_EARLY` keeps asking the pieces submissions asked about lately,
 // so that most are.
 
-/// Whether it is on (`VICTORY_ASK_MARKS=1`; off).
+/// Whether it is on (`VICTORY_ASK_MARKS=1`, or with `VICTORY_WARM=1`; off).
 fn ask_marks() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_MARKS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_MARKS").is_some_and(|v| v == "1") || crate::host::warm_on())
+}
+
+thread_local! {
+    /// Pages `[first, last)` this thread asked the kernel about just now, for
+    /// what it refreshes next ([`warm_ask`]): [`writes`] answers those from
+    /// the journal.
+    static WARM_ASKED: std::cell::RefCell<Vec<(usize, usize)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The warming thread's asking for `ranges` (start, end) of title memory:
+/// what lies close together in one asking, whole pieces, as a submission's
+/// own asking joins them; [`writes`] of anything in them is answered from
+/// the journal until [`warm_done`].
+pub(crate) fn warm_ask(ranges: &[(usize, usize)]) {
+    if crate::host::warm_parts() & 1 == 0 {
+        return;
+    }
+    let mut pieces: Vec<(usize, usize)> = ranges
+        .iter()
+        .filter(|r| r.0 < r.1 && !published(r.0, r.1) && !refused_as_view(r.0, r.1))
+        .map(|&(start, end)| (start / PAGE / EARLY_PIECE, (end.div_ceil(PAGE)).div_ceil(EARLY_PIECE)))
+        .collect();
+    pieces.sort_unstable();
+    let (gap, most) = (AHEAD_GAP / EARLY_PIECE, AHEAD_MAX / EARLY_PIECE);
+    let mut i = 0;
+    while i < pieces.len() {
+        let first = pieces[i].0;
+        let mut last = pieces[i].1;
+        let mut k = i + 1;
+        while k < pieces.len() && pieces[k].0 <= last + gap && last.max(pieces[k].1) - first <= most {
+            last = last.max(pieces[k].1);
+            k += 1;
+        }
+        warm_ask_run(first, last);
+        i = k;
+    }
+}
+
+/// [`warm_ask`] for pieces `[first, last)`: by halves where the kernel
+/// refuses the whole.
+fn warm_ask_run(first: usize, last: usize) {
+    let (start, end) = (first * EARLY_PIECE * PAGE, last * EARLY_PIECE * PAGE);
+    if writes(start, end, false).is_some() {
+        stamps_publish();
+        WARM_ASKED.with(|w| w.borrow_mut().push((first * EARLY_PIECE, last * EARLY_PIECE)));
+        return;
+    }
+    STAMPED.with(|s| s.borrow_mut().clear());
+    if last - first < 2 {
+        return;
+    }
+    let half = first + (last - first) / 2;
+    warm_ask_run(first, half);
+    warm_ask_run(half, last);
+}
+
+/// Whether this thread's [`warm_ask`] holds title memory `[start, end)`.
+pub(crate) fn warm_holds(start: usize, end: usize) -> bool {
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    WARM_ASKED.with(|w| w.borrow().iter().any(|&(a, b)| a <= first && last <= b))
+}
+
+/// The warming thread's refreshes are done.
+pub(crate) fn warm_done() {
+    WARM_ASKED.with(|w| w.borrow_mut().clear());
+    stamps_publish();
 }
 
 thread_local! {
@@ -785,6 +851,20 @@ thread_local! {
     /// Kernel askings this thread made whose pages may not be noted yet:
     /// (first, last, the number taken before the asking).
     static STAMPED: std::cell::RefCell<Vec<(usize, usize, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The asking number below which no submission's mark counts
+/// ([`wrote_unnoted`]).
+static ASK_FLOOR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// We wrote title memory ourselves and did not note it in the journal (a
+/// step of a submission done when it is prepared, behind its one asking or
+/// anywhere): only an asking of the kernel after this finds it, whenever the
+/// submissions that read it were queued.
+pub(crate) fn wrote_unnoted() {
+    if ask_marks() {
+        ASK_FLOOR.fetch_max(next_asking(), std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// The number of the last asking so far: a submission queued now needs
@@ -1185,7 +1265,11 @@ fn ask_early(every: std::time::Duration) {
         if ask_marks() {
             // (Its own askings above: noted by `writes`.)
             stamps_publish();
-            ask_wanted();
+            // (With the warming thread the next submissions' pieces are
+            // asked about there.)
+            if !crate::host::warm_on() {
+                ask_wanted();
+            }
         }
         EARLY[0].fetch_add(asked, Relaxed);
         EARLY[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
@@ -1247,7 +1331,14 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     // other asking comes between the two parts.
     let _all = Asking::hold_all();
     // (The mark is this submission's alone: taken, not left for the next.)
-    let mark = if ask_marks() { ASK_MARK.replace(0) } else { 0 };
+    let mark = if ask_marks() {
+        match ASK_MARK.replace(0) {
+            0 => 0,
+            mark => mark.max(ASK_FLOOR.load(std::sync::atomic::Ordering::Relaxed)),
+        }
+    } else {
+        0
+    };
     ask_ahead_held(ranges, true, mark);
     spent.next("asking: the rest");
     ask_rest(ranges, true);
@@ -1385,10 +1476,14 @@ pub(crate) fn wrote(at: usize, len: usize) {
     // which is seen shared. (Standing, its number moves: alone, as before.)
     if port_journal() && (len == 0 || !journal().kept) {
         port7_count(P7_SKIPPED, 1);
+        // (Not noted: the kernel is to be asked about it. `ask_marks`.)
+        wrote_unnoted();
         return;
     }
     let mut j = journal_mut();
     if !j.kept || len == 0 {
+        drop(j);
+        wrote_unnoted();
         return;
     }
     let now = next_asking();
@@ -1467,6 +1562,11 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     };
     if let Some(known) = ahead(&journal()) {
         return Some(known);
+    }
+    // Asked about by this thread a moment ago ([`warm_ask`]): the journal
+    // has it. (What the title wrote since is found by the next asking.)
+    if WARM_ASKED.with(|w| w.borrow().iter().any(|&(a, b)| a <= first && last <= b)) {
+        return Some(fresh());
     }
     // Read-only since an asking noted it: the bits first, then the journal.
     if guarded && published(start, end) {

@@ -111,6 +111,10 @@ pub(super) trait Work: Send {
     /// Told just before [`Work::go`] of a submission: the highest mark of
     /// what it is made of and of the waits its queue went past.
     fn marked(&mut self, _mark: u64) {}
+    /// Told of a submission that is among the next ones in the line, once,
+    /// while the one before it is done: what can be made ready for it
+    /// beside (`crate::host::warm`).
+    fn warm(&self) {}
 }
 
 struct Entry<W> {
@@ -119,6 +123,8 @@ struct Entry<W> {
     what: W,
     /// [`Work::mark_now`] when it was put in the line.
     mark: u64,
+    /// [`Work::warm`] was called for it.
+    warmed: bool,
 }
 
 struct State<W> {
@@ -191,7 +197,7 @@ impl<W: Work> Lane<W> {
         state.runs += usize::from(what.runs());
         let number = state.next;
         state.next += 1;
-        state.items.push_back(Entry { number, queue, what, mark });
+        state.items.push_back(Entry { number, queue, what, mark, warmed: false });
     }
 
     /// Adds to the end of the line, and has it looked at.
@@ -340,7 +346,7 @@ impl<W: Work> Lane<W> {
         state.runs -= runs;
         state.runs += parts.iter().filter(|p| p.runs()).count();
         for (i, what) in parts.into_iter().enumerate() {
-            state.items.insert(at + i, Entry { number, queue, what, mark });
+            state.items.insert(at + i, Entry { number, queue, what, mark, warmed: false });
         }
     }
 
@@ -448,7 +454,7 @@ impl<W: Work> Lane<W> {
                 join_end(1);
                 break;
             }
-            let Entry { number, queue, what, mark: theirs } = next;
+            let Entry { number, queue, what, mark: theirs, warmed } = next;
             let waits = what.ask().is_some() && what.raises();
             match entry.what.take_along(what) {
                 Ok(run) => {
@@ -460,7 +466,7 @@ impl<W: Work> Lane<W> {
                     }
                 }
                 Err(what) => {
-                    self.lock().items.insert(at, Entry { number, queue, what, mark: theirs });
+                    self.lock().items.insert(at, Entry { number, queue, what, mark: theirs, warmed });
                     break;
                 }
             }
@@ -468,6 +474,23 @@ impl<W: Work> Lane<W> {
         if runs > 0 {
             let floor = self.lock().floor(entry.queue);
             entry.what.marked(mark.max(floor));
+        }
+        if runs > 0 || shows {
+            // The next submissions in the line: made ready beside this one.
+            let mut state = self.lock();
+            let mut left = WARM_AHEAD;
+            for next in state.items.iter_mut() {
+                if left == 0 {
+                    break;
+                }
+                if next.what.runs() && !next.what.folded() {
+                    left -= 1;
+                    if !next.warmed {
+                        next.warmed = true;
+                        next.what.warm();
+                    }
+                }
+            }
         }
         entry.what.go(forced);
         {
@@ -505,6 +528,10 @@ fn stand_spin() -> Duration {
     static US: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     Duration::from_micros(*US.get_or_init(|| number("VICTORY_STAND_SPIN_US").map_or(3000, |n| n as u64)))
 }
+
+/// How many submissions behind the one being done are made ready beside it
+/// ([`Work::warm`]).
+const WARM_AHEAD: usize = 3;
 
 /// The asking number's bits of a mark (`Work::mark_now` of the queues' jobs).
 const MARK_ASKING: u64 = (1 << 40) - 1;
@@ -619,6 +646,15 @@ impl Work for Job {
     fn marked(&mut self, mark: u64) {
         crate::port_journal::set_mark(mark >> 40);
         crate::watch::set_ask_mark(mark & MARK_ASKING);
+    }
+
+    fn warm(&self) {
+        match self {
+            Job::Run(_, lists, order) | Job::Joined(_, lists, order, ..) => {
+                crate::host::warm(order.iter().filter_map(|&i| lists.get(i)).map(crate::list::Detached::host));
+            }
+            _ => {}
+        }
     }
 
     fn idle_kind(&self) -> usize {
