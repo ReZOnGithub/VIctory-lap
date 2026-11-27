@@ -24,18 +24,41 @@ Built on:
 The earlier VIctory-lap tree (built on victory-fork) is on the branch
 `victory-lap-v1`.
 
-## Where it stands (2026-11-27)
+## Status (2026-11-27)
 
-Tested on one machine: Windows 10, Ryzen 7 3700X, 32 GB RAM, **GeForce RTX
-5070**, ray tracing off, Series S profile (1080p).
+Self-reported, measured on one machine: Windows 10, Ryzen 7 3700X (8 cores),
+32 GB RAM, **NVIDIA GeForce RTX 5070**, ray tracing off, Series S profile
+(1080p). The numbers are the layer's own frame meter over runs of four
+minutes; nobody else has verified them.
 
-| | |
-|---|---|
-| How far it plays | Boot, menus, the prison opening and its cutscenes, on to **the first boat mission** (driving the boat in open water), where testing is now |
-| Frame rate at the boat mission | **about 22 fps** (runs average 21.5 to 22.3 at 3,500 draws a frame; single readings 20.3 to 22.7) |
-| Frame rate in the prison opening | about 9 fps (4,500 draws a frame) |
-| Menus and videos | 30 to 60 fps |
-| Memory | 24 to 27 GB of private memory: a 32 GB PC pages now and then; 64 GB is comfortable |
+| Milestone | State | Detail |
+|---|---|---|
+| Executable loads | Yes | The title's executable is loaded and patched in memory |
+| Boots, first frame | Yes | Windows 10 and 11 (Windows 10 needed the Agility SDK fix below) |
+| Main menu | Yes | 60 fps |
+| In-game | Yes | Played from the start through the prison opening and its cutscenes into the first boat mission |
+| Frame rate in-game | **21 to 22 fps** | Boat mission, open water, 3,500 draws a frame: runs average 21.5 to 22.3 fps, single readings 20.3 to 22.7. Cutscenes 24 to 28 fps |
+| 30 fps in-game | No | The card is busy two thirds of a frame at 22 fps; one CPU thread sets the rest |
+| Stable | Partly | Four-minute scripted runs repeat without a crash or a lost device; longer sessions were played by hand to the boat mission, not timed |
+
+**What works:** boot, menus, video, save and load, cutscenes, on-foot play and
+driving the boat; lighting, characters, water, HUD and minimap as described
+under "How it renders".
+
+**What is blocking 30 fps and a "stable" mark:**
+
+- CPU: one thread prepares the title's 37 submissions a frame (about 36 ms of
+  work a frame on a 3700X); the title's own threads and the layer's keep all
+  eight cores busy.
+- GPU: about 31 ms of work a frame, nine tenths of it the title's own lists.
+- Memory: 24 to 27 GB of private memory; a 32 GB PC pages now and then.
+- Picture: the faults listed under "How it renders".
+- Not tested here: ray tracing, AMD and Intel cards, Series X profile, play
+  beyond the first boat mission.
+
+Earlier in the same build: the prison opening ran at about 9 fps (4,500 draws
+a frame) before the later changes in the table below; it has not been
+measured again.
 
 ### How it renders
 
