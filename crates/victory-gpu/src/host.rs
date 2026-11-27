@@ -3648,6 +3648,12 @@ fn late_helper() {
             }
         };
         let Some(target) = target else {
+            // What queues hold is looked at now too, before the landed
+            // lists are reset (driver calls, a millisecond and more): a
+            // value the landing wrote was noticed by the line's thread only
+            // at its next look of every millisecond (run bl46: it stood
+            // 21 s at value waits, nearly all of it in looks that ran out).
+            crate::queue::release_held(false);
             let mut helping = crate::timeline::span("helper: landed lists reset and given back");
             land();
             helping.next("helper: looking at what queues hold");

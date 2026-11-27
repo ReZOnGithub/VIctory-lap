@@ -1,3 +1,60 @@
+# VIctory-lap
+
+An NVIDIA / Windows 10 performance fork of
+[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD),
+which is built on [fxceless/victory-fork](https://github.com/fxceless/victory-fork)
+and [Marvisak/VIctory](https://github.com/Marvisak/VIctory).
+
+**Credits.** Nearly everything here is their work. The renderer ports
+(descriptor stores that report their slots, the guards' and journal's lock
+work, constants in place), the lighting and texture work that gives the
+near-retail picture, the timeline and the launcher are Belobug's. The layer,
+the translator and the host copies are Marvisak's and the VIctory
+contributors', with fxceless' and the victory-fork contributors' frame-rate
+work on top. Ideas were also taken from
+[stellarr-studio/kelvaroq](https://github.com/stellarr-studio/kelvaroq) and
+[xcl-dev/xcl](https://github.com/xcl-dev/xcl). The earlier VIctory-lap tree
+(on victory-fork) is kept on the branch `victory-lap-v1`.
+
+## What this fork adds
+
+Belobug's tree is tuned on an RX 7900 XTX under Windows 11. On an RTX 5070
+under Windows 10 it crashed at boot, then ran at 2.5 fps. This fork makes it
+run there and brings it to about 9:
+
+| RTX 5070, Ryzen 7 3700X, 32 GB, Windows 10; first prison scene, ~4,500 draws, Series S profile, warm caches | fps |
+|---|---|
+| Belobug's tree as is (after the boot fix), renderer ports 2, 6, 7 | 2.5 |
+| Every title buffer's copy in the card's memory | 4.0 |
+| Upload buffers pooled, draw state freed off the recording threads | 4.3 |
+| `shadow::exact`: buffers made and idle copies dropped outside its lock | 6.95 |
+| Our applicable settings, Series S, Belobug's full launcher set | 8.05 |
+| The title's big heap blocks write-watched (no whole 20 MB copies) | 8.66 |
+| Card copies' changes kept in a pending list; the line woken at landings | **8.9 average, 9.3 peak** |
+
+- **Windows 10 boot fix:** the Agility SDK export (`apps/victory/build.rs`,
+  `src/agility.rs`). Without it Windows 10's D3D12 refuses the boot screen's
+  root signatures and the title crashes before it draws.
+- **The fastest settings are the defaults** (`nv_defaults` in
+  `apps/victory/src/run.rs`; `VICTORY_NV_DEFAULTS=0` turns them off). Add
+  `--console series-s` for the numbers above (less memory, a 1080p picture).
+- **Not usable on NVIDIA:** renderer ports 1 and 5 (`VICTORY_PORT_CONSTANTS`,
+  `VICTORY_PORT_CBV`): the card reads the PC's memory several times slower
+  there, and the picture is black with both on.
+- **Before the first run:** `victory shaders <game dir>`, then one run with
+  `VICTORY_PIPELINE_BOOK=1` and `victory warm --used`; else each frame waits
+  half a second for pipelines.
+- Known: a strip of blocks along the bottom edge on NVIDIA (in Belobug's tree
+  before these changes too); 24-27 GB of memory, so a 32 GB PC pages.
+
+What sets the frame now: one thread prepares the title's submissions, about
+90 ms a frame, one after the other. Belobug's 22 fps is on a faster card and
+processor with 64 GB.
+
+Everything below is Belobug's README.
+
+---
+
 # VIctory on an RX 7900 XTX
 
 A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer

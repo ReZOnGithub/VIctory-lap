@@ -57,6 +57,11 @@ pub(super) trait Work: Send {
     type Ask;
     fn ask(&self) -> Option<Self::Ask>;
     fn met(ask: &Self::Ask) -> bool;
+    /// For the idle account ([`IDLE`]): 0 other, 1 a fence wait, 2 a value
+    /// wait, 3 lists being translated, 4 a submission or present.
+    fn idle_kind(&self) -> usize {
+        0
+    }
     /// Whether it is a present: everything before it goes first, met or not.
     fn shows(&self) -> bool;
     /// Whether it is a submission.
@@ -270,14 +275,20 @@ impl<W: Work> Lane<W> {
                 let mut state = self.lock();
                 while state.asked == state.served {
                     if state.items.is_empty() {
+                        let began = Instant::now();
                         state = self.work.wait(state).unwrap_or_else(|e| e.into_inner());
+                        IDLE[0].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
                     } else {
+                        let began = Instant::now();
+                        let kind = state.items.front().map_or(0, |e| e.what.idle_kind());
                         // It stands at something the CPU may write without
                         // a call of ours.
                         let (back, out) =
                             self.work.wait_timeout(state, Duration::from_millis(1)).unwrap_or_else(|e| e.into_inner());
                         state = back;
+                        IDLE[1 + kind.min(4)].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
                         if out.timed_out() {
+                            IDLE[6].fetch_add(1, Relaxed);
                             break;
                         }
                     }
@@ -456,6 +467,12 @@ impl<W: Work> Lane<W> {
 /// present, lists being translated, another kind. Said with the line.
 pub(crate) static JOIN_END: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
 
+/// Microseconds the line's thread stood, since the start: with the line
+/// empty; then with its oldest entry another kind, a fence wait, a value
+/// wait, lists being translated, a submission or present; and the 1 ms
+/// looks that ran out.
+pub(crate) static IDLE: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+
 fn join_end(i: usize) {
     JOIN_END[i].fetch_add(1, Relaxed);
 }
@@ -562,6 +579,16 @@ impl Work for Job {
 
     fn marked(&mut self, mark: u64) {
         crate::port_journal::set_mark(mark);
+    }
+
+    fn idle_kind(&self) -> usize {
+        match self {
+            Job::Wait(..) => 1,
+            Job::Value(..) => 2,
+            Job::Lists(..) => 3,
+            Job::Run(..) | Job::Joined(..) | Job::Present(..) => 4,
+            Job::Signal(..) => 0,
+        }
     }
 
     fn met(ask: &Ask) -> bool {
@@ -989,6 +1016,10 @@ pub(super) fn line(frames: f64) {
         s[FORCED] / frames,
         s[JOINED] / frames,
         JOIN_END.iter().map(|c| c.load(Relaxed)).collect::<Vec<_>>()
+    );
+    tracing::info!(
+        "the line's thread stood, ms since the start (empty, other, fence wait, value wait, lists translated, run/present; 1 ms looks run out): {:?}",
+        IDLE.iter().enumerate().map(|(i, c)| if i < 6 { c.load(Relaxed) / 1000 } else { c.load(Relaxed) }).collect::<Vec<_>>()
     );
 }
 
