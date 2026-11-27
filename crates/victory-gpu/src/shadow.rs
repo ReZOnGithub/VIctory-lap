@@ -1578,10 +1578,15 @@ fn spin(there: impl Fn() -> bool) {
 /// 2 to 8 (a quarter, as before, left an 8-core processor 4 threads for the
 /// refreshes and merges the submitting thread waits on).
 fn wide_threads() -> usize {
-    if let Some(n) = std::env::var("VICTORY_WIDE_THREADS").ok().and_then(|v| v.trim().parse::<usize>().ok()) {
-        return n.clamp(1, 32);
-    }
-    std::thread::available_parallelism().map_or(4, |n| n.get() / 2).clamp(2, 8)
+    // (Asked once: the environment's lock and a string every call were
+    // 0.5 ms a frame of the thread that prepares submissions, run bop3.)
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        if let Some(n) = std::env::var("VICTORY_WIDE_THREADS").ok().and_then(|v| v.trim().parse::<usize>().ok()) {
+            return n.clamp(1, 32);
+        }
+        std::thread::available_parallelism().map_or(4, |n| n.get() / 2).clamp(2, 8)
+    })
 }
 
 fn workers() -> &'static Workers {

@@ -443,12 +443,48 @@ fn big_blocks() -> String {
 /// additions per allocation and per release: diagnostics builds only).
 struct Counting;
 
-// SAFETY: every call goes to the system's allocator unchanged; only
-// counters are kept beside it.
+/// Whether blocks come from mimalloc instead of the system's heap
+/// (`VICTORY_MIMALLOC`, on unless `0`; asked once, without allocating). Run
+/// bop3 (the boat): the thread that prepares submissions spent 5.9 ms of
+/// its 65 ms a frame in the system heap's calls, and the threads that
+/// translate list calls theirs beside it, on one heap's locks.
+fn mi() -> bool {
+    static MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    match MODE.load(Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            #[cfg(windows)]
+            let on = {
+                let mut value = [0u8; 8];
+                // SAFETY: a name with its end and a buffer of the length said.
+                let n = unsafe {
+                    #[link(name = "kernel32")]
+                    unsafe extern "system" {
+                        fn GetEnvironmentVariableA(name: *const u8, buffer: *mut u8, size: u32) -> u32;
+                    }
+                    GetEnvironmentVariableA(
+                        c"VICTORY_MIMALLOC".as_ptr().cast(),
+                        value.as_mut_ptr(),
+                        value.len() as u32,
+                    )
+                };
+                !(n == 1 && value[0] == b'0')
+            };
+            #[cfg(not(windows))]
+            let on = false;
+            MODE.store(if on { 2 } else { 1 }, Relaxed);
+            on
+        }
+    }
+}
+
+// SAFETY: every call goes to one allocator unchanged, the same for the
+// process's life ([`mi`]); only counters are kept beside it.
 unsafe impl std::alloc::GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
         // SAFETY: the caller's contract, passed on.
-        let at = unsafe { std::alloc::System.alloc(layout) };
+        let at = unsafe { if mi() { mimalloc::MiMalloc.alloc(layout) } else { std::alloc::System.alloc(layout) } };
         if !at.is_null() {
             own(layout.size(), true);
             big(at, layout.size(), true);
@@ -458,7 +494,7 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
 
     unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
         // SAFETY: the caller's contract, passed on.
-        let at = unsafe { std::alloc::System.alloc_zeroed(layout) };
+        let at = unsafe { if mi() { mimalloc::MiMalloc.alloc_zeroed(layout) } else { std::alloc::System.alloc_zeroed(layout) } };
         if !at.is_null() {
             own(layout.size(), true);
             big(at, layout.size(), true);
@@ -470,12 +506,12 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
         own(layout.size(), false);
         big(at, layout.size(), false);
         // SAFETY: the caller's contract, passed on.
-        unsafe { std::alloc::System.dealloc(at, layout) };
+        unsafe { if mi() { mimalloc::MiMalloc.dealloc(at, layout) } else { std::alloc::System.dealloc(at, layout) } };
     }
 
     unsafe fn realloc(&self, at: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
         // SAFETY: the caller's contract, passed on.
-        let moved = unsafe { std::alloc::System.realloc(at, layout, size) };
+        let moved = unsafe { if mi() { mimalloc::MiMalloc.realloc(at, layout, size) } else { std::alloc::System.realloc(at, layout, size) } };
         if !moved.is_null() {
             own(layout.size(), false);
             own(size, true);

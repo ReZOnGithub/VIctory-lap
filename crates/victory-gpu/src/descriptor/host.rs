@@ -170,6 +170,9 @@ pub(crate) struct HostHeap {
     /// waited for most (5.6 % of their time, profile waits-1: each descriptor
     /// made for a draw takes it, and lets go of what the slot held under it).
     kept: Box<[Mutex<Option<ID3D12Resource>>]>,
+    /// Whether each slot of `kept` holds a resource: written with the slot's
+    /// lock held, read without by [`HostHeap::keep`].
+    kept_some: Box<[std::sync::atomic::AtomicBool]>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
@@ -1750,6 +1753,7 @@ impl HostHeap {
             waiting: Mutex::default(),
             away: Mutex::default(),
             kept: (0..count + extra).map(|_| Mutex::new(None)).collect(),
+            kept_some: (0..count + extra).map(|_| std::sync::atomic::AtomicBool::new(false)).collect(),
             next: Mutex::new((0, vec![false; extra as usize])),
             free: std::sync::atomic::AtomicU32::new(extra),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
@@ -2911,10 +2915,21 @@ impl HostHeap {
         };
         let old = {
             use windows::core::Interface;
+            // Nothing kept and nothing to keep (constant buffers, null
+            // views: many slots of a table), seen without the lock
+            // (`kept_some` is written with the slot's lock held).
+            if resource.is_none()
+                && self.kept_some.get(index as usize).is_some_and(|s| !s.load(std::sync::atomic::Ordering::Acquire))
+            {
+                return;
+            }
             let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
             // The same again: nothing to retire.
             if slot.as_ref().map(Interface::as_raw) == resource.as_ref().map(Interface::as_raw) {
                 return;
+            }
+            if let Some(some) = self.kept_some.get(index as usize) {
+                some.store(resource.is_some(), std::sync::atomic::Ordering::Release);
             }
             std::mem::replace(&mut *slot, resource)
         };

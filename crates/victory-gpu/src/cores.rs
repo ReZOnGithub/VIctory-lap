@@ -255,9 +255,15 @@ fn ask(what: &str, from: u32) {
     // (`VICTORY_BOOST`, on unless `0`): the process keeps 7 of 8 cores busy
     // at the boat (run bop2), and the thread that prepares submissions, which
     // sets the frame, stood in line with them for a processor.
-    if from <= 2 {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *ON.get_or_init(|| std::env::var_os("VICTORY_BOOST").is_none_or(|v| v != "0")) {
+    // (`VICTORY_BOOST=2`: the translating threads as well.)
+    {
+        static ON: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        let upto = *ON.get_or_init(|| match std::env::var("VICTORY_BOOST").ok().as_deref() {
+            Some("0") => 0,
+            Some("2") => 3,
+            _ => 2,
+        });
+        if from <= upto {
             use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL};
             // SAFETY: the calling thread's own priority.
             unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) };

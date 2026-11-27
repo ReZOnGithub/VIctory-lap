@@ -690,6 +690,9 @@ fn nv_defaults() {
         // The title's own 30 fps pacing held its frame back while the layer
         // stood (boat mission, runs bo8/bo10: 22.8 to 19.3 us a draw).
         ("VICTORY_FRAME_INTERVAL_MS", "16.667"),
+        // A submission's write-watch askings on the landing threads too
+        // (5.6 ms a frame of the preparing thread at the boat, run bop3).
+        ("VICTORY_ASK_SPREAD", "1"),
     ];
     for &(name, value) in SET {
         if std::env::var_os(name).is_none() {
