@@ -778,6 +778,12 @@ fn nv_defaults() {
         // fps (runs p0, t1, t3). A texture changed that way shows up to two
         // seconds later than before.
         ("VICTORY_TEXTURE_HASH_EVERY", "64"),
+        // The heat-haze pass is left out: on this card it smears blocks of
+        // green and black across the picture when the camera turns (seen
+        // with frame generation on; gone without the pass, run fg6; named
+        // "smeared blocks" by trustno1-coder/VIctory-NVIDIA, which leaves it
+        // out too). Diagnostics builds only, as the switch is.
+        ("VICTORY_SKIP_PIPELINES", "731a39171b568298"),
     ];
     for &(name, value) in SET {
         if std::env::var_os(name).is_none() {
