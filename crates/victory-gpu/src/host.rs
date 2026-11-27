@@ -8620,7 +8620,7 @@ impl HostList {
                     if !batch.due.is_empty() {
                         batch.refresh_textures();
                     }
-                    batch.title_written();
+                    batch.title_wrote(dst, len);
                     crate::port::copied(dst, src, len);
                     // Renderer port #7: into a heap's records, the rounds
                     // asked earlier did not see it.
@@ -8663,7 +8663,7 @@ impl HostList {
                         if !batch.due.is_empty() {
                             batch.refresh_textures();
                         }
-                        batch.title_written();
+                        batch.title_wrote(p.dst, p.len);
                     }
                     if let Some(bytes) = p.prepare(free) {
                         batch.placed.push((p.shadow.clone(), p.dst, bytes));
@@ -8871,6 +8871,20 @@ static SPLIT: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::A
 #[cfg(feature = "diagnostics")]
 static FLUSHES: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
+/// Since the last frame-rate line, of the refreshes in front
+/// ([`Batch::refresh_spans`]) with `VICTORY_WIDE_TWO_ENDS`: nanoseconds the
+/// submitting thread spent on its own items, and after them helping and
+/// waiting for the join.
+#[cfg(feature = "diagnostics")]
+static SPANS_CALLER: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Since the last frame-rate line, of [`Batch::title_wrote`]
+/// (`VICTORY_TITLE_RANGE`): calls, those that fell back to the whole reset
+/// (views), those that overlapped some pending refresh, and the pending
+/// refreshes kept for later.
+#[cfg(feature = "diagnostics")]
+static TITLE_RANGE: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
 /// Counts into [`SPLIT`].
 #[cfg(feature = "diagnostics")]
 struct Split(std::cell::Cell<std::time::Instant>);
@@ -8902,10 +8916,14 @@ fn split_line(frames: f64) {
     let a: Vec<f64> = crate::watch::asks().iter().map(|&n| n as f64 / frames).collect();
     let h: Vec<f64> = crate::draw::HEAP_SPLIT.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames).collect();
     let s: Vec<f64> = crate::shadow::send_stats().iter().map(|&n| n as f64 / frames).collect();
+    let sc: Vec<f64> = SPANS_CALLER.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames).collect();
+    let tr: Vec<f64> = TITLE_RANGE.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
         "preparing per frame, the submitting thread: {:.1} ms asking the write watch ({:.1} of them finding what to ask), {:.1} putting the title's bytes under flights' \
          writes, {:.1} in the lists' steps (refreshes {:.1} in {:.0} flushes of {:.0}, {:.0} of them known to copy nothing, {:.0} on \
-         several threads, {:.1} one at a time in {:.0} before shader writes; copies and fills {:.1}, the refreshes before copies among them), {:.1} snapshots, {:.1} for copies in the \
+         several threads; in front {:.1} ms on its own items, {:.1} ms helping and waiting after them (VICTORY_WIDE_TWO_ENDS); title \
+         copies clearing only what they overlap {:.0}, {:.0} of them fell back to all, {:.0} overlapped some, {:.0} refreshes kept \
+         pending (VICTORY_TITLE_RANGE); {:.1} one at a time in {:.0} before shader writes; copies and fills {:.1}, the refreshes before copies among them), {:.1} snapshots, {:.1} for copies in the \
          card's memory, {:.1} sending the lists (VICTORY_LIGHT_REFRESH is {}); ahead of these {:.1} waiting for the submission lock, {:.1} \
          planning steps done on the card, {:.1} waiting for flights, {:.1} the heaps' records and what is swept; at the end {:.1} waiting \
          for the heaps' records; asked early by a thread of its own {:.0} pieces of 2 MiB, {:.1} ms (VICTORY_ASK_EARLY)",
@@ -8918,6 +8936,12 @@ fn split_line(frames: f64) {
         f[1],
         f[2],
         f[3],
+        sc[0],
+        sc[1],
+        tr[0],
+        tr[1],
+        tr[2],
+        tr[3],
         ms[9],
         ms[10] * 1e6,
         ms[7],
@@ -9059,6 +9083,21 @@ struct Batch {
 fn refresh_once() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_ONCE").is_none_or(|v| v != "0"))
+}
+
+/// Whether a title copy among a submission's steps forgets only what it
+/// overlaps of the refreshes known and pending (`VICTORY_TITLE_RANGE`, on
+/// unless `0`; [`Batch::title_wrote`]), not all of them.
+///
+/// Each copy flushed every pending refresh and forgot every copy brought
+/// up to date, so the next lists queued and checked them all again: 8,076
+/// title copies of 4.9 MB a frame, refreshes in 41 flushes of 8,999, 7,693
+/// of them known to copy nothing (run fg2; rt6: 35 flushes of 9,960,
+/// 8,426), 1.66 ms a frame of the submitting thread in those flushes (run
+/// bop4).
+fn title_range() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TITLE_RANGE").is_none_or(|v| v != "0"))
 }
 
 /// Whether the copies that a submission's shaders write are brought up to
@@ -9531,6 +9570,69 @@ impl Batch {
         self.textures.clear();
     }
 
+    /// [`Batch::title_written`] for a step that writes only `[dst, dst +
+    /// len)` of title memory (a title copy), with [`title_range`]: pending
+    /// refreshes that overlap it are done first, the others stay pending,
+    /// and only what was brought up to date of it is forgotten. The bytes of
+    /// title memory outside the range are as they were, so a copy's refresh
+    /// of them before or after the step reads the same.
+    ///
+    /// Not where the range is view memory the title shows at another
+    /// address too, or where the views are not guarded together: a write
+    /// there changes bytes at other addresses as well, and the whole reset
+    /// is done, as before. The textures are checked again after it in every
+    /// case: a texture's on-demand levels need not lie in the range its
+    /// memory names.
+    fn title_wrote(&mut self, dst: usize, len: usize) {
+        if !title_range() {
+            self.title_written();
+            return;
+        }
+        #[cfg(feature = "diagnostics")]
+        TITLE_RANGE[0].fetch_add(1, Ordering::Relaxed);
+        let end = dst.saturating_add(len);
+        if !crate::watch::view_guard() || crate::inplace::shown_more_than_once(dst & !(crate::watch::PAGE - 1), end) {
+            #[cfg(feature = "diagnostics")]
+            TITLE_RANGE[1].fetch_add(1, Ordering::Relaxed);
+            self.title_written();
+            return;
+        }
+        self.refresh_textures();
+        self.textures.clear();
+        let overlaps = |from: usize, to: usize| from < end && to > dst;
+        let (now, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.refreshes).into_iter().partition(|r| overlaps(r.1, r.2));
+        #[cfg(feature = "diagnostics")]
+        {
+            if !now.is_empty() {
+                TITLE_RANGE[2].fetch_add(1, Ordering::Relaxed);
+            }
+            TITLE_RANGE[3].fetch_add(later.len() as u64, Ordering::Relaxed);
+        }
+        if !now.is_empty() {
+            // As `flush`: timed and counted the same.
+            #[cfg(feature = "diagnostics")]
+            let (began, all) = (std::time::Instant::now(), now.len());
+            let _flush = crate::timeline::span("refreshes of copies");
+            self.refreshes = now;
+            self.flush_all();
+            #[cfg(feature = "diagnostics")]
+            {
+                SPLIT[6].fetch_add(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                FLUSHES[0].fetch_add(1, Ordering::Relaxed);
+                FLUSHES[1].fetch_add(all as u64, Ordering::Relaxed);
+            }
+        }
+        self.refreshes = later;
+        self.index.clear();
+        for (at, r) in self.refreshes.iter().enumerate() {
+            self.index.insert(std::sync::Arc::as_ptr(&r.0) as usize, at);
+        }
+        // Removed, not cut: what remains of an entry is never joined to a
+        // later one as if it were current (`note_current`).
+        self.ahead.retain(|_, &mut (from, to)| !overlaps(from, to));
+        self.current.retain(|_, &mut (from, to)| !overlaps(from, to));
+    }
+
     /// `[from, to)` of the copy at `key` was brought up to date ([`refresh_once`]).
     fn note_current(&mut self, key: usize, from: usize, to: usize) {
         let e = self.current.entry(key).or_insert((from, to));
@@ -9662,7 +9764,15 @@ impl Batch {
         }
         #[cfg(feature = "diagnostics")]
         FLUSHES[3].fetch_add(spans.len() as u64, Ordering::Relaxed);
-        crate::shadow::wide_each(spans.len() + due.len(), move |i| {
+        let mut due = due;
+        // With the two ends of `wide_each` the kept threads take from the
+        // front and this thread from the back: the largest textures first,
+        // so that they start at once on the others and this one is left the
+        // short spans (`VICTORY_WIDE_TWO_ENDS`).
+        if crate::shadow::wide_two_ends() {
+            due.sort_by_key(|staging| std::cmp::Reverse(staging.bytes()));
+        }
+        let _split = crate::shadow::wide_each_split(spans.len() + due.len(), move |i| {
             // The textures first: they are the longer pieces.
             let Some(i) = i.checked_sub(due.len()) else {
                 due[i].refresh();
@@ -9676,6 +9786,10 @@ impl Batch {
             }
             Self::update(shadow, *from, *to);
         });
+        #[cfg(feature = "diagnostics")]
+        for (n, ns) in SPANS_CALLER.iter().zip(_split) {
+            n.fetch_add(ns, Ordering::Relaxed);
+        }
         if ahead {
             crate::watch::ask_ahead_done();
         }

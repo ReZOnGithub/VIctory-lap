@@ -1303,13 +1303,15 @@ pub(crate) fn log(frames: f64) {
     let faults = page_faults();
     let faults = faults - FAULTS.swap(faults, Relaxed).min(faults);
     let c: Vec<f64> = (0..COUNTERS).map(|i| taken(i) as f64 / frames).collect();
+    let chunks = crate::watch::chunk_counts();
     let mb = |v: f64| v / 1e6;
     let ms = |v: f64| v / 1e3;
     tracing::info!(
         "copies per frame: {:.1} submissions; {:.0} title copies {:.1} MB; {:.0} refreshes {:.1} MB, \
          {:.0} skipped {:.1} MB; {:.0} runs {:.1} ms; {:.0} queries {:.2} ms, moves {:.2} ms, \
          {:.2} MB unmapped; {:.0} page faults; {:.0} watches {:.2} ms, {:.1} MB checked, {:.1} MB \
-         unchanged; {:.1} fallbacks; {:.0} guard faults; textures {:.1} MB watched and \
+         unchanged ({:.0} chunks of 1 MiB passed over, {:.0} walked, {:.0} answers differing, VICTORY_NOTE_CHUNKS); \
+         {:.1} fallbacks; {:.0} guard faults; textures {:.1} MB watched and \
          changed, {:.1} MB hashed, {:.1} MB of them changed, {:.1} changes the guard did not see",
         c[C::Submissions as usize],
         c[C::Copies as usize],
@@ -1329,6 +1331,9 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::WatchUs as usize]),
         mb(c[C::Checked as usize]),
         mb(c[C::Unchanged as usize]),
+        chunks[0] as f64 / frames,
+        chunks[1] as f64 / frames,
+        chunks[2] as f64,
         c[C::Fallbacks as usize],
         c[C::GuardFaults as usize],
         mb(c[C::TexWatched as usize]),

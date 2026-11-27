@@ -409,6 +409,28 @@ pub(crate) fn shown_elsewhere(start: usize, end: usize) -> Vec<(usize, Vec<usize
     out
 }
 
+/// Whether any 64 KiB page of `[start, end)` is view memory the title shows
+/// at two addresses or more, those it shows in very many views too (unlike
+/// [`shown_elsewhere`], which leaves them out): a write there changes bytes
+/// at another address as well, so a title copy into it cannot clear only
+/// what it overlaps (`crate::host`, `VICTORY_TITLE_RANGE`).
+pub(crate) fn shown_more_than_once(start: usize, end: usize) -> bool {
+    let v = views();
+    if start >= end || v.pages_twice == 0 {
+        return false;
+    }
+    let first = v.views.range(..=start).next_back().filter(|(base, view)| *base + view.0 > start).map(|(base, _)| *base);
+    for (&base, &(bytes, section, offset)) in v.views.range(first.unwrap_or(start)..end) {
+        let from = start.max(base) & !(K64 - 1);
+        for page in (from..end.min(base + bytes)).step_by(K64) {
+            if v.pages.get(&(section, offset + (page - base) as u64)).is_some_and(|shown| shown.len() >= 2) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// The address of the 64 KiB page shown at `page` in every title view that
 /// shows it, `page`'s own address included; empty if `page` is not a view.
 pub(crate) fn pages_of(page: usize) -> Vec<usize> {

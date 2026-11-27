@@ -56,7 +56,11 @@ fn parts_on() -> bool {
 
 impl Shard {
     const fn new() -> Shard {
-        Shard { written: BTreeMap::new(), parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()) }
+        Shard {
+            written: BTreeMap::new(),
+            parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
+            chunks: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
+        }
     }
 
     /// Page `page` was found written by asking `now`: the parts in `parts`
@@ -69,6 +73,10 @@ impl Shard {
     fn note(&mut self, page: usize, parts: u16, now: u64) -> u64 {
         let before = self.written.get(&page).copied().unwrap_or(0);
         self.written.insert(page, before.max(now));
+        if note_chunks() != Chunks::Off {
+            let most = self.chunks.entry(page / CHUNK).or_insert(0);
+            *most = (*most).max(before.max(now));
+        }
         if parts == WHOLE || !parts_on() {
             if now >= before {
                 self.parts.remove(&page);
@@ -137,6 +145,58 @@ struct Shard {
     /// the parts are known ([`parts_on`]); a page that is not here was
     /// written whole, as far as anyone knows.
     parts: std::collections::HashMap<usize, [u64; PARTS], std::hash::BuildHasherDefault<PageHash>>,
+    /// Chunk of [`CHUNK`] pages (page / `CHUNK`) → the highest note of its
+    /// pages in `written` ([`note_chunks`]). Kept by [`Shard::note`], the
+    /// only writer of `written`, and notes only go up, so it stays exact. A
+    /// chunk of `CHUNK` pages lies in one part (`CHUNK` divides the
+    /// `1 << SHARD_SHIFT` pages of a piece).
+    chunks: std::collections::HashMap<usize, u64, std::hash::BuildHasherDefault<PageHash>>,
+}
+
+/// Pages to a chunk of [`Shard::chunks`] and of a copy's lowest takes
+/// (`crate::shadow`): 1 MiB.
+pub(crate) const CHUNK: usize = 16;
+const _: () = assert!((1 << SHARD_SHIFT) % CHUNK == 0);
+
+/// How [`nothing_new`] goes over a range's notes (`VICTORY_NOTE_CHUNKS`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Chunks {
+    /// `0`: page by page, as before.
+    Off,
+    /// The default: a chunk whose highest note is no later than the copy's
+    /// lowest take of it is passed over whole.
+    On,
+    /// `check`: both, the answer page by page, and the disagreements
+    /// counted ([`chunk_counts`]).
+    Check,
+}
+
+/// Whether [`nothing_new`] passes over whole chunks of [`CHUNK`] pages
+/// (`VICTORY_NOTE_CHUNKS`: on unless `0`; `check` runs both ways).
+///
+/// It walked every page of the range, its take and every note: 9,472 MB a
+/// frame checked to find 26 MB written (run fg2; rt6 16,234 MB and 25 MB),
+/// 9.2 ms a frame on the kept threads and 1.8-1.9 on the submitting one
+/// (runs bop3, bop4). A chunk's highest note and the copy's lowest take of
+/// it answer for its 16 pages at once, most of the time.
+pub(crate) fn note_chunks() -> Chunks {
+    static ON: std::sync::OnceLock<Chunks> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_NOTE_CHUNKS").as_deref() {
+        Ok("0") => Chunks::Off,
+        Ok("check") | Ok("=check") => Chunks::Check,
+        _ => Chunks::On,
+    })
+}
+
+/// Since the last line: chunks [`nothing_new`] passed over, chunks it
+/// walked page by page, and (`VICTORY_NOTE_CHUNKS=check`) answers that
+/// differed from the walk of every page.
+static CHUNK_COUNTS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// [`CHUNK_COUNTS`], taken.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn chunk_counts() -> [u64; 3] {
+    CHUNK_COUNTS.each_ref().map(|n| n.swap(0, std::sync::atomic::Ordering::Relaxed))
 }
 
 impl Notes {
@@ -231,15 +291,15 @@ impl Notes {
 /// The pieces of pages `[first, last)` in page order, each in one part;
 /// `None` for a range of more pieces than is worth walking (then each part
 /// is looked at once).
-fn pieces(first: usize, last: usize) -> Option<Vec<(usize, usize)>> {
-    if first >= last {
-        return Some(Vec::new());
-    }
-    let (a, b) = (first >> SHARD_SHIFT, (last - 1) >> SHARD_SHIFT);
-    if b - a >= 4 * SHARDS {
+fn pieces(first: usize, last: usize) -> Option<impl Iterator<Item = (usize, usize)>> {
+    // (No pieces for an empty range: a range of no numbers.)
+    let (a, b) = if first >= last { (1, 0) } else { (first >> SHARD_SHIFT, (last - 1) >> SHARD_SHIFT) };
+    if b >= a && b - a >= 4 * SHARDS {
         return None;
     }
-    Some((a..=b).map(|piece| (first.max(piece << SHARD_SHIFT), last.min((piece + 1) << SHARD_SHIFT))).collect())
+    // (An iterator, not a list: 0.44 ms a frame of the kept threads went to
+    // the lists alone, run bop3.)
+    Some((a..=b).map(move |piece| (first.max(piece << SHARD_SHIFT), last.min((piece + 1) << SHARD_SHIFT))))
 }
 
 /// Parts of [`Notes`] held ([`Notes::hold`]).
@@ -1669,7 +1729,98 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
 /// taken whole, or 0) does not hold, as [`writes`] would answer with nothing
 /// asked: the submission's asking covers the range, or its blocks are known
 /// by their bits. `false` if something would have to be asked.
-pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64], ranged: u64) -> bool {
+///
+/// `chunk_taken`: with [`note_chunks`], for each chunk of [`CHUNK`] pages
+/// from chunk `base / CHUNK` on, at most the lowest of `copied` in it, and 0
+/// for a chunk with a page never taken or a page outside the copy (empty:
+/// not known). A chunk whose highest note is no higher than that, or than
+/// `ranged`, is passed over whole; the others are walked page by page.
+pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64], chunk_taken: &[u64], ranged: u64) -> bool {
+    match note_chunks() {
+        Chunks::Off => nothing_new_pages(start, end, base, copied, ranged),
+        _ if chunk_taken.is_empty() => nothing_new_pages(start, end, base, copied, ranged),
+        Chunks::On => nothing_new_chunks(start, end, base, copied, chunk_taken, ranged, false),
+        Chunks::Check => nothing_new_chunks(start, end, base, copied, chunk_taken, ranged, true),
+    }
+}
+
+/// [`nothing_new`] by chunks ([`note_chunks`]). With `check`, a chunk passed
+/// over is walked too, under the same lock (so that no note that comes
+/// between makes a difference), a disagreement is counted and said, and the
+/// answer is the walk's.
+fn nothing_new_chunks(start: usize, end: usize, base: usize, copied: &[u64], chunk_taken: &[u64], ranged: u64, check: bool) -> bool {
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    let known = published(start, end);
+    #[cfg(feature = "diagnostics")]
+    if known {
+        crate::faultbook::note(crate::faultbook::What::Known, first, last, 1);
+    }
+    let j = journal();
+    if !known && !j.ahead.holds(first, last) {
+        return false;
+    }
+    let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {
+        return false;
+    };
+    // (A range of more pieces than is worth walking: as before.)
+    let Some(pieces) = pieces(first, last) else {
+        return (ranged != 0 || taken.iter().all(|&at| at != 0))
+            && j.notes.each(first, last, |page, write| write <= taken[page - first].max(ranged));
+    };
+    let (mut skipped, mut walked, mut differing) = (0u64, 0u64, 0u64);
+    let mut same = true;
+    'pieces: for (from, to) in pieces {
+        let s = j.notes.read(shard_of(from));
+        for chunk in from / CHUNK..=(to - 1) / CHUNK {
+            let (lo, hi) = (from.max(chunk * CHUNK), to.min((chunk + 1) * CHUNK));
+            let taken = &taken[lo - first..hi - first];
+            // The pages' answer for the chunk, as `nothing_new_pages` gives
+            // it for the range.
+            let by_pages =
+                || (ranged != 0 || !taken.contains(&0)) && s.written.range(lo..hi).all(|(&p, &w)| w <= taken[p - lo].max(ranged));
+            let least = chunk.checked_sub(base / CHUNK).and_then(|c| chunk_taken.get(c)).copied().unwrap_or(0);
+            let most = s.chunks.get(&chunk).copied().unwrap_or(0);
+            // Every note of the chunk is at most `most`, every take at least
+            // `least`; and `least` is 0 if a page was never taken.
+            if (least != 0 || ranged != 0) && most <= least.max(ranged) {
+                skipped += 1;
+                if check && !by_pages() {
+                    differing += 1;
+                    same = false;
+                }
+                continue;
+            }
+            walked += 1;
+            if !by_pages() {
+                same = false;
+                if !check {
+                    break 'pieces;
+                }
+            }
+        }
+    }
+    if differing != 0 {
+        let n = CHUNK_COUNTS[2].fetch_add(differing, std::sync::atomic::Ordering::Relaxed) + differing;
+        if n <= 16 || n.is_power_of_two() {
+            tracing::warn!(
+                n,
+                range = format_args!("{start:#x}..{end:#x}"),
+                "nothing-new check: a chunk passed over has a page written since its take (VICTORY_NOTE_CHUNKS=check)"
+            );
+        }
+    }
+    #[cfg(feature = "diagnostics")]
+    {
+        CHUNK_COUNTS[0].fetch_add(skipped, std::sync::atomic::Ordering::Relaxed);
+        CHUNK_COUNTS[1].fetch_add(walked, std::sync::atomic::Ordering::Relaxed);
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = (skipped, walked);
+    same
+}
+
+/// [`nothing_new`] page by page, as it was.
+fn nothing_new_pages(start: usize, end: usize, base: usize, copied: &[u64], ranged: u64) -> bool {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     // The bits first, then the journal, as in `writes`.
     let known = published(start, end);
@@ -3269,7 +3420,7 @@ pub(crate) const MANY_VIEWS: usize = 64;
 
 /// Whether all the views of a guarded page are guarded together
 /// (`VICTORY_VIEW_GUARD`).
-fn view_guard() -> bool {
+pub(crate) fn view_guard() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_GUARD").is_none_or(|v| v != "0"))
 }
@@ -6003,8 +6154,8 @@ mod port7_tests {
         assert_eq!(shards_of(P - 1, P + 1), 0b11);
         assert_eq!(shards_of(63 * P, 65 * P), 1 << 63 | 1);
         assert_eq!(shards_of(5, 5 + SHARDS * P), u64::MAX);
-        assert_eq!(pieces(P - 2, 2 * P + 3), Some(vec![(P - 2, P), (P, 2 * P), (2 * P, 2 * P + 3)]));
-        assert_eq!(pieces(0, 1 << 40), None);
+        assert_eq!(pieces(P - 2, 2 * P + 3).map(Iterator::collect::<Vec<_>>), Some(vec![(P - 2, P), (P, 2 * P), (2 * P, 2 * P + 3)]));
+        assert!(pieces(0, 1 << 40).is_none());
         let notes = Notes::new();
         let mut want: BTreeMap<usize, u64> = BTreeMap::new();
         let mut seed = 7;

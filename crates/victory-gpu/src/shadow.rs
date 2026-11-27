@@ -24,6 +24,70 @@ use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
 
+/// [`Shadow::copied`]: per page the asking after which it was last taken,
+/// and with [`crate::watch::note_chunks`] per chunk of
+/// [`crate::watch::CHUNK`] pages (from chunk `base / CHUNK` on, `base` the
+/// copy's first page) at most the lowest of them, for
+/// [`crate::watch::nothing_new`] to pass over whole chunks.
+///
+/// `chunk_taken` is kept a lower bound: [`Copied::set`] lowers a chunk's
+/// value with any page's that goes below it, and [`Copied::recount`] makes
+/// it exact again (`Shadow::copy_stale`, the writer of nearly all takes).
+/// A chunk with a page never taken, or a page outside the copy, is 0.
+/// Only `set` changes the pages (no `DerefMut`).
+struct Copied {
+    pages: Vec<u64>,
+    chunk_taken: Vec<u64>,
+    /// `base % CHUNK`: the place in its chunk of the copy's first page.
+    lead: usize,
+}
+
+impl Copied {
+    fn new(base: usize, pages: usize) -> Copied {
+        use crate::watch::CHUNK;
+        let lead = base % CHUNK;
+        let chunks = if crate::watch::note_chunks() == crate::watch::Chunks::Off || pages == 0 { 0 } else { (lead + pages).div_ceil(CHUNK) };
+        Copied { pages: vec![0; pages], chunk_taken: vec![0; chunks], lead }
+    }
+
+    /// Page `i` (from the copy's first) was taken after asking `at`.
+    fn set(&mut self, i: usize, at: u64) {
+        self.pages[i] = at;
+        if let Some(least) = self.chunk_taken.get_mut((self.lead + i) / crate::watch::CHUNK)
+            && at < *least
+        {
+            *least = at;
+        }
+    }
+
+    /// The chunks of pages `[from, to)` (from the copy's first) made exact.
+    fn recount(&mut self, from: usize, to: usize) {
+        use crate::watch::CHUNK;
+        if self.chunk_taken.is_empty() || from >= to {
+            return;
+        }
+        for c in (self.lead + from) / CHUNK..=(self.lead + to - 1) / CHUNK {
+            // The chunk's pages, from the copy's first; 0 if it has some
+            // outside the copy.
+            let least = match (c * CHUNK).checked_sub(self.lead) {
+                Some(lo) if lo + CHUNK <= self.pages.len() => self.pages[lo..lo + CHUNK].iter().copied().min().unwrap_or(0),
+                _ => 0,
+            };
+            if let Some(at) = self.chunk_taken.get_mut(c) {
+                *at = least;
+            }
+        }
+    }
+}
+
+impl std::ops::Deref for Copied {
+    type Target = Vec<u64>;
+
+    fn deref(&self) -> &Vec<u64> {
+        &self.pages
+    }
+}
+
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
     /// Title memory's pages of 4 KiB (from the one `start` lies in on), a bit
@@ -42,7 +106,7 @@ pub(crate) struct Shadow {
     len: u64,
     /// Per page of title memory from `start`'s on: the write-watch asking
     /// after which it was last copied (0: never).
-    copied: Mutex<Vec<u64>>,
+    copied: Mutex<Copied>,
     /// Two ranges of title memory taken whole, the last one and the longest,
     /// and the asking after which each was ([`Shadow::copy_stale`]). A page
     /// a range holds in part cannot say so in `copied`. Locked inside
@@ -1681,6 +1745,31 @@ fn wide(jobs: Vec<Job>) {
     let _wide = crate::timeline::span("work spread over threads");
     // (This thread takes one itself: no more threads woken than the others.)
     let others = jobs.len() - 1;
+    let left = wide_queue(workers, jobs, others);
+    wide_help(workers, &left);
+}
+
+/// [`wide`], with `own` run on this thread first, outside the queue: all of
+/// `jobs` go to the kept threads, and this one helps with what is left of
+/// the queue only after `own` ([`wide_each`] with [`wide_two_ends`]).
+fn wide_with(jobs: Vec<Job>, own: impl FnOnce()) {
+    if jobs.is_empty() {
+        own();
+        return;
+    }
+    let workers = workers();
+    let _wide = crate::timeline::span("work spread over threads");
+    let others = jobs.len();
+    let left = wide_queue(workers, jobs, others);
+    own();
+    wide_help(workers, &left);
+}
+
+type Left = Arc<(Mutex<usize>, std::sync::Condvar)>;
+
+/// The first half of [`wide`]: `jobs` queued, each counting itself done in
+/// the count returned, and `others` of the kept threads woken.
+fn wide_queue(workers: &'static Workers, jobs: Vec<Job>, others: usize) -> Left {
     let left = Arc::new((Mutex::new(jobs.len()), std::sync::Condvar::new()));
     {
         let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
@@ -1704,6 +1793,12 @@ fn wide(jobs: Vec<Job>) {
             workers.more.notify_one();
         }
     }
+    left
+}
+
+/// The second half of [`wide`]: this thread runs queued jobs while there are
+/// any, then waits until all of `left`'s are done.
+fn wide_help(workers: &'static Workers, left: &Left) {
     loop {
         let job = workers.jobs.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
         match job {
@@ -1731,6 +1826,35 @@ pub(crate) fn wide_run(jobs: Vec<Box<dyn FnOnce() + Send>>) {
 /// this one, the next number to whichever is free: for thousands of small
 /// pieces of work, where a job each ([`wide`]) is mostly the jobs' queue.
 pub(crate) fn wide_each(n: usize, work: impl Fn(usize) + Send + Sync + 'static) {
+    let _ = wide_each_split(n, work);
+}
+
+/// Whether [`wide_each`] is worked from both ends (`VICTORY_WIDE_TWO_ENDS`, on
+/// unless `0`): the kept threads take numbers from the front, the calling
+/// thread runs its own loop at once, outside the queue, and takes them from
+/// the back.
+///
+/// With one cursor the calling thread took the first number itself, and
+/// the first items are the long ones (a submission's refreshes in front put
+/// the textures first): the submitting thread started a texture of several
+/// ms and the others waited for it at the join, while the many short items
+/// went to the kept threads (refreshes in front 11.3 and 8.9 ms a frame of
+/// the submitting thread, runs bop3 and bop4). From the back it takes the
+/// short ones, and the join waits for the longest item only when that one
+/// is longer than the rest together. The items done are the same, in
+/// another order.
+pub(crate) fn wide_two_ends() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_TWO_ENDS").is_none_or(|v| v != "0"))
+}
+
+/// [`wide_each`], and with diagnostics and [`wide_two_ends`]: nanoseconds the
+/// calling thread spent on its own items, and after them on others' jobs
+/// and the wait for the last one (else zeros).
+pub(crate) fn wide_each_split(n: usize, work: impl Fn(usize) + Send + Sync + 'static) -> [u64; 2] {
+    if wide_two_ends() && n <= u32::MAX as usize {
+        return wide_each_ends(n, work);
+    }
     let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let work = Arc::new(work);
     let threads = (wide_threads() + 1).min(n);
@@ -1749,6 +1873,74 @@ pub(crate) fn wide_each(n: usize, work: impl Fn(usize) + Send + Sync + 'static) 
         })
         .collect();
     wide(jobs);
+    [0; 2]
+}
+
+/// [`wide_each_split`] from both ends ([`wide_two_ends`]). The two ends are
+/// one word (front in the low half, back in the high half), so a number is
+/// taken by one side only: each side claims with a compare-exchange that
+/// fails if the other moved either end meanwhile, and stops when they meet.
+fn wide_each_ends(n: usize, work: impl Fn(usize) + Send + Sync + 'static) -> [u64; 2] {
+    // (front 0, back n)
+    let ends = Arc::new(AtomicU64::new((n as u64) << 32));
+    let work = Arc::new(work);
+    let threads = (wide_threads() + 1).min(n);
+    // The kept threads' part: from the front.
+    let jobs: Vec<Job> = (1..threads)
+        .map(|_| {
+            let (ends, work) = (ends.clone(), work.clone());
+            Box::new(move || {
+                let mut was = ends.load(Ordering::Relaxed);
+                loop {
+                    let (front, back) = (was & 0xffff_ffff, was >> 32);
+                    if front >= back {
+                        break;
+                    }
+                    // (front < back <= u32::MAX: no carry into the back.)
+                    match ends.compare_exchange_weak(was, was + 1, Ordering::Relaxed, Ordering::Relaxed) {
+                        Ok(_) => {
+                            work(front as usize);
+                            was = ends.load(Ordering::Relaxed);
+                        }
+                        Err(now) => was = now,
+                    }
+                }
+            }) as Job
+        })
+        .collect();
+    #[cfg(feature = "diagnostics")]
+    let began = std::time::Instant::now();
+    #[cfg(feature = "diagnostics")]
+    let mut own_ns = 0u64;
+    // This thread's part: from the back.
+    wide_with(jobs, || {
+        let mut was = ends.load(Ordering::Relaxed);
+        loop {
+            let (front, back) = (was & 0xffff_ffff, was >> 32);
+            if back <= front {
+                break;
+            }
+            match ends.compare_exchange_weak(was, was - (1 << 32), Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => {
+                    work((back - 1) as usize);
+                    was = ends.load(Ordering::Relaxed);
+                }
+                Err(now) => was = now,
+            }
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            own_ns = began.elapsed().as_nanos() as u64;
+        }
+    });
+    #[cfg(feature = "diagnostics")]
+    {
+        [own_ns, (began.elapsed().as_nanos() as u64).saturating_sub(own_ns)]
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    {
+        [0; 2]
+    }
 }
 
 /// About this many bytes to a piece of work for [`wide`].
@@ -3379,7 +3571,7 @@ impl Shadow {
             gpu,
             start,
             len,
-            copied: Mutex::new(vec![0; pages as usize]),
+            copied: Mutex::new(Copied::new((start / PAGE as u64) as usize, pages as usize)),
             ranged: Mutex::default(),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
@@ -4037,9 +4229,11 @@ impl Shadow {
             drop(merging);
             {
                 let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                // (Through `set`: should `now` be below a page's take, the
+                // chunk's lowest follows it down.)
                 for page in taken {
-                    if let Some(at) = copied.get_mut(page - base) {
-                        *at = now;
+                    if page - base < copied.len() {
+                        copied.set(page - base, now);
                     }
                 }
             }
@@ -4207,7 +4401,7 @@ impl Shadow {
             return false;
         }
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let same = crate::watch::nothing_new(from, to, start / PAGE, &copied, self.ranged(from, to));
+        let same = crate::watch::nothing_new(from, to, start / PAGE, &copied.pages, &copied.chunk_taken, self.ranged(from, to));
         #[cfg(feature = "diagnostics")]
         if same {
             use crate::copystat::{C, add};
@@ -4327,6 +4521,8 @@ impl Shadow {
         let (mut runs, mut run) = (Vec::new(), None::<(usize, bool)>);
         // Pages taken before and written since: in the order of their runs.
         let mut again_at: Vec<(usize, u64)> = Vec::new();
+        // Whether a page's take was noted.
+        let mut took = false;
         let last = (to - 1) / PAGE;
         for page in from / PAGE..=last {
             let write = match writes.peek() {
@@ -4336,14 +4532,14 @@ impl Shadow {
                 }
                 _ => 0,
             };
-            let at = &mut copied[page - base];
-            let taken = (*at).max(ranged);
+            let taken = copied[page - base].max(ranged);
             if taken == 0 || write > taken {
                 // A page only partly in the range is copied in part: it
                 // stays stale for the rest.
                 let (start, end) = (self.start as usize, (self.start + self.len) as usize);
                 if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
-                    *at = now;
+                    copied.set(page - base, now);
+                    took = true;
                 }
                 // Cut where pages taken before meet pages never taken.
                 let again = taken != 0;
@@ -4364,6 +4560,13 @@ impl Shadow {
         // Cut to the range: next to it shaders may be writing the copy.
         if let Some((first, known)) = run {
             runs.push(((first * PAGE).max(from), ((last + 1) * PAGE).min(to), known));
+        }
+        // The lowest takes of the chunks touched, exact again
+        // (`VICTORY_NOTE_CHUNKS`). (`landed` and `merge_under_writes` note
+        // takes too, through `Copied::set`, which keeps the lowest a lower
+        // bound without this.)
+        if took {
+            copied.recount(from / PAGE - base, last + 1 - base);
         }
         let runs = by_parts(runs, &again_at, &crate::watch::parts_written(&again_at));
         let bytes = self.take_all(runs);
@@ -5028,12 +5231,13 @@ impl Shadow {
             return false;
         };
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(at) = copied.get_mut(page) else {
+        let Some(&at) = copied.get(page) else {
             return false;
         };
-        let held = *at != 0 && *at >= before && crate::watch::block_published(block);
+        let held = at != 0 && at >= before && crate::watch::block_published(block);
         if held {
-            *at = (*at).max(now);
+            // (Only raises it: the chunk's lowest stays a lower bound.)
+            copied.set(page, at.max(now));
         }
         held
     }

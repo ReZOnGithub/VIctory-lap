@@ -1199,6 +1199,12 @@ impl Staging {
         (self.memory as usize, self.read)
     }
 
+    /// The staging buffer's bytes: what its refresh may have to detile, to
+    /// put the longest refreshes first.
+    pub(crate) fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
     /// The title's level and the array slice of the staging buffer's part
     /// `i`.
     fn part(&self, i: usize) -> (u32, u32) {
