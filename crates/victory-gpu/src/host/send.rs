@@ -272,59 +272,21 @@ impl Own {
     ) {
         // (With `crate::host::upq`: a copy of the memory in the card's.)
         let source = from.unwrap_or(&self.memory.buffer);
-        let read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-        let write = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-        let dest = D3D12_RESOURCE_STATE_COPY_DEST;
-        let (mut first, mut last) = (Vec::new(), Vec::new());
-        for ((shadow, _), copy) in dirty.iter().zip(&self.copies) {
-            for &(a, from, n) in &copy.runs {
-                // SAFETY: the caller's; live buffers, ranges inside them.
-                unsafe { list.CopyBufferRegion(&shadow.buffer, a as u64, source, from, n as u64) };
-            }
-            let mut state = (looked(shadow) || !copy.runs.is_empty()).then_some(dest);
-            if copy.pairs.1 > 0 {
-                if let Some(was) = state {
-                    first.push(transition(&shadow.buffer, was, write));
-                }
-                state = Some(write);
-            }
-            let hashed = shadow.card_sides().is_some_and(|(_, before, _)| before.is_some());
-            if let Some(was) = state
-                && hashed
-                && (!copy.runs.is_empty() || copy.pairs.1 > 0)
-            {
-                last.push(transition(&shadow.buffer, was, read));
-            }
-        }
-        // SAFETY: the caller's; live objects.
-        unsafe {
-            if !first.is_empty() {
-                list.ResourceBarrier(&first);
-            }
-            if let Some(pass) = pass(host)
-                && self.copies.iter().any(|c| c.pairs.1 > 0)
-            {
-                list.SetComputeRootSignature(&pass.root);
-                list.SetPipelineState(&pass.pso);
-                list.SetComputeRootShaderResourceView(1, source.GetGPUVirtualAddress());
-                for ((shadow, _), copy) in dirty.iter().zip(&self.copies).filter(|(_, c)| c.pairs.1 > 0) {
-                    list.SetComputeRootUnorderedAccessView(2, shadow.buffer.GetGPUVirtualAddress());
-                    const MOST: u32 = 64 * D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION;
-                    let (at, words) = copy.pairs;
-                    let mut done = 0;
-                    while done < words {
-                        let n = (words - done).min(MOST);
-                        let constants = [at as u32 + done * 8, n];
-                        list.SetComputeRoot32BitConstants(0, 2, constants.as_ptr().cast(), 0);
-                        list.Dispatch(n.div_ceil(64), 1, 1);
-                        done += n;
-                    }
-                }
-            }
-            if !last.is_empty() {
-                list.ResourceBarrier(&last);
-            }
-        }
+        let hashed = |_: usize, shadow: &Shadow| shadow.card_sides().is_some_and(|(_, before, _)| before.is_some());
+        // SAFETY: the caller's.
+        unsafe { record_copies(&self.copies, source, host, list, dirty, looked, hashed) }
+    }
+
+    /// The memory, kept until the submission has run, and what records the
+    /// sends from it on another thread ([`Sends`]): with
+    /// `VICTORY_SYNC_RECORD_BESIDE` the list is recorded on the sending
+    /// thread, while the plan keeps the memory.
+    pub(super) fn record_parts(self) -> (Memory, Sends) {
+        let sends = Sends {
+            buffer: self.memory.buffer.clone(),
+            copies: self.copies,
+        };
+        (self.memory, sends)
     }
 
     /// The memory and the bytes of it used.
@@ -335,5 +297,99 @@ impl Own {
     /// The memory, to be kept until the submission has run.
     pub(super) fn memory(self) -> Memory {
         self.memory
+    }
+}
+
+/// An [`Own`]'s sends without its memory (which its plan keeps): the
+/// buffer they come from and what goes where.
+pub(super) struct Sends {
+    buffer: ID3D12Resource,
+    copies: Vec<Copy>,
+}
+
+impl Sends {
+    /// [`Own::record`] with no copy looked at (`upcheck` is off) and no copy
+    /// queue (`upq` is off); `hashed(i, shadow)`: whether `dirty[i]` had a
+    /// "before" when the sends were taken, as the caller saw it then.
+    ///
+    /// # Safety
+    /// As [`Own::record`]; the memory is alive until the list has run.
+    pub(super) unsafe fn record(
+        &self,
+        host: &Host,
+        list: &ID3D12GraphicsCommandList,
+        dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, usize)>)],
+        hashed: impl Fn(usize, &Shadow) -> bool,
+    ) {
+        // SAFETY: the caller's.
+        unsafe { record_copies(&self.copies, &self.buffer, host, list, dirty, |_| false, hashed) }
+    }
+}
+
+/// The body of [`Own::record`] and [`Sends::record`]: `copies` are
+/// `dirty`'s, in its order, out of `source`.
+///
+/// # Safety
+/// As [`Own::record`].
+unsafe fn record_copies(
+    copies: &[Copy],
+    source: &ID3D12Resource,
+    host: &Host,
+    list: &ID3D12GraphicsCommandList,
+    dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, usize)>)],
+    looked: impl Fn(&Shadow) -> bool,
+    hashed: impl Fn(usize, &Shadow) -> bool,
+) {
+    let read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    let write = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    let dest = D3D12_RESOURCE_STATE_COPY_DEST;
+    let (mut first, mut last) = (Vec::new(), Vec::new());
+    for (i, ((shadow, _), copy)) in dirty.iter().zip(copies).enumerate() {
+        for &(a, from, n) in &copy.runs {
+            // SAFETY: the caller's; live buffers, ranges inside them.
+            unsafe { list.CopyBufferRegion(&shadow.buffer, a as u64, source, from, n as u64) };
+        }
+        let mut state = (looked(shadow) || !copy.runs.is_empty()).then_some(dest);
+        if copy.pairs.1 > 0 {
+            if let Some(was) = state {
+                first.push(transition(&shadow.buffer, was, write));
+            }
+            state = Some(write);
+        }
+        if let Some(was) = state
+            && hashed(i, shadow)
+            && (!copy.runs.is_empty() || copy.pairs.1 > 0)
+        {
+            last.push(transition(&shadow.buffer, was, read));
+        }
+    }
+    // SAFETY: the caller's; live objects.
+    unsafe {
+        if !first.is_empty() {
+            list.ResourceBarrier(&first);
+        }
+        if let Some(pass) = pass(host)
+            && copies.iter().any(|c| c.pairs.1 > 0)
+        {
+            list.SetComputeRootSignature(&pass.root);
+            list.SetPipelineState(&pass.pso);
+            list.SetComputeRootShaderResourceView(1, source.GetGPUVirtualAddress());
+            for ((shadow, _), copy) in dirty.iter().zip(copies).filter(|(_, c)| c.pairs.1 > 0) {
+                list.SetComputeRootUnorderedAccessView(2, shadow.buffer.GetGPUVirtualAddress());
+                const MOST: u32 = 64 * D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION;
+                let (at, words) = copy.pairs;
+                let mut done = 0;
+                while done < words {
+                    let n = (words - done).min(MOST);
+                    let constants = [at as u32 + done * 8, n];
+                    list.SetComputeRoot32BitConstants(0, 2, constants.as_ptr().cast(), 0);
+                    list.Dispatch(n.div_ceil(64), 1, 1);
+                    done += n;
+                }
+            }
+        }
+        if !last.is_empty() {
+            list.ResourceBarrier(&last);
+        }
     }
 }

@@ -1073,6 +1073,30 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     ask_ahead_held(ranges, false, 0);
 }
 
+/// Whether [`ask_ahead_held`] keeps a range of [`AHEAD_GAP`] (8 MiB) or more
+/// out of the runs it joins (`VICTORY_ASK_RUNS_APART=1`; off by default).
+/// With ray tracing the title's ranges are 64 MB reservations that end where
+/// the next begins: a run of them is refused by the kernel at every level
+/// of [`ask_run`]'s halving down to single ranges, 141 refused askings a
+/// frame in run rt6 against 3 in fg2. Each such range needs its own walking
+/// call whatever the grouping, so joining it saves nothing; alone it goes
+/// straight to [`ask_rest`]'s asking by itself.
+fn ask_runs_apart() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_RUNS_APART").is_some_and(|v| v == "1"))
+}
+
+/// Since the last frame line: large ranges [`ask_ahead_held`] left out of
+/// its runs ([`ask_runs_apart`]).
+#[cfg(feature = "diagnostics")]
+static APART: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// [`APART`], taken.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn apart_asks() -> u64 {
+    APART.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// [`ask_ahead`]; `held`: the caller holds everything ([`Asking::hold_all`]).
 fn ask_ahead_held(ranges: &[(usize, usize)], held: bool, mark: u64) {
     let mut pieces: Vec<(usize, usize)> = ranges
@@ -1094,17 +1118,25 @@ fn ask_ahead_held(ranges: &[(usize, usize)], held: bool, mark: u64) {
     let _all = (!held).then(Asking::hold_all);
     let (mut asked, mut written) = (Vec::new(), Vec::new());
     let mut runs = Vec::new();
+    let apart = ask_runs_apart();
+    let large = |p: (usize, usize)| apart && p.1 - p.0 >= AHEAD_GAP;
     let mut i = 0;
     while i < pieces.len() {
         let first = pieces[i].0;
         let mut last = pieces[i].1;
         let mut k = i + 1;
         while k < pieces.len()
+            && !large(pieces[i])
+            && !large(pieces[k])
             && pieces[k].0 <= last + AHEAD_GAP
             && last.max(pieces[k].1) - first <= AHEAD_MAX
         {
             last = last.max(pieces[k].1);
             k += 1;
+        }
+        #[cfg(feature = "diagnostics")]
+        if k == i + 1 && large(pieces[i]) {
+            APART.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         runs.push(i..k);
         i = k;
@@ -1254,13 +1286,31 @@ const EARLY_PIECE: usize = (2 << 20) / PAGE;
 /// Told when a submission asked.
 static HOT_MOVED: Condvar = Condvar::new();
 
-/// Since the last frame line: pieces asked early, the microseconds of it.
-static EARLY: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// Since the last frame line: pieces asked early, the microseconds of it,
+/// the calls to [`writes`] they took.
+static EARLY: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// [`EARLY`], taken.
 #[cfg(feature = "diagnostics")]
-pub(crate) fn early_asks() -> [u64; 2] {
-    [0, 1].map(|i| EARLY[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+pub(crate) fn early_asks() -> [u64; 3] {
+    [0, 1, 2].map(|i| EARLY[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
+/// The most pieces [`ask_early`] asks about in one call with
+/// [`early_runs`]: 16 MiB, so the range it holds ([`Asking::hold`]) stays
+/// short for a submission's asking that waits on it.
+const EARLY_RUN: usize = 8;
+
+/// Whether [`ask_early`] asks about a run of strictly adjacent hot pieces in
+/// one call (`VICTORY_EARLY_RUNS=1`; off by default). It asks one call per
+/// 2 MiB piece today: 283 pieces in 5.2 ms a frame in run fg2, 355 in 8.8 ms
+/// in rt6, 278 in 7.7 ms in bop4, each call 30-70 microseconds whatever its
+/// range. No gap is joined: in run ag1 a bigger gap halved the calls and
+/// doubled the kernel time, the walk being most of it. A run refused as a
+/// whole is asked piece by piece as before.
+fn early_runs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EARLY_RUNS").is_some_and(|v| v == "1"))
 }
 
 /// A submission's asking found `written` (pages).
@@ -1313,15 +1363,45 @@ fn ask_early(every: std::time::Duration) {
         };
         let began = std::time::Instant::now();
         let mut asked = 0;
-        for piece in pieces {
+        let mut calls = 0;
+        if early_runs() {
             // (A submission's asking stands: what it holds is answered from
             // the journal, and costs nothing here.)
-            if published(piece * EARLY_PIECE * PAGE, (piece + 1) * EARLY_PIECE * PAGE) {
-                continue;
+            let mut pieces: Vec<usize> =
+                pieces.into_iter().filter(|&p| !published(p * EARLY_PIECE * PAGE, (p + 1) * EARLY_PIECE * PAGE)).collect();
+            pieces.sort_unstable();
+            let mut i = 0;
+            while i < pieces.len() {
+                let mut k = i + 1;
+                while k < pieces.len() && k - i < EARLY_RUN && pieces[k] == pieces[k - 1] + 1 {
+                    k += 1;
+                }
+                let (first, last) = (pieces[i], pieces[k - 1] + 1);
+                asked += (k - i) as u64;
+                calls += 1;
+                if writes(first * EARLY_PIECE * PAGE, last * EARLY_PIECE * PAGE, false).is_none() && k - i >= 2 {
+                    // Refused as a whole (a view block in it, or two
+                    // reservations): each piece as before.
+                    for piece in first..last {
+                        calls += 1;
+                        let _ = writes(piece * EARLY_PIECE * PAGE, (piece + 1) * EARLY_PIECE * PAGE, false);
+                    }
+                }
+                i = k;
             }
-            asked += 1;
-            let _ = writes(piece * EARLY_PIECE * PAGE, (piece + 1) * EARLY_PIECE * PAGE, false);
+        } else {
+            for piece in pieces {
+                // (A submission's asking stands: what it holds is answered from
+                // the journal, and costs nothing here.)
+                if published(piece * EARLY_PIECE * PAGE, (piece + 1) * EARLY_PIECE * PAGE) {
+                    continue;
+                }
+                asked += 1;
+                calls += 1;
+                let _ = writes(piece * EARLY_PIECE * PAGE, (piece + 1) * EARLY_PIECE * PAGE, false);
+            }
         }
+        EARLY[2].fetch_add(calls, Relaxed);
         if ask_marks() {
             // (Its own askings above: noted by `writes`.)
             stamps_publish();
