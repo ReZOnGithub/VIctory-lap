@@ -721,6 +721,9 @@ fn nv_defaults() {
         // (with the breadcrumbs of scripts/play.ps1 off: 15.3 to 15.9 fps at
         // the boat, runs h4 and h5).
         ("VICTORY_ASK_EARLY", "2"),
+        // The heaps' records in finer rounds (A/B at the boat, run ab1: a
+        // frame 1 ms shorter of 59).
+        ("VICTORY_SYNC_FINE", "1"),
     ];
     for &(name, value) in SET {
         if std::env::var_os(name).is_none() {

@@ -279,8 +279,19 @@ fn ask(what: &str, from: u32) {
         // change while the title runs, and `settle` follows it)
         (fast_sets(&sets, false), sets.len())
     });
-    // All alike (or nothing known): nothing to ask for.
+    // All alike (or nothing known): nothing to ask for, but for the
+    // submitting thread's own core ([`lane_core`]), which needs no faster
+    // cores, only six of them: the rest of the process is kept off one core
+    // and that thread on it ([`settle`]).
     if fast.is_empty() {
+        if what == "victory-submit" && lane_core() {
+            // SAFETY: our own thread; the handle stays open.
+            let thread = unsafe { OpenThread(THREAD_SET_LIMITED_INFORMATION, 0, GetCurrentThreadId()) };
+            if !thread.is_null() {
+                ASKED.lock().unwrap_or_else(|e| e.into_inner()).push((thread as usize, true));
+                settle();
+            }
+        }
         return;
     }
     // SAFETY: our own thread; the handle stays open.
