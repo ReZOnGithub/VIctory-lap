@@ -1324,6 +1324,9 @@ pub(crate) struct HostList {
     /// next call is its reset ([`HostList::mark_pristine`]): that reset has
     /// nothing to do.
     pristine: std::sync::atomic::AtomicBool,
+    /// The driver's close of the list running on a thread of ours
+    /// ([`close_beside`]): waited for before the list is submitted or reset.
+    closing: Mutex<Option<std::sync::Arc<(Mutex<bool>, std::sync::Condvar)>>>,
     /// With barriers held and joined (`rec`).
     pub(crate) list: rec::Rec,
     /// Work for submission time, in recorded order.
@@ -2415,6 +2418,56 @@ enum Step {
 /// What a list does on the CPU when it is submitted: copies between host
 /// memory regions (title buffers, upload buffers and buffer copies), and
 /// the upload buffers its GPU commands read, kept until the list is reset.
+/// Whether the driver's close of a title's list runs on threads of ours
+/// (`VICTORY_CLOSE_BESIDE`, on unless `0`): the title's Close returns once
+/// our own steps are recorded, and the list is waited for where it is
+/// submitted or reset. On an RTX 5070 the driver's close was a fifth of the
+/// title's recording threads' time inside list calls (profile bp3).
+fn close_beside() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CLOSE_BESIDE").is_none_or(|v| v != "0"))
+}
+
+/// A list to close beside, and what says it is done.
+struct Closing {
+    list: ID3D12GraphicsCommandList,
+    done: std::sync::Arc<(Mutex<bool>, std::sync::Condvar)>,
+}
+// SAFETY: D3D12 lists may be closed on any thread; the title's list is
+// not touched until `done` is set (submission and reset wait for it).
+unsafe impl Send for Closing {}
+
+/// The closing threads' line.
+struct Closer(Mutex<std::sync::mpsc::Sender<Closing>>);
+
+impl Closer {
+    fn send(&self, c: Closing) {
+        let _ = self.0.lock().unwrap_or_else(|e| e.into_inner()).send(c);
+    }
+}
+
+fn closer() -> &'static Closer {
+    static CLOSER: OnceLock<Closer> = OnceLock::new();
+    CLOSER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<Closing>();
+        let rx = std::sync::Arc::new(Mutex::new(rx));
+        for i in 0..4 {
+            let rx = rx.clone();
+            let _ = std::thread::Builder::new().name(format!("victory-close-{i}")).spawn(move || loop {
+                let next = rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                let Ok(Closing { list, done }) = next else { return };
+                // SAFETY: an open list of ours that nothing else records into.
+                if let Err(e) = unsafe { list.Close() } {
+                    fail(format_args!("a host command list did not close ({e}): a command recorded into it was invalid"));
+                }
+                *done.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
+                done.1.notify_all();
+            });
+        }
+        Closer(Mutex::new(tx))
+    })
+}
+
 /// An upload buffer of [`HostList::upload`]'s pool: mapped for good.
 struct Pooled {
     buffer: ID3D12Resource,
@@ -4422,6 +4475,7 @@ impl Host {
             Ok(HostList {
                 pooled: Mutex::new(Vec::new()),
                 pristine: std::sync::atomic::AtomicBool::new(false),
+                closing: Mutex::new(None),
                 allocator,
                 list: rec::Rec::new(list),
                 deferred: Mutex::default(),
@@ -6009,6 +6063,7 @@ impl Host {
                     _ => crate::copystat::Timed::Title(_run),
                 },
             ));
+            list.wait_closed();
             lists.push(list.list.cast().ok());
         }
         batch.fill();
@@ -6658,7 +6713,19 @@ impl HostList {
         times
     }
 
+    /// A close of the list running beside ([`close_beside`]) is done.
+    pub(crate) fn wait_closed(&self) {
+        let Some(done) = self.closing.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+            return;
+        };
+        let mut finished = done.0.lock().unwrap_or_else(|e| e.into_inner());
+        while !*finished {
+            finished = done.1.wait(finished).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
     pub(crate) fn close(&self) {
+        self.wait_closed();
         let _closing = crate::timeline::span("closing a host list");
         self.twins_to_depth();
         self.textures_back();
@@ -6677,6 +6744,14 @@ impl HostList {
                 self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, count);
                 self.list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 1, back, 0);
             }
+        }
+        if close_beside() {
+            // The list with what it holds recorded (`rec::Rec`'s deref).
+            let list: ID3D12GraphicsCommandList = (*self.list).clone();
+            let done = std::sync::Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+            *self.closing.lock().unwrap_or_else(|e| e.into_inner()) = Some(done.clone());
+            closer().send(Closing { list, done });
+            return;
         }
         // SAFETY: our list.
         if let Err(e) = unsafe { self.list.Close() } {
@@ -6731,6 +6806,7 @@ impl HostList {
     }
 
     pub(crate) fn reset(&self) {
+        self.wait_closed();
         self.changed_something();
         // Allocator reset already, nothing recorded with it since (an empty
         // list closed): only the list is reset.
@@ -8988,6 +9064,13 @@ impl Batch {
 /// reports an unmapped page instead of faulting. Asking `VirtualQuery` first
 /// cost about 2 ms per copy in the title's big pools (it walks the page
 /// tables to the region's end), which made copies run at 100-200 MB/s.
+/// [`copy_mapped`]'s size from which a copy into memory of ours is cut into
+/// pieces for several threads (0: never).
+fn split_copy_bytes() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_SPLIT_COPY_MB").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(2) << 20)
+}
+
 pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
     #[cfg(feature = "diagnostics")]
     match crate::copystat::mode() {
@@ -9022,9 +9105,39 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
     let since = crate::watch::changes();
-    // (A title destination that is away only while the runtime changes a
-    // mapping beside it is written when that is done.)
-    let whole = read(src, dst, len) || title_dst && crate::watch::again_after_change(since, || read(src, dst, len));
+    // Big copies into memory of ours: in pieces on several threads
+    // (`VICTORY_SPLIT_COPY_MB`, 2 unless set; 0 off). One refresh of a big
+    // copy ran on one thread while the others stood (run bl33: ~90 MB a
+    // frame of refreshes at ~3.7 GB/s).
+    let split = split_copy_bytes();
+    let whole = if !title_dst && split > 0 && len >= split {
+        let pieces = (len / (split / 2)).clamp(2, 4);
+        let each = len.div_ceil(pieces).next_multiple_of(4096);
+        let (s0, d0) = (src as usize, dst as usize);
+        let ok = std::sync::atomic::AtomicBool::new(true);
+        std::thread::scope(|scope| {
+            for k in 1..pieces {
+                let (at, n) = (k * each, each.min(len.saturating_sub(k * each)));
+                if n == 0 {
+                    continue;
+                }
+                let ok = &ok;
+                scope.spawn(move || {
+                    if !read((s0 + at) as *const u8, (d0 + at) as *mut u8, n) {
+                        ok.store(false, Ordering::Relaxed);
+                    }
+                });
+            }
+            if !read(src, dst, each.min(len)) {
+                ok.store(false, Ordering::Relaxed);
+            }
+        });
+        ok.load(Ordering::Relaxed) || read(src, dst, len)
+    } else {
+        // (A title destination that is away only while the runtime changes a
+        // mapping beside it is written when that is done.)
+        read(src, dst, len) || title_dst && crate::watch::again_after_change(since, || read(src, dst, len))
+    };
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
