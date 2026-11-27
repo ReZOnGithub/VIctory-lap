@@ -717,6 +717,10 @@ fn nv_defaults() {
         // A submission's write-watch askings on the landing threads too
         // (5.6 ms a frame of the preparing thread at the boat, run bop3).
         ("VICTORY_ASK_SPREAD", "1"),
+        // The write watch asked a little at a time while the title records
+        // (with the breadcrumbs of scripts/play.ps1 off: 15.3 to 15.9 fps at
+        // the boat, runs h4 and h5).
+        ("VICTORY_ASK_EARLY", "2"),
     ];
     for &(name, value) in SET {
         if std::env::var_os(name).is_none() {
