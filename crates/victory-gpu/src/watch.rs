@@ -698,6 +698,9 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         let keep = no_reset();
+        // (`ask_marks`: what the title wrote before this number was taken
+        // is in the answer.)
+        let stamp = if ask_marks() { next_asking() } else { 0 };
         // SAFETY: the answer buffer holds `count` entries.
         let failed = unsafe {
             GetWriteWatch(
@@ -722,6 +725,15 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
         if keep {
             reset_found(&found[..count]);
         }
+        if stamp != 0 {
+            STAMPED.with(|s| {
+                let mut s = s.borrow_mut();
+                if s.len() > 4096 {
+                    s.clear();
+                }
+                s.push((first, last, stamp));
+            });
+        }
         #[cfg(feature = "diagnostics")]
         {
             tally(12, count as u64);
@@ -744,6 +756,166 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// Askings a submission need not make itself (`VICTORY_ASK_MARKS`).
+//
+// A submission asks the kernel which pages the title wrote in everything it
+// refreshes, some 600 MB to 2 GB of ranges for each of 17 submissions a frame
+// at the title's boat mission: 4 ms a frame of the thread that prepares
+// submissions inside `GetWriteWatch` alone (profile bop4), 6 to 7 ms with
+// what stands around it. But the title wrote what a submission reads before
+// it queued it, and the line's thread comes to it some 20 ms later. So: a
+// submission carries the asking number that stood when the title queued it
+// (its mark, raised as renderer port #7 raises its rounds: by the parts it is
+// joined with and the waits its queue went past). A piece of memory that any
+// thread asked the kernel about after that mark has all of those writes in
+// the journal, and the submission's asking leaves it out. The thread of
+// `VICTORY_ASK_EARLY` keeps asking the pieces submissions asked about lately,
+// so that most are.
+
+/// Whether it is on (`VICTORY_ASK_MARKS=1`; off).
+fn ask_marks() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_MARKS").is_some_and(|v| v == "1"))
+}
+
+thread_local! {
+    /// The mark of the submission this thread is about to prepare; 0: none.
+    static ASK_MARK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Kernel askings this thread made whose pages may not be noted yet:
+    /// (first, last, the number taken before the asking).
+    static STAMPED: std::cell::RefCell<Vec<(usize, usize, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The number of the last asking so far: a submission queued now needs
+/// askings with a later one.
+pub(crate) fn asking_now() -> u64 {
+    ASKED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The submission the calling thread prepares next was queued when the
+/// asking number was `mark` (0: not known).
+pub(crate) fn set_ask_mark(mark: u64) {
+    ASK_MARK.set(mark);
+}
+
+/// By piece ([`EARLY_PIECE`] pages): the number taken before the last kernel
+/// asking that covered the whole piece and whose pages are noted.
+static STAMPS: std::sync::LazyLock<RwLock<std::collections::HashMap<usize, u64>>> =
+    std::sync::LazyLock::new(|| RwLock::new(std::collections::HashMap::new()));
+
+/// Pieces a submission had to ask the kernel about lately, and for how many
+/// more rounds the early thread asks about them.
+static WANTED: Mutex<BTreeMap<usize, u32>> = Mutex::new(BTreeMap::new());
+
+/// Since the last frame line: runs of a submission's asking left out, and
+/// runs asked.
+static MARKED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// The askings this thread made are noted in the journal: the pieces they
+/// covered whole are known as asked.
+fn stamps_publish() {
+    let done = STAMPED.with(|s| std::mem::take(&mut *s.borrow_mut()));
+    if done.is_empty() {
+        return;
+    }
+    let mut stamps = STAMPS.write().unwrap_or_else(|e| e.into_inner());
+    for (first, last, stamp) in done {
+        for piece in first.div_ceil(EARLY_PIECE)..last / EARLY_PIECE {
+            let at = stamps.entry(piece).or_insert(0);
+            *at = (*at).max(stamp);
+        }
+    }
+}
+
+/// Whether every piece that holds some of pages `[first, last)` was asked
+/// about after `mark`.
+fn asked_since(first: usize, last: usize, mark: u64) -> bool {
+    if mark == 0 || first >= last {
+        return false;
+    }
+    let stamps = STAMPS.read().unwrap_or_else(|e| e.into_inner());
+    (first / EARLY_PIECE..last.div_ceil(EARLY_PIECE)).all(|piece| stamps.get(&piece).is_some_and(|&s| s > mark))
+}
+
+/// A submission asked the kernel about pages `[first, last)` itself.
+fn want(first: usize, last: usize) {
+    const ROUNDS: u32 = 400;
+    let mut wanted = WANTED.lock().unwrap_or_else(|e| e.into_inner());
+    for piece in first / EARLY_PIECE..last.div_ceil(EARLY_PIECE) {
+        wanted.insert(piece, ROUNDS);
+    }
+}
+
+/// The early thread's part: asks the kernel about the pieces submissions
+/// wanted lately, those next to each other in one asking.
+fn ask_wanted() {
+    // (As a submission's own asking joins them: `AHEAD_GAP`, `AHEAD_MAX`.)
+    let pieces: Vec<usize> = {
+        let mut wanted = WANTED.lock().unwrap_or_else(|e| e.into_inner());
+        wanted.retain(|_, left| {
+            *left -= 1;
+            *left > 0
+        });
+        wanted.keys().copied().collect()
+    };
+    let (gap, most) = (AHEAD_GAP / EARLY_PIECE, AHEAD_MAX / EARLY_PIECE);
+    let mut i = 0;
+    while i < pieces.len() {
+        let first = pieces[i];
+        let mut last = first + 1;
+        let mut k = i + 1;
+        while k < pieces.len() && pieces[k] <= last + gap && pieces[k] + 1 - first <= most {
+            last = pieces[k] + 1;
+            k += 1;
+        }
+        ask_wanted_run(first, last);
+        i = k;
+    }
+}
+
+/// [`ask_wanted`] for pieces `[first, last)`: by halves where the kernel
+/// refuses the whole (two reservations, memory not write-watched).
+fn ask_wanted_run(first: usize, last: usize) {
+    /// Runs the kernel refused whole: by halves at once the next time.
+    static REFUSED: Mutex<BTreeSet<(usize, usize)>> = Mutex::new(BTreeSet::new());
+    let (start, end) = (first * EARLY_PIECE * PAGE, last * EARLY_PIECE * PAGE);
+    if published(start, end) {
+        return;
+    }
+    let refused = last - first >= 2 && REFUSED.lock().unwrap_or_else(|e| e.into_inner()).contains(&(first, last));
+    if !refused {
+        if writes(start, end, false).is_some() {
+            stamps_publish();
+            return;
+        }
+        STAMPED.with(|s| s.borrow_mut().clear());
+        if last - first < 2 {
+            // Not memory the kernel watches: nothing to ask for.
+            WANTED.lock().unwrap_or_else(|e| e.into_inner()).remove(&first);
+            return;
+        }
+        let mut refused = REFUSED.lock().unwrap_or_else(|e| e.into_inner());
+        if refused.len() > 4096 {
+            refused.clear();
+        }
+        refused.insert((first, last));
+    }
+    let half = first + (last - first) / 2;
+    ask_wanted_run(first, half);
+    ask_wanted_run(half, last);
+}
+
+/// For the frame line.
+pub(crate) fn ask_marks_line(frames: f64) -> Option<String> {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !ask_marks() {
+        return None;
+    }
+    let (left, asked) = (MARKED[0].swap(0, Relaxed) as f64 / frames, MARKED[1].swap(0, Relaxed) as f64 / frames);
+    Some(format!("askings by mark (VICTORY_ASK_MARKS) per frame: {left:.1} runs left out, {asked:.1} asked"))
+}
+
 /// Ranges of one submission closer than this are asked about together:
 /// walking the pages between them costs less than another kernel call (a
 /// call that resets written pages costs 30-70 microseconds whatever the
@@ -758,11 +930,11 @@ const AHEAD_MAX: usize = (1 << 30) / PAGE;
 /// 456 ms, in run 14). Ranges that are not write-watched, or lie alone, are
 /// left to `writes`.
 pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
-    ask_ahead_held(ranges, false);
+    ask_ahead_held(ranges, false, 0);
 }
 
 /// [`ask_ahead`]; `held`: the caller holds everything ([`Asking::hold_all`]).
-fn ask_ahead_held(ranges: &[(usize, usize)], held: bool) {
+fn ask_ahead_held(ranges: &[(usize, usize)], held: bool, mark: u64) {
     let mut pieces: Vec<(usize, usize)> = ranges
         .iter()
         // Not view memory known by its bits: the kernel would refuse the
@@ -797,13 +969,33 @@ fn ask_ahead_held(ranges: &[(usize, usize)], held: bool) {
         runs.push(i..k);
         i = k;
     }
-    for (a, w) in spread_each(runs.len(), |r| {
+    // (`ask_marks`: a run every piece of which was asked about since the
+    // submission was queued is in the journal already.)
+    if mark != 0 {
+        let before = runs.len();
+        runs.retain(|run| {
+            let first = pieces[run.start].0;
+            let last = pieces[run.clone()].iter().map(|p| p.1).max().unwrap_or(first);
+            if asked_since(first, last, mark) {
+                asked.push((first, last));
+                false
+            } else {
+                want(first, last);
+                true
+            }
+        });
+        MARKED[0].fetch_add((before - runs.len()) as u64, std::sync::atomic::Ordering::Relaxed);
+        MARKED[1].fetch_add(runs.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+    for (a, w, stamped) in spread_each(runs.len(), |r| {
         let (mut a, mut w) = (Vec::new(), Vec::new());
         ask_run(&pieces[runs[r].clone()], &mut a, &mut w);
-        (a, w)
+        // (Each thread's askings: published below, once their pages are noted.)
+        (a, w, STAMPED.with(|s| std::mem::take(&mut *s.borrow_mut())))
     }) {
         asked.extend(a);
         written.extend(w);
+        STAMPED.with(|s| s.borrow_mut().extend(stamped));
     }
     note_hot(&written);
     if port_journal() {
@@ -814,6 +1006,8 @@ fn ask_ahead_held(ranges: &[(usize, usize)], held: bool) {
         let mut j = journal_mut();
         j.ahead_asked = now;
         j.ahead.set(asked);
+        drop(j);
+        stamps_publish();
         return;
     }
     let mut j = journal_mut();
@@ -823,6 +1017,8 @@ fn ask_ahead_held(ranges: &[(usize, usize)], held: bool) {
     for (page, parts) in written {
         j.notes.note(page, parts, now);
     }
+    drop(j);
+    stamps_publish();
 }
 
 /// Renderer port #7: notes `written` (pages and their parts) as found by an
@@ -986,6 +1182,11 @@ fn ask_early(every: std::time::Duration) {
             asked += 1;
             let _ = writes(piece * EARLY_PIECE * PAGE, (piece + 1) * EARLY_PIECE * PAGE, false);
         }
+        if ask_marks() {
+            // (Its own askings above: noted by `writes`.)
+            stamps_publish();
+            ask_wanted();
+        }
         EARLY[0].fetch_add(asked, Relaxed);
         EARLY[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
         last = ASKED.load(Relaxed);
@@ -1045,7 +1246,9 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     // other threads' askings again (0.5 ms a time, run fills-ab3), and no
     // other asking comes between the two parts.
     let _all = Asking::hold_all();
-    ask_ahead_held(ranges, true);
+    // (The mark is this submission's alone: taken, not left for the next.)
+    let mark = if ask_marks() { ASK_MARK.replace(0) } else { 0 };
+    ask_ahead_held(ranges, true, mark);
     spent.next("asking: the rest");
     ask_rest(ranges, true);
     spent.end();

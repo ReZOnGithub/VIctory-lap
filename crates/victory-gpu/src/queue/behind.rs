@@ -506,6 +506,9 @@ fn stand_spin() -> Duration {
     Duration::from_micros(*US.get_or_init(|| number("VICTORY_STAND_SPIN_US").map_or(3000, |n| n as u64)))
 }
 
+/// The asking number's bits of a mark (`Work::mark_now` of the queues' jobs).
+const MARK_ASKING: u64 = (1 << 40) - 1;
+
 fn join_end(i: usize) {
     JOIN_END[i].fetch_add(1, Relaxed);
 }
@@ -589,14 +592,17 @@ impl Work for Job {
         }
     }
 
+    // (A mark is the round of renderer port #7 above 40 bits of the asking
+    // number of `crate::watch`'s marks: both only grow, so the later of two
+    // marks is the greater in both.)
     fn mark_now() -> u64 {
-        if crate::port_journal::on() { crate::descriptor::round_after_now() } else { 0 }
+        if crate::port_journal::on() { crate::descriptor::round_after_now() << 40 | crate::watch::asking_now() & MARK_ASKING } else { 0 }
     }
 
     fn mark_later() -> u64 {
         // (Asked for now: the round runs while the lane does what is before
         // the part behind the wait.)
-        if crate::port_journal::on() { crate::descriptor::round_after_now() } else { 0 }
+        if crate::port_journal::on() { crate::descriptor::round_after_now() << 40 | crate::watch::asking_now() & MARK_ASKING } else { 0 }
     }
 
     fn raises(&self) -> bool {
@@ -611,7 +617,8 @@ impl Work for Job {
     }
 
     fn marked(&mut self, mark: u64) {
-        crate::port_journal::set_mark(mark);
+        crate::port_journal::set_mark(mark >> 40);
+        crate::watch::set_ask_mark(mark & MARK_ASKING);
     }
 
     fn idle_kind(&self) -> usize {
