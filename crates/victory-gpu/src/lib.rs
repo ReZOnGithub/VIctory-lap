@@ -108,6 +108,8 @@ mod ab;
 mod tdr;
 #[cfg(windows)]
 mod texture;
+#[cfg(windows)]
+pub mod streamline;
 pub mod timeline;
 #[cfg(windows)]
 pub mod titlewrite;

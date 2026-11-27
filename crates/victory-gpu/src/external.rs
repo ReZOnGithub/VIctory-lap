@@ -69,3 +69,15 @@ pub fn record<R>(list: This, f: impl FnOnce(&Recording<'_>) -> R) -> Option<R> {
     });
     out
 }
+
+/// A title texture's host copy, moved to the host resource `state` in
+/// `list`, and the state it is in (`crate::streamline`). `None` for a buffer.
+pub(crate) fn host_texture(list: &crate::host::HostList, resource: This, state: u32) -> Option<(ID3D12Resource, u32)> {
+    Recording(list).texture(resource, state)
+}
+
+/// Prepares a title-authored input as a compute shader's resource view is
+/// (`crate::streamline`).
+pub(crate) fn prepare_input(list: &crate::host::HostList, resource: This) -> Option<()> {
+    Recording(list).prepare_input(resource)
+}

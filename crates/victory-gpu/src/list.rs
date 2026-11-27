@@ -149,6 +149,32 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 /// Runs `f` with the host list and draw state of a title list, if there
 /// is a host GPU.
 #[cfg(windows)]
+/// Work of ours at a place of a title's list (`crate::streamline`): whether
+/// it bound anything the list's state has to put back.
+pub(crate) type External = Box<dyn FnOnce(&crate::host::HostList) -> bool + Send>;
+
+/// Runs `work` at this place of title list `this`, on the host list that
+/// records its calls (what was written down of them with `VICTORY_THIN=1`
+/// is translated first: `thin::for_external`). False if the list records
+/// nowhere.
+#[cfg(windows)]
+pub(crate) fn external(this: This, work: External) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    let Some(list) = thin::for_external(this) else {
+        return false;
+    };
+    let mut ran = false;
+    with_state(list, |host, state| {
+        if work(host) {
+            state.external_compute();
+        }
+        ran = true;
+    });
+    ran
+}
+
 pub(crate) fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
     let Some(list) = host_list(this) else { return };
     #[cfg(feature = "diagnostics")]
