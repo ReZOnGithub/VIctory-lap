@@ -182,8 +182,12 @@ $env:VICTORY_FRAMEGEN = '1'; $env:VICTORY_FRAMEGEN_X = '2'      # 2 to 6 frames 
   55 % busy instead of 66 %; the frame rate stays what the CPU gives.
 - DLSS Frame Generation needs an RTX 40 or later **and Windows' "Hardware-
   accelerated GPU scheduling" switched on** (Settings, System, Display,
-  Graphics, then restart). With it off Streamline refuses frame generation
-  and the layer says so at the start. Not yet measured here for that reason.
+  Graphics, then restart; or `HwSchMode` = 2 under
+  `HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers`). With it off
+  Streamline refuses frame generation and the layer says so at the start.
+- Measured here at 2x (RTX 5070, boat mission): 22 frames rendered and 22
+  generated a second, about 43 shown. At that base rate the generated frames
+  show faults on fast camera moves.
 
 For 3 % more frames (21.0 to 21.7 fps at the boat mission here), a
 profile-guided build: `scripts\pgo.ps1 -Step train -Exe <path>` runs a

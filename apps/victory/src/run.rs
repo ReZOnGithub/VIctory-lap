@@ -700,6 +700,20 @@ fn nv_defaults() {
     if std::env::var_os("VICTORY_NV_DEFAULTS").is_some_and(|v| v == "0") {
         return;
     }
+    // With frame generation the card must keep some 1.5 to 2 GB for it. The
+    // launcher this came with leaves a fifth of the budget free; here, with
+    // 3 GB of the title's buffers kept in the card's memory, that starved the
+    // textures (8,719 uploads turned down for lack of room, trees black and
+    // far objects wrong: runs fg4 and safe1). Less of the buffers on the card
+    // and 88 % for textures: none turned down, frame generation runs (fg5).
+    if std::env::var_os("VICTORY_FRAMEGEN").is_some_and(|v| v == "1") {
+        for (name, value) in [("VICTORY_TEXTURE_ROOM_PERCENT", "88"), ("VICTORY_CARD_BUFFERS_MB", "2048")] {
+            if std::env::var_os(name).is_none() {
+                // SAFETY: nothing else runs yet.
+                unsafe { std::env::set_var(name, value) };
+            }
+        }
+    }
     const SET: &[(&str, &str)] = &[
         // scripts/play.ps1's settings.
         ("VICTORY_TEXTURE_NO_WAIT", "1"),
