@@ -648,6 +648,30 @@ pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console) -> Result<(
 /// only where the user has not set it. `VICTORY_NV_DEFAULTS=0`: none of them.
 /// `--console series-s` is faster still (less memory; a 1080p picture).
 fn nv_defaults() {
+    // `VICTORY_EXIT_AFTER_S=n`: the process ends by itself after n seconds,
+    // through the runtime's own exit (a profile-generating build writes its
+    // counters there; a killed one writes nothing).
+    if let Some(after) = std::env::var("VICTORY_EXIT_AFTER_S").ok().and_then(|v| v.parse::<u64>().ok()) {
+        drop(std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(after));
+            // A profile-generating build (`--cfg victory_pgo` beside
+            // `-Cprofile-generate`): its counters, written here, since the
+            // process's end does not reach the runtime's own writer.
+            #[allow(unexpected_cfgs)]
+            {
+                #[cfg(victory_pgo)]
+                {
+                    unsafe extern "C" {
+                        fn __llvm_profile_write_file() -> i32;
+                    }
+                    // SAFETY: the profiling runtime's own entry, linked into such a build.
+                    let wrote = unsafe { __llvm_profile_write_file() };
+                    eprintln!("profile counters written: {wrote}");
+                }
+            }
+            std::process::exit(0);
+        }));
+    }
     if std::env::var_os("VICTORY_NV_DEFAULTS").is_some_and(|v| v == "0") {
         return;
     }
