@@ -2526,6 +2526,32 @@ fn land_not_least() -> u64 {
     })
 }
 
+/// Whether what a submission's shaders may have written comes down whole,
+/// with no compare on the card to say which pieces changed
+/// (`VICTORY_LAND_PLAIN=1`; off). With [`land_not_least`] at 1 MB what is
+/// left to bring down is small buffers, half a megabyte to four a frame at
+/// the title's boat mission, and the compare is a list recorded and run for
+/// every submission.
+fn land_plain() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_PLAIN").is_some_and(|v| v == "1"))
+}
+
+/// `VICTORY_LAND_EVERY_MS` ([`Host::relay_card_back`]); `None`: not set, or 0.
+fn land_every() -> Option<std::time::Duration> {
+    static EVERY: OnceLock<Option<std::time::Duration>> = OnceLock::new();
+    *EVERY.get_or_init(|| {
+        let ms = std::env::var("VICTORY_LAND_EVERY_MS").ok().and_then(|v| v.trim().parse::<f64>().ok())?;
+        std::time::Duration::try_from_secs_f64(ms / 1000.0).ok().filter(|d| !d.is_zero())
+    })
+}
+
+/// With [`land_every`]: the pieces kept for the next fetch (copy, from, to),
+/// and when the last one was.
+#[allow(clippy::type_complexity)]
+static LAND_KEPT: Mutex<(Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>, Option<std::time::Instant>)> =
+    Mutex::new((Vec::new(), None));
+
 /// Whether the card does not look for what shaders wrote in such copies
 /// either (`VICTORY_LAND_NOT_COMPARE`, on unless `0`): nothing of it is
 /// brought down, so the hashes before and the compare after the lists, of
@@ -4981,7 +5007,7 @@ impl Host {
                 let Some(span) = shadow.card_span(from, to) else {
                     continue;
                 };
-                let compared = twin && u64::from(at + span.pieces) * 4 <= work.differs.2;
+                let compared = twin && u64::from(at + span.pieces) * 4 <= work.differs.2 && !land_plain();
                 plan.ranges.push(CardRange {
                     shadow: shadow.clone(),
                     declared: (from, to),
@@ -5241,6 +5267,33 @@ impl Host {
                 for piece in &mut pieces {
                     piece.3 = total;
                     total += (piece.2 - piece.1) as u64;
+                }
+            }
+        }
+        // `VICTORY_LAND_EVERY_MS=<n>`: the pieces are brought down together,
+        // every n ms at most, and not after each flight, as long as other
+        // flights are in the air (with none, at once: whatever waits for all
+        // of them to land finds title memory whole, as before). A piece
+        // flagged meanwhile is kept and comes down with the next ones, as
+        // it is by then. At the title's boat mission 17 landings a frame
+        // brought 113 small pieces, half a megabyte, and cost a tenth of the
+        // frame (runs k16 and h17).
+        if let Some(every) = land_every() {
+            let mut kept = LAND_KEPT.lock().unwrap_or_else(|e| e.into_inner());
+            let (waiting, since) = &mut *kept;
+            for (shadow, lo, hi, _) in pieces.drain(..) {
+                if !waiting.iter().any(|w| std::sync::Arc::ptr_eq(&w.0, &shadow) && w.1 == lo && w.2 == hi) {
+                    waiting.push((shadow, lo, hi));
+                }
+            }
+            total = 0;
+            let more_in_the_air = !line().line.is_empty();
+            let due = since.is_none_or(|at| at.elapsed() >= every);
+            if !more_in_the_air || due || waiting.len() > 4096 {
+                *since = Some(std::time::Instant::now());
+                for (shadow, lo, hi) in waiting.drain(..) {
+                    pieces.push((shadow, lo, hi, total));
+                    total += (hi - lo) as u64;
                 }
             }
         }
