@@ -323,6 +323,48 @@ pub(crate) fn card_room_kept() -> u64 {
 /// The copies in the card's memory.
 static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
 
+/// How many copies went to the card's memory so far ([`CARDED_AT`]).
+static CARDED_MADE: AtomicU64 = AtomicU64::new(0);
+
+/// The copies in the card's memory in the order of their title memory
+/// (start, end, the copy), the count of [`CARDED_MADE`] they were put in
+/// order at, and the longest of them: for [`send_copied`], which went
+/// through all of them, some 3,700, for every copy of the title's that a
+/// submission does itself.
+#[allow(clippy::type_complexity)]
+static CARDED_AT: Mutex<(u64, Vec<(usize, usize, std::sync::Weak<Shadow>)>, usize)> = Mutex::new((u64::MAX, Vec::new(), 0));
+
+/// The copies in the card's memory that hold some of title memory
+/// `[from, to)`.
+fn carded_over(from: usize, to: usize) -> Vec<Arc<Shadow>> {
+    let mut at = CARDED_AT.lock().unwrap_or_else(|e| e.into_inner());
+    let made = CARDED_MADE.load(Ordering::Acquire);
+    if at.0 != made {
+        let mut all: Vec<(usize, usize, std::sync::Weak<Shadow>)> = CARDED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter_map(|w| {
+                let shadow = w.upgrade()?;
+                Some((shadow.start as usize, (shadow.start + shadow.len) as usize, w.clone()))
+            })
+            .collect();
+        all.sort_unstable_by_key(|c| c.0);
+        let longest = all.iter().map(|c| c.1 - c.0).max().unwrap_or(0);
+        *at = (made, all, longest);
+    }
+    let (_, all, longest) = &*at;
+    // Those that begin before `to`, back to where none can reach `from`.
+    let before = all.partition_point(|c| c.0 < to);
+    all[..before]
+        .iter()
+        .rev()
+        .take_while(|c| c.0 + longest > from)
+        .filter(|c| c.1 > from)
+        .filter_map(|c| c.2.upgrade())
+        .collect()
+}
+
 /// Copies in the card's memory by address, for [`CARD_PENDING`].
 static CARDED_BY: std::sync::LazyLock<Mutex<std::collections::HashMap<usize, std::sync::Weak<Shadow>>>> =
     std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
@@ -341,6 +383,7 @@ fn card_pending() -> bool {
 /// A copy goes to the card's memory: known to [`card_dirty`].
 fn carded_insert(shadow: &Arc<Shadow>) {
     CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(shadow));
+    CARDED_MADE.fetch_add(1, Ordering::Release);
     CARDED_BY.lock().unwrap_or_else(|e| e.into_inner()).insert(Arc::as_ptr(shadow) as usize, Arc::downgrade(shadow));
 }
 
@@ -808,7 +851,7 @@ pub(crate) fn copy_all(copies: Vec<(usize, usize, usize)>) {
 /// CPU side held the same before or not. Left out is what shaders in the air
 /// may be writing (such a copy waits for them, or is done on the card).
 pub(crate) fn send_copied(dst: usize, len: usize) {
-    for shadow in carded_copies() {
+    for shadow in carded_over(dst, dst + len) {
         let (start, end) = (shadow.start as usize, (shadow.start + shadow.len) as usize);
         let (from, to) = (dst.max(start), (dst + len).min(end));
         if from >= to {
