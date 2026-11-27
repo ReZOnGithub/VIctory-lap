@@ -168,12 +168,11 @@ name to select it explicitly. With the launcher, pass
 Ported from [trustno1-coder/VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA)
 (NVIDIA Streamline: DLSS Super Resolution, DLSS Frame Generation, and AMD FSR 3
 frame generation). `Get-NVIDIA-DLSS.cmd` fetches NVIDIA's files once (about
-70 MB, from NVIDIA's own GitHub, into `nvidia-sdk\`, which is not committed).
-Then, before `victory.exe run ...`:
+70 MB, from NVIDIA's own GitHub, into the `nvidia-sdk` folder, which is not
+committed). Then, before `victory.exe run ...`:
 
 ```powershell
-$env:VICTORY_STREAMLINE_DIR = "$PWD
-vidia-sdk\Streamlineind"
+$env:VICTORY_STREAMLINE_DIR = "$PWD\nvidia-sdk\Streamline\bin\x64"
 $env:VICTORY_DLSS = '1'; $env:VICTORY_DLSS_MODE = 'quality'     # dlaa, quality, balanced, performance
 $env:VICTORY_FRAMEGEN = '1'; $env:VICTORY_FRAMEGEN_X = '2'      # 2 to 6 frames shown for each rendered (more than 2: RTX 50)
 ```
