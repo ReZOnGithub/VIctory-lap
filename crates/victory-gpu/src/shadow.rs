@@ -1505,8 +1505,15 @@ fn spin(there: impl Fn() -> bool) {
 }
 
 /// How many threads are kept for [`wide`].
+///
+/// `VICTORY_WIDE_THREADS=<n>` sets it; else half the logical processors,
+/// 2 to 8 (a quarter, as before, left an 8-core processor 4 threads for the
+/// refreshes and merges the submitting thread waits on).
 fn wide_threads() -> usize {
-    std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6)
+    if let Some(n) = std::env::var("VICTORY_WIDE_THREADS").ok().and_then(|v| v.trim().parse::<usize>().ok()) {
+        return n.clamp(1, 32);
+    }
+    std::thread::available_parallelism().map_or(4, |n| n.get() / 2).clamp(2, 8)
 }
 
 fn workers() -> &'static Workers {
