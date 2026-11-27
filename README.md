@@ -36,7 +36,7 @@ Tested on one machine: Windows 10, Ryzen 7 3700X, 32 GB RAM, **GeForce RTX
 | | |
 |---|---|
 | How far it plays | Boot, menus, the prison opening and its cutscenes, on to **the first boat mission** (driving the boat in open water), where testing is now |
-| Frame rate at the boat mission | **21 to 22 fps** (21.3 to 22.0 at 3,450 draws a frame) |
+| Frame rate at the boat mission | **about 22 fps** (runs average 21.5 to 22.3 at 3,500 draws a frame; single readings 20.3 to 22.7) |
 | Frame rate in the prison opening | about 9 fps (4,500 draws a frame) |
 | Menus and videos | 30 to 60 fps |
 | Memory | 24 to 27 GB of private memory: a 32 GB PC pages now and then; 64 GB is comfortable |
@@ -78,7 +78,8 @@ under Windows 10 it crashed at boot, then ran at 2.5 fps. Step by step:
 | Sends on a thread of their own; D3D12 breadcrumbs off; the write watch asked early | | 17.3 to 17.5 |
 | What shaders write into buffers of 16 MB and more is no longer read back into the title's memory (`VICTORY_LAND_NOT_MB`) | | 19.1 to 19.8 |
 | The same from 1 MB, and no compare pass on the card for those | | 20.4 to 21.1 |
-| The same from 64 KB | | **21.3 to 22.0** |
+| The same from 64 KB | | 21.0 to 21.6 |
+| Guarded textures hashed again every 64th frame, not every 8th | | **21.5 to 22.3** |
 
 - **Windows 10 boot fix:** the Agility SDK export (`apps/victory/build.rs`,
   `src/agility.rs`). Without it Windows 10's D3D12 refuses the boot screen's

@@ -733,6 +733,12 @@ fn nv_defaults() {
         // white (h17). `VICTORY_LAND_NOT_KB=100000000` brings everything
         // down again, if a scene needs it.
         ("VICTORY_LAND_NOT_KB", "64"),
+        // Textures in guarded memory are hashed again every 64th frame, not
+        // every 8th, for changes their guard cannot see: 37 MB a frame
+        // hashed at the boat, none such found; 4 MB with this, 21.0 to 21.9
+        // fps (runs p0, t1, t3). A texture changed that way shows up to two
+        // seconds later than before.
+        ("VICTORY_TEXTURE_HASH_EVERY", "64"),
     ];
     for &(name, value) in SET {
         if std::env::var_os(name).is_none() {
