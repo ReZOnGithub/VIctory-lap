@@ -10,18 +10,14 @@ developer or publisher.
 
 ## Credits
 
-Nearly everything here is other people's work:
+Built on:
 
-- **[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)**:
-  the tree this fork is built on. The "renderer ports" (the title's descriptor
-  stores reporting their slots, the guards' and journal's lock work), the
-  lighting and texture work that gives the picture below, the frame timeline
-  and the launcher are Belobug's.
-- **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)** and its
-  contributors: the frame-rate work under that (flights, the relay, card
-  copies, async submission).
-- **[Marvisak/VIctory](https://github.com/Marvisak/VIctory)** and its
-  contributors: the layer itself, the shader translator, the host copies.
+- [Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD),
+  the tree this fork starts from.
+- [fxceless/victory-fork](https://github.com/fxceless/victory-fork) and its
+  contributors.
+- [Marvisak/VIctory](https://github.com/Marvisak/VIctory) and its
+  contributors, the original layer.
 - Ideas from [stellarr-studio/kelvaroq](https://github.com/stellarr-studio/kelvaroq)
   and [xcl-dev/xcl](https://github.com/xcl-dev/xcl).
 
