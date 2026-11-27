@@ -2762,8 +2762,48 @@ mod merge_tests {
 /// snapshot still holds) and the bytes of title memory they copy.
 static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+/// Whether the copies with ranges shaders may be writing are kept in
+/// [`PENDING_COPIES`] (`VICTORY_PENDING_SET=0` turns it off; on by default).
+///
+/// Without it `crate::host::stale_under_flights` asks every copy the lists
+/// refresh, some 21,000 refreshes of 4,500 copies a submission, whether a
+/// flight's shaders may write it: 1.16 ms a frame in run fg2 (rt4 1.09,
+/// base1 1.05) for the few copies that are.
+pub(crate) fn pending_set() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PENDING_SET").is_none_or(|v| v != "0"))
+}
+
+/// With [`pending_set`]: the addresses of the copies whose `pending` is not
+/// empty. Changed only under the copy's lock on `pending`, on its change
+/// from empty to not and back, and on the copy's drop.
+static PENDING_COPIES: Mutex<std::collections::HashSet<usize, std::hash::BuildHasherDefault<crate::host::AddressHash>>> =
+    Mutex::new(std::collections::HashSet::with_hasher(std::hash::BuildHasherDefault::new()));
+
+fn pending_copies_add(shadow: &Shadow) {
+    if pending_set() {
+        PENDING_COPIES.lock().unwrap_or_else(|e| e.into_inner()).insert(shadow as *const Shadow as usize);
+    }
+}
+
+fn pending_copies_remove(shadow: &Shadow) {
+    if pending_set() {
+        PENDING_COPIES.lock().unwrap_or_else(|e| e.into_inner()).remove(&(shadow as *const Shadow as usize));
+    }
+}
+
+/// With [`pending_set`], the addresses of the copies shaders of a
+/// submission not yet copied back may be writing, as now
+/// ([`Shadow::writes_pending`] still says for each); `None` without it.
+pub(crate) fn pending_copies() -> Option<std::collections::HashSet<usize, std::hash::BuildHasherDefault<crate::host::AddressHash>>> {
+    pending_set().then(|| PENDING_COPIES.lock().unwrap_or_else(|e| e.into_inner()).clone())
+}
+
 impl Drop for Shadow {
     fn drop(&mut self) {
+        // First, whatever follows: a copy may go with `pending` not empty,
+        // and another may be made at its address.
+        pending_copies_remove(self);
         if self.place.is_some() {
             // Never counted with the copies (`Shadow::placed`).
             crate::inplace::gone(self.window, self.len);
@@ -2784,8 +2824,11 @@ impl Drop for Shadow {
             } else {
                 CARD_BYTES[0].fetch_sub(card.size, Ordering::Relaxed);
             }
-            if card.before.get_mut().unwrap_or_else(|e| e.into_inner()).is_some() {
+            // (No list that used it is still to run: the submissions hold
+            // their copies until they are done.)
+            if let Some(before) = card.before.get_mut().unwrap_or_else(|e| e.into_inner()).take() {
                 CARD_BYTES[1].fetch_sub(card_hash_bytes(card.size), Ordering::Relaxed);
+                crate::host::hash_buffer_back(before);
             }
         }
     }
@@ -3417,7 +3460,11 @@ impl Shadow {
         // the card (`Host::card_before` reads the declared ranges from the
         // lists).
         if self.card.is_some() {
+            let was_empty = pending.is_empty();
             pending.push(range);
+            if was_empty {
+                pending_copies_add(self);
+            }
             return;
         }
         // The parts no declared range holds yet: their bytes are taken now,
@@ -3441,7 +3488,11 @@ impl Shadow {
             }
             parts = rest;
         }
+        let was_empty = pending.is_empty();
         pending.push(range);
+        if was_empty {
+            pending_copies_add(self);
+        }
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
         let total = self.len as usize;
@@ -3730,6 +3781,10 @@ impl Shadow {
             pending.retain(|r| free.binary_search(r).is_err());
         } else {
             pending.retain(|r| !ranges.contains(r));
+        }
+        // Still under the lock on `pending`, as where it was filled.
+        if pending.is_empty() {
+            pending_copies_remove(self);
         }
         if !pending.is_empty() || self.card.is_some() {
             return;

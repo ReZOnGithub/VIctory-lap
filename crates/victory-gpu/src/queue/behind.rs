@@ -560,8 +560,12 @@ enum Job {
     /// the parts of it are known when they are.
     Lists(usize, Recordings),
     /// Parts taken along with a submission ([`crate::host::joins`]): where they
-    /// begin in the order, and the signals given behind them.
-    Joined(usize, Vec<crate::list::Detached>, Vec<usize>, Vec<usize>, Vec<(usize, u64)>),
+    /// begin in the order, the signals given behind them, and (with
+    /// `crate::host::list_summary`, once a part was asked about) what the
+    /// lists so far may write ([`crate::host::writes_of`]), so that it is
+    /// not found again from all of them for each part asked about (bop4:
+    /// 0.28 ms a frame of `declared_writes` under `joinable`).
+    Joined(usize, Vec<crate::list::Detached>, Vec<usize>, Vec<usize>, Vec<(usize, u64)>, Option<Vec<(usize, usize)>>),
     /// A signal of the queue's.
     Signal(usize, u64),
     /// A frame is shown: the base texture (and optional overlay plane) and the states their lists leave them in.
@@ -689,11 +693,13 @@ impl Work for Job {
             return Err(next);
         }
         // Nothing but waits and signals that a submission may follow.
-        let (count, lists, signals) = match self {
-            Job::Run(_, lists, order) => (1, (&*lists, &*order), &[][..]),
-            Job::Joined(_, lists, order, parts, signals) => (1 + parts.len(), (&*lists, &*order), &signals[..]),
+        let (count, lists, signals, written) = match self {
+            Job::Run(_, lists, order) => (1, (&*lists, &*order), &[][..], None),
+            Job::Joined(_, lists, order, parts, signals, written) => (1 + parts.len(), (&*lists, &*order), &signals[..], written.as_ref()),
             _ => return Err(next),
         };
+        // What the lists so far may write, if found here (not kept yet).
+        let mut found: Option<Vec<(usize, usize)>> = None;
         let hosts = || lists.1.iter().map(|&i| lists.0[i].host());
         match &next {
             Job::Value(wait) => {
@@ -714,7 +720,22 @@ impl Work for Job {
             Job::Signal(..) => {}
             Job::Run(_, more, order) => {
                 let runs: Vec<&crate::host::HostList> = order.iter().map(|&i| more[i].host()).collect();
-                if count >= most || lists.1.len() + runs.len() > most_lists || !crate::host::joinable(hosts(), &runs) {
+                if count >= most || lists.1.len() + runs.len() > most_lists {
+                    join_end(4);
+                    return Err(next);
+                }
+                let joinable = if crate::host::list_summary() {
+                    // (The part's own question first, as `joinable` asks it.)
+                    !crate::host::writes_title(&runs) && {
+                        if written.is_none() {
+                            found = Some(crate::host::writes_of(hosts()));
+                        }
+                        written.or(found.as_ref()).is_some_and(|w| crate::host::joinable_with(w, &runs))
+                    }
+                } else {
+                    crate::host::joinable(hosts(), &runs)
+                };
+                if !joinable {
                     join_end(4);
                     return Err(next);
                 }
@@ -733,17 +754,23 @@ impl Work for Job {
             }
         }
         let taken = std::mem::replace(self, Job::Wait(0, 0));
-        let (queue, mut lists, mut order, mut parts, mut signals) = match taken {
-            Job::Run(queue, lists, order) => (queue, lists, order, Vec::new(), Vec::new()),
-            Job::Joined(queue, lists, order, parts, signals) => (queue, lists, order, parts, signals),
+        let (queue, mut lists, mut order, mut parts, mut signals, written) = match taken {
+            Job::Run(queue, lists, order) => (queue, lists, order, Vec::new(), Vec::new(), None),
+            Job::Joined(queue, lists, order, parts, signals, written) => (queue, lists, order, parts, signals, written),
             other => {
                 *self = other;
                 return Err(next);
             }
         };
         let run = matches!(next, Job::Run(..));
+        let mut written = written.or(found);
         match next {
             Job::Run(_, more, then) => {
+                // (The ranges of the lists so far, kept or found above: the new
+                // part's are joined to them.)
+                if let Some(written) = &mut written {
+                    crate::host::join_more(written, crate::host::writes_of(then.iter().map(|&i| more[i].host())));
+                }
                 parts.push(order.len());
                 order.extend(then.into_iter().map(|i| i + lists.len()));
                 lists.extend(more);
@@ -752,7 +779,7 @@ impl Work for Job {
             Job::Signal(fence, value) => signals.push((fence, value)),
             _ => {}
         }
-        *self = Job::Joined(queue, lists, order, parts, signals);
+        *self = Job::Joined(queue, lists, order, parts, signals, written);
         Ok(run)
     }
 
@@ -785,7 +812,7 @@ impl Work for Job {
                 }
                 QUEUED.fetch_sub(1, Relaxed);
             }
-            Job::Joined(queue, lists, order, parts, signals) => {
+            Job::Joined(queue, lists, order, parts, signals, _) => {
                 let _ = queue;
                 #[cfg(feature = "diagnostics")]
                 crate::capture::op(queue, || {
