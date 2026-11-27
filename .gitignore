@@ -76,3 +76,7 @@
 *.swp
 Thumbs.db
 .DS_Store
+
+# NVIDIA and AMD run-time files each user fetches (Get-NVIDIA-DLSS.cmd): never committed.
+/nvidia-sdk/
+/amd-sdk/

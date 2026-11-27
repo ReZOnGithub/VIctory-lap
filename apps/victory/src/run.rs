@@ -7,6 +7,8 @@ use crate::{Console, Unimplemented};
 #[cfg(windows)]
 #[path = "fsr_4k.rs"]
 mod fsr_4k;
+#[path = "native_1440p.rs"]
+mod native_1440p;
 
 #[cfg(any(windows, test))]
 const SKIP_CPU_CHECK_ENV: &str = "VICTORY_SKIP_CPU_CHECK";
@@ -59,6 +61,26 @@ pub fn run(
     let cfg = victory_core::Config::load()?;
     nv_defaults();
     let fsr = fsr_4k::FsrPreset::requested()?;
+    // DLSS and frame generation (`VICTORY_DLSS`, `VICTORY_FRAMEGEN`; from
+    // trustno1-coder/VIctory-NVIDIA): Streamline is loaded before anything of
+    // the title or the host GPU, and fails soft; only if it offers one of
+    // them does the title render through its FidelityFX path, which DLSS
+    // takes over (`native_1440p::prepare_upscaler`).
+    let mut asked = victory_hle::streamline::Asked::from_env().map_err(anyhow::Error::msg)?;
+    asked.series_s = matches!(console, Console::SeriesS);
+    let available = victory_hle::streamline::init(&asked);
+    let upscaler = (available.dlss || available.framegen || available.fsr_framegen).then_some(asked.mode);
+    for (i, line) in victory_hle::streamline::notice_at_start().iter().enumerate() {
+        println!("{}{line}", if i == 0 { "frame gen      " } else { "               " });
+    }
+    if asked.any() {
+        println!(
+            "upscaling      DLSS {}, frame generation {}{}",
+            if available.dlss { "on" } else if asked.dlss { "asked, not available" } else { "off" },
+            if available.framegen { "on" } else if asked.framegen { "asked, not available" } else { "off" },
+            upscaler.map(|m| format!(", scene at the {} scale ({})", m.name(), m.scale())).unwrap_or_default()
+        );
+    }
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let mut prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
@@ -69,21 +91,21 @@ pub fn run(
 
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
-    let image = if let Some(preset) = fsr {
-        anyhow::ensure!(matches!(console, Console::SeriesX), "FSR 4K requires Series X mode");
-        fsr_4k::prepare_fsr_4k(&mut prepared, preset)?;
-        let dir = cfg.fidelityfx_dir.as_deref().context(
-            "FSR 4K requires amd_fidelityfx_upscaler_dx12.dll. Set VICTORY_FIDELITYFX_DIR or [paths].fidelityfx_dir to its folder.",
-        )?;
-        // Select the provider before the first lookup builds the import registry.
-        victory_hle::modules::fidelityfx::use_host_dir(dir)
-            .map_err(anyhow::Error::msg)
-            .with_context(|| format!("loading FSR 4.1.2 from {}", dir.display()))?;
-        // SAFETY: Windows supports setting the environment across threads.
-        // No title code has run or queried DXGI yet.
-        unsafe { std::env::set_var("VICTORY_DISPLAY_MODE", "3840x2160") };
-        let cache = cfg.cache_subdir(&format!("images/fsr-{}-4k-sdr", preset.name()))?;
-        victory_loader::load(&prepared, &cache)?
+    // (The PC FSR 4 bridge of `-Fsr4K` went with the FidelityFX module that
+    // served it: DLSS and frame generation take the title's upscaling now.)
+    anyhow::ensure!(fsr.is_none(), "FSR 4K is not in this build any more: use VICTORY_DLSS=1 (README)");
+    let image = if let Some(mode) = upscaler {
+        match native_1440p::prepare_upscaler(&mut prepared, mode) {
+            Ok(()) => {
+                println!("display        the title's output, scene at {} of it through its FidelityFX path ({})", mode.scale(), mode.name());
+                let cache = cfg.cache_subdir(&format!("images/upscaler-{}", mode.name()))?;
+                victory_loader::load(&prepared, &cache)?
+            }
+            Err(e) => {
+                println!("upscaling      the title's FidelityFX path was not patched in: {e:#}");
+                victory_loader::load(&prepared, &images)?
+            }
+        }
     } else {
         victory_loader::load(&prepared, &images)?
     };
@@ -185,7 +207,10 @@ pub fn run(
         show(name, dll.bind_imports(&with_dlls, policy)?);
     }
     let exe_name = exe.file_name().unwrap_or_default().to_string_lossy();
-    show(&exe_name, image.bind_imports(&with_dlls, policy)?);
+    // The title's FidelityFX calls go through ours when DLSS or frame
+    // generation is on (bound as before otherwise).
+    let interposed = victory_hle::modules::fidelityfx::Interpose { inner: &with_dlls };
+    show(&exe_name, image.bind_imports(&interposed, policy)?);
     if execute {
         let size = image.info().size_of_image as usize;
         // SAFETY: the image stays mapped, and nothing of it has run yet.

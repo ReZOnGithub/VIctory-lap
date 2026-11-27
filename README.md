@@ -163,6 +163,29 @@ name, PCI vendor and device IDs, and dedicated VRAM. Set
 name to select it explicitly. With the launcher, pass
 `-More @{VICTORY_D3D12_ADAPTER='NVIDIA'}`.
 
+### DLSS and frame generation
+
+Ported from [trustno1-coder/VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA)
+(NVIDIA Streamline: DLSS Super Resolution, DLSS Frame Generation, and AMD FSR 3
+frame generation). `Get-NVIDIA-DLSS.cmd` fetches NVIDIA's files once (about
+70 MB, from NVIDIA's own GitHub, into `nvidia-sdk\`, which is not committed).
+Then, before `victory.exe run ...`:
+
+```powershell
+$env:VICTORY_STREAMLINE_DIR = "$PWD
+vidia-sdk\Streamlineind"
+$env:VICTORY_DLSS = '1'; $env:VICTORY_DLSS_MODE = 'quality'     # dlaa, quality, balanced, performance
+$env:VICTORY_FRAMEGEN = '1'; $env:VICTORY_FRAMEGEN_X = '2'      # 2 to 6 frames shown for each rendered (more than 2: RTX 50)
+```
+
+- DLSS in place of the title's own upscaling is tested here (RTX 5070,
+  Series S profile): one DLSS pass a frame, the picture right, the card about
+  55 % busy instead of 66 %; the frame rate stays what the CPU gives.
+- DLSS Frame Generation needs an RTX 40 or later **and Windows' "Hardware-
+  accelerated GPU scheduling" switched on** (Settings, System, Display,
+  Graphics, then restart). With it off Streamline refuses frame generation
+  and the layer says so at the start. Not yet measured here for that reason.
+
 For 3 % more frames (21.0 to 21.7 fps at the boat mission here), a
 profile-guided build: `scripts\pgo.ps1 -Step train -Exe <path>` runs a
 counting build for some minutes while you play, `scripts\pgo.ps1 -Step build`
