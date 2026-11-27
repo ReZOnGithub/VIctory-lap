@@ -3548,6 +3548,31 @@ pub(crate) fn late_met(wait: &crate::list::ValueWait) -> bool {
     wait.met()
 }
 
+/// Diagnostics: what a wait that is not met sees among the flights (said
+/// for every 400th such look): whether anything is in the air, whether
+/// shaders may write its place, and the flights' writes that touch it.
+pub(crate) fn late_why(wait: &crate::list::ValueWait) {
+    static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if SEEN.fetch_add(1, Ordering::Relaxed) % 400 != 0 {
+        return;
+    }
+    let (address, bytes) = wait.place();
+    let line = line();
+    let shaders = touches(&line.written, address, address + bytes);
+    let mut writes = Vec::new();
+    for (at, what, n) in line.in_hand.iter().map(|(at, what, n)| (at, what, n)).chain(line.line.iter().filter_map(|item| match item {
+        Late::Write(at, what, n) => Some((at, what, n)),
+        _ => None,
+    })) {
+        if *at < address + bytes && address < *at + *n {
+            writes.push(format!("{at:#x}+{n} {what:?}"));
+        }
+    }
+    let (in_air, in_hand) = (line.line.len(), line.in_hand.len());
+    drop(line);
+    tracing::info!(?wait, in_air, in_hand, shaders, ?writes, known = ?late_met_known(wait), "a value wait the line stands at");
+}
+
 /// [`late_met`] without a wait for the card; `None`: it has to be waited for.
 pub(crate) fn late_met_known(wait: &crate::list::ValueWait) -> Option<bool> {
     let (address, bytes) = wait.place();

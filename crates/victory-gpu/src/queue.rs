@@ -480,7 +480,11 @@ pub(crate) fn behind_line(frames: f64) {
 /// will once those in the air have run.
 #[cfg(windows)]
 fn value_met(wait: &crate::list::ValueWait) -> bool {
-    wait.met() || (crate::host::late() && crate::host::late_met(wait))
+    let met = wait.met() || (crate::host::late() && crate::host::late_met(wait));
+    if !met {
+        crate::host::late_why(wait);
+    }
+    met
 }
 
 fn queue<'a>(this: This) -> &'a Queue {

@@ -270,6 +270,8 @@ impl<W: Work> Lane<W> {
 
     /// Looks at the line for as long as the process runs.
     fn serve(&self) -> ! {
+        // Since when it stands at something with entries in the line.
+        let mut standing: Option<Instant> = None;
         loop {
             let (asked, limit) = {
                 let mut state = self.lock();
@@ -281,6 +283,23 @@ impl<W: Work> Lane<W> {
                     } else {
                         let began = Instant::now();
                         let kind = state.items.front().map_or(0, |e| e.what.idle_kind());
+                        // The first milliseconds of standing it looks again
+                        // at once, awake ([`stand_spin`]): what it stands at
+                        // is mostly a value the title's processor writes a
+                        // moment after a flight landed, some twenty times a
+                        // frame, and a sleep of a millisecond each time was
+                        // a third of the frame (run bo1, the boat).
+                        let since = *standing.get_or_insert(began);
+                        if since.elapsed() < stand_spin() {
+                            drop(state);
+                            for _ in 0..64 {
+                                std::hint::spin_loop();
+                            }
+                            std::thread::yield_now();
+                            IDLE[1 + kind.min(4)].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
+                            state = self.lock();
+                            break;
+                        }
                         // It stands at something the CPU may write without
                         // a call of ours.
                         let (back, out) =
@@ -295,7 +314,9 @@ impl<W: Work> Lane<W> {
                 }
                 (state.asked, state.next)
             };
-            self.look(limit);
+            if self.look(limit) {
+                standing = None;
+            }
             let mut state = self.lock();
             state.served = state.served.max(asked);
             drop(state);
@@ -304,8 +325,12 @@ impl<W: Work> Lane<W> {
     }
 
     /// Does what is free to run of the entries before number `limit`.
-    pub(super) fn look(&self, limit: u64) {
-        while self.step(limit) {}
+    pub(super) fn look(&self, limit: u64) -> bool {
+        let mut any = false;
+        while self.step(limit) {
+            any = true;
+        }
+        any
     }
 
     /// The parts of `entry`, which stands for them, in place `at`.
@@ -472,6 +497,14 @@ pub(crate) static JOIN_END: [std::sync::atomic::AtomicU64; 8] = [const { std::sy
 /// wait, lists being translated, a submission or present; and the 1 ms
 /// looks that ran out.
 pub(crate) static IDLE: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+
+/// How long the line's thread looks again awake when it stands at
+/// something (`VICTORY_STAND_SPIN_US`, 3000 unless set; 0: a look every
+/// millisecond, as before).
+fn stand_spin() -> Duration {
+    static US: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    Duration::from_micros(*US.get_or_init(|| number("VICTORY_STAND_SPIN_US").map_or(3000, |n| n as u64)))
+}
 
 fn join_end(i: usize) {
     JOIN_END[i].fetch_add(1, Relaxed);
