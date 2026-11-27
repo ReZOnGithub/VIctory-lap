@@ -777,6 +777,13 @@ fn nv_defaults() {
         // the world, as seen in play; with ray tracing 128 KB is no faster
         // than 1 MB, runs rt4 and rt6.)
         ("VICTORY_LAND_NOT_KB", "1024"),
+        // Preludes recorded on the sending thread and the early asking in
+        // runs, large ranges asked apart: the submitting thread worked 41.6 ms
+        // a frame without them and 37.2 with them (runs n5 and n4), the
+        // picture the same (captures of run n10).
+        ("VICTORY_PRELUDE_BESIDE", "1"),
+        ("VICTORY_EARLY_RUNS", "1"),
+        ("VICTORY_ASK_RUNS_APART", "1"),
         // Textures in guarded memory are hashed again every 64th frame, not
         // every 8th, for changes their guard cannot see: 37 MB a frame
         // hashed at the boat, none such found; 4 MB with this, 21.0 to 21.9
