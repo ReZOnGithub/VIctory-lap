@@ -2428,6 +2428,91 @@ fn close_beside() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_CLOSE_BESIDE").is_none_or(|v| v != "0"))
 }
 
+/// Whether a submission sent ahead goes to the card's queue on a thread of
+/// its own (`VICTORY_SEND_BESIDE`, on unless `0`): the driver's part of
+/// `ExecuteCommandLists` and the signals behind it, some 3 ms of the 60 a
+/// frame of the thread that prepares submissions took at the title's boat
+/// mission (profile bop3), while that thread prepares the next one. The
+/// sends keep their order (one thread, one line); whatever else goes to the
+/// queue, or needs what was sent to be on it, waits for the line to be
+/// empty first ([`send_flush`]).
+fn send_beside() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SEND_BESIDE").is_none_or(|v| v != "0"))
+}
+
+/// A send for the sending thread.
+struct Sending(Box<dyn FnOnce()>);
+// SAFETY: D3D12 queues, lists and fences are free-threaded; the lists are
+// closed and nothing resets them before the fence signalled behind them has
+// passed.
+unsafe impl Send for Sending {}
+
+/// The sending thread's line: how many sends were given and how many are done.
+struct Sender {
+    line: Mutex<(std::collections::VecDeque<Sending>, u64, u64)>,
+    more: std::sync::Condvar,
+    done: std::sync::Condvar,
+}
+
+fn sender() -> &'static Sender {
+    static SENDER: OnceLock<Sender> = OnceLock::new();
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    let sender = SENDER.get_or_init(|| Sender {
+        line: Mutex::new((std::collections::VecDeque::new(), 0, 0)),
+        more: std::sync::Condvar::new(),
+        done: std::sync::Condvar::new(),
+    });
+    STARTED.call_once(|| {
+        let _ = std::thread::Builder::new().name("victory-send".into()).spawn(|| {
+            crate::cores::keep_on_fast_cores("victory-send");
+            let sender = SENDER.get().expect("made above");
+            loop {
+                let job = {
+                    let mut line = sender.line.lock().unwrap_or_else(|e| e.into_inner());
+                    loop {
+                        if let Some(job) = line.0.pop_front() {
+                            break job;
+                        }
+                        line = sender.more.wait(line).unwrap_or_else(|e| e.into_inner());
+                    }
+                };
+                {
+                    let _sending = crate::timeline::span("sending, beside");
+                    (job.0)();
+                }
+                sender.line.lock().unwrap_or_else(|e| e.into_inner()).2 += 1;
+                sender.done.notify_all();
+            }
+        });
+    });
+    sender
+}
+
+/// Gives `send` to the sending thread.
+fn send_later(send: Box<dyn FnOnce()>) {
+    let sender = sender();
+    {
+        let mut line = sender.line.lock().unwrap_or_else(|e| e.into_inner());
+        line.0.push_back(Sending(send));
+        line.1 += 1;
+    }
+    sender.more.notify_one();
+}
+
+/// Returns when every send given to the sending thread is on the queue.
+pub(crate) fn send_flush() {
+    if !send_beside() {
+        return;
+    }
+    let sender = sender();
+    let mut line = sender.line.lock().unwrap_or_else(|e| e.into_inner());
+    let given = line.1;
+    while line.2 < given {
+        line = sender.done.wait(line).unwrap_or_else(|e| e.into_inner());
+    }
+}
+
 /// A list to close beside, and what says it is done.
 struct Closing {
     list: ID3D12GraphicsCommandList,
@@ -4671,6 +4756,8 @@ impl Host {
         // (Of a copy with a declared range here, that says it.)
         let looked: Vec<&crate::picked::Range> =
             picked.looked.iter().filter(|l| !declared.iter().any(|(s, _)| Arc::ptr_eq(s, &l.0))).collect();
+        // (Behind the lists of the submission before: `send_beside`.)
+        send_flush();
         // With the relay: the order of the queue is held from here until
         // what is taken is on the queue, and the taking is numbered.
         let mut order = relay().then(|| QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
@@ -5493,6 +5580,7 @@ impl Host {
                         list.CopyBufferRegion(fetched, at, &plan.ranges[i].shadow.buffer, lo as u64, (hi - lo) as u64);
                     }
                     list.Close()?;
+                    send_flush();
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     self.card_sent();
                     *submitted += 1;
@@ -6180,19 +6268,43 @@ impl Host {
                 firsts.iter_mut().for_each(|first| *first += 1);
             }
             let cuts: Vec<usize> = parts.iter().filter_map(|&n| firsts.get(n).copied()).collect();
-            // SAFETY: closed lists; the fence is ours.
-            let signalled = unsafe {
-                let mut from = 0;
-                for to in cuts.into_iter().chain([lists.len()]) {
-                    self.queue.ExecuteCommandLists(&lists[from..to]);
-                    from = to;
-                }
-                self.queue.Signal(&self.fence, *submitted)
+            let value = *submitted;
+            let signalled: windows::core::Result<()> = if send_beside() {
+                let lists = std::mem::take(&mut lists);
+                send_later(Box::new(move || {
+                    let Some(host) = host() else { return };
+                    // SAFETY: closed lists; the fence is ours.
+                    let signalled = unsafe {
+                        let mut from = 0;
+                        for to in cuts.into_iter().chain([lists.len()]) {
+                            host.queue.ExecuteCommandLists(&lists[from..to]);
+                            from = to;
+                        }
+                        host.queue.Signal(&host.fence, value)
+                    };
+                    awake::sent(&host.device);
+                    host.card_sent();
+                    if let Err(e) = signalled {
+                        fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
+                    }
+                }));
+                Ok(())
+            } else {
+                // SAFETY: closed lists; the fence is ours.
+                let signalled = unsafe {
+                    let mut from = 0;
+                    for to in cuts.into_iter().chain([lists.len()]) {
+                        self.queue.ExecuteCommandLists(&lists[from..to]);
+                        from = to;
+                    }
+                    self.queue.Signal(&self.fence, value)
+                };
+                awake::sent(&self.device);
+                self.card_sent();
+                signalled
             };
-            awake::sent(&self.device);
             #[cfg(feature = "diagnostics")]
             crate::timeline::sent(sending, *submitted, stamp);
-            self.card_sent();
             stage.next("submit: noting what is in the air");
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
@@ -6237,6 +6349,7 @@ impl Host {
         };
         #[cfg(not(feature = "diagnostics"))]
         let groups = [(&lists[..], ())];
+        send_flush();
         submitting(2, runs.len());
         for (_i, &(group, _kind)) in groups.iter().enumerate() {
             *submitted += 1;
@@ -9452,6 +9565,7 @@ impl Host {
     /// in order with the lists (`crate::tiles`: a texture's levels are
     /// given memory ahead of the list that uploads them).
     pub(crate) fn queue(&self) -> &ID3D12CommandQueue {
+        send_flush();
         &self.queue
     }
 
@@ -10279,6 +10393,7 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
+            send_flush();
             let status = p.swap_chain.Present(0, DXGI_PRESENT(0));
             showing.next("the frame meter");
             if status == windows::Win32::Foundation::S_OK {
