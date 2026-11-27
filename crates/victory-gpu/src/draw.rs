@@ -3626,6 +3626,7 @@ impl State {
                                 TABLE_HITS.swap(0, Ordering::Relaxed) as f64 / f,
                                 if table_by_content() { "on" } else { "off" }
                             );
+                            kept_line(f);
                             *g = Some((std::time::Instant::now(), frame));
                         }
                     }
@@ -3656,6 +3657,7 @@ impl State {
                         TABLE_HITS.swap(0, Ordering::Relaxed) as f64 / f,
                         if table_by_content() { "on" } else { "off" }
                     );
+                    kept_line(f);
                     g.2 = [0; 4];
                     g.3 = Some(std::time::Instant::now());
                 }
@@ -4502,6 +4504,29 @@ struct FreshTable {
 /// Tables found made already in their list, since the last line.
 #[cfg(feature = "diagnostics")]
 static TABLE_HITS: AtomicU64 = AtomicU64::new(0);
+
+/// Beside the "tables made afresh" line, over `f` frames: what the views a
+/// thread keeps across recordings (`VICTORY_VIEWS_KEPT`) and the lock-free
+/// keep of dynamic slots (`VICTORY_KEEP_FAST`) did. The disagreements of
+/// `check` must be 0.
+#[cfg(feature = "diagnostics")]
+fn kept_line(f: f64) {
+    let [same, kept, remade, dropped, made, cleared, differed] = crate::descriptor::host::views_kept_counts();
+    let [held, not_held] = crate::descriptor::host::keep_fast_counts();
+    let per = |n: u64| n as f64 / f;
+    tracing::info!(
+        "views per frame (VICTORY_VIEWS_KEPT {}): {:.0} found in their recording, {:.0} kept from an earlier one, {:.0} made anew for another basis, {:.0} dropped (the record names no view or another), {:.0} made first; {} maps cleared full; check disagreements {differed}; dynamic slots holding what they keep already (VICTORY_KEEP_FAST): {:.0} of {:.0}",
+        crate::descriptor::host::views_kept_mode(),
+        per(same),
+        per(kept),
+        per(remade),
+        per(dropped),
+        per(made),
+        cleared,
+        per(held),
+        per(held + not_held),
+    );
+}
 
 /// Whether a list knows a table it made by its records alone, not by where
 /// the title has it (`VICTORY_TABLE_BY_CONTENT=1`; off: measured no fewer tables, run bo12, they differ by their constant buffers). The title's
