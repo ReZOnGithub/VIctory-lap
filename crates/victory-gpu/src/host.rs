@@ -1353,6 +1353,11 @@ pub(crate) struct HostList {
     /// The list that runs those transitions just before this one, made
     /// when the list first has such transitions ([`lazy_prelude`]).
     prelude: OnceLock<Option<Prelude>>,
+    /// How many of this list's preludes are still to be recorded and sent
+    /// on the sending thread ([`PreludeRecord`]). A prelude recorded on the
+    /// submitting thread meanwhile waits for them to be sent first, or it
+    /// would reset the list under a record that has not run yet.
+    prelude_due: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: std::sync::Arc<Mutex<std::collections::BTreeSet<String>>>,
     /// What its indirect executions ran, for the report of a removed device.
@@ -1399,6 +1404,93 @@ pub(crate) struct HostList {
 
 /// A list's prelude: an allocator and a closed list.
 type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
+
+/// Whether a submission's preludes are recorded on the sending thread, in
+/// the same send as the `ExecuteCommandLists` that runs them
+/// (`VICTORY_PRELUDE_BESIDE=1`; off until an A/B run shows it clean). Only
+/// for submissions sent ahead with [`send_beside`]. The submitting thread
+/// still works out the barriers, the twin copies and the textures' states;
+/// only the driver calls move. Those were 4.96 ms a frame of the thread that
+/// prepares submissions at the boat mission (profile bop4: the allocator and
+/// list resets, the barriers, the twins' and the uploads' copies and the
+/// close). A prelude whose uploads have a level prefill from the texture
+/// store (`crate::texstore`) is still recorded here: the prefill sets how
+/// many levels the views made in the heap sync of this same submission show.
+fn prelude_beside() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| send_beside() && std::env::var_os("VICTORY_PRELUDE_BESIDE").is_some_and(|v| v == "1"))
+}
+
+/// What a prelude records, worked out on the submitting thread
+/// ([`HostList::prelude`]) and recorded on the sending thread just before
+/// its submission goes to the queue ([`prelude_beside`]). It owns what the
+/// commands name: the barriers hold borrowed pointers, so the textures they
+/// name are held here until the record has been sent.
+struct PreludeRecord {
+    allocator: ID3D12CommandAllocator,
+    list: ID3D12GraphicsCommandList,
+    aliasing: Vec<D3D12_RESOURCE_BARRIER>,
+    to_copy: Vec<D3D12_RESOURCE_BARRIER>,
+    barriers: Vec<D3D12_RESOURCE_BARRIER>,
+    /// The twin copies (depth texture, twin, whether into the twin).
+    syncs: Vec<(std::sync::Arc<crate::resource::HostTexture>, std::sync::Arc<crate::resource::Twin>, bool)>,
+    /// The uploads, none with a prefill; they hold their staging buffers
+    /// and host copies.
+    uploads: Vec<crate::texture::PreludeUpload>,
+    /// The other textures the barriers name (the list's own states).
+    _keep: Vec<std::sync::Arc<crate::resource::HostTexture>>,
+    /// The list's count of records still to run, less one when this one is
+    /// dropped (after its submission has gone to the queue).
+    due: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl PreludeRecord {
+    /// Records and closes the prelude, as [`HostList::prelude`] does when it
+    /// records there.
+    ///
+    /// # Safety
+    /// Called on the sending thread, before the `ExecuteCommandLists` of the
+    /// submission the prelude belongs to and after those of the list's
+    /// earlier submissions; nothing else records into the prelude meanwhile
+    /// (`HostList::prelude_due`).
+    unsafe fn record(&self) {
+        let (allocator, list) = (&self.allocator, &self.list);
+        // SAFETY: the prelude is not executing (its earlier submissions went
+        // to the queue before this, in the sending thread's order, as when it
+        // is recorded at submission); the textures and staging buffers are
+        // held by `self`.
+        let recorded = unsafe {
+            allocator.Reset().and_then(|()| {
+                list.Reset(allocator, None)?;
+                if !self.aliasing.is_empty() {
+                    list.ResourceBarrier(&self.aliasing);
+                }
+                if !self.to_copy.is_empty() {
+                    list.ResourceBarrier(&self.to_copy);
+                }
+                for (depth, twin, colour) in &self.syncs {
+                    record_twin_copy(list, &depth.texture, twin, *colour);
+                }
+                for upload in &self.uploads {
+                    upload.record_levels(list);
+                }
+                if !self.barriers.is_empty() {
+                    list.ResourceBarrier(&self.barriers);
+                }
+                list.Close()
+            })
+        };
+        if let Err(e) = recorded {
+            fail(format_args!("a host state prelude did not record on the sending thread ({e})"));
+        }
+    }
+}
+
+impl Drop for PreludeRecord {
+    fn drop(&mut self) {
+        self.due.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 /// Whether a host list's prelude is made when the list first needs one. A
 /// prelude runs the texture transitions and twin copies a list needs before
@@ -2479,7 +2571,9 @@ fn flush_small() -> usize {
 struct Sending(Box<dyn FnOnce()>);
 // SAFETY: D3D12 queues, lists and fences are free-threaded; the lists are
 // closed and nothing resets them before the fence signalled behind them has
-// passed.
+// passed. A prelude recorded here (`PreludeRecord`) is recorded by this
+// thread alone until it is sent: the submitting thread waits for the line
+// before it records that prelude itself (`HostList::prelude_due`).
 unsafe impl Send for Sending {}
 
 /// The sending thread's line: how many sends were given and how many are done.
@@ -2542,8 +2636,16 @@ pub(crate) fn send_flush() {
     let sender = sender();
     let mut line = sender.line.lock().unwrap_or_else(|e| e.into_inner());
     let given = line.1;
+    // The time waited, all callers together (diagnostics): what longer sends
+    // (`prelude_beside`) cost the threads that need the line empty.
+    #[cfg(feature = "diagnostics")]
+    let waiting = (line.2 < given).then(std::time::Instant::now);
     while line.2 < given {
         line = sender.done.wait(line).unwrap_or_else(|e| e.into_inner());
+    }
+    #[cfg(feature = "diagnostics")]
+    if let Some(waiting) = waiting {
+        crate::copystat::add(crate::copystat::C::SendFlushWaitUs, waiting.elapsed().as_micros() as u64);
     }
 }
 
@@ -5043,6 +5145,7 @@ impl Host {
                 states: Mutex::default(),
                 twins: Mutex::default(),
                 prelude,
+                prelude_due: Default::default(),
                 pipelines,
                 #[cfg(feature = "diagnostics")]
                 indirects,
@@ -6635,6 +6738,9 @@ impl Host {
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
+        // The preludes recorded on the sending thread (`prelude_beside`):
+        // only for a submission sent from there, so none on the other paths.
+        let mut records: Vec<PreludeRecord> = Vec::new();
         // Diagnostics: where each list of `lists` starts and what it is, for
         // a timing run to time each on its own (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
@@ -6706,10 +6812,11 @@ impl Host {
         for (_run, list) in runs.iter().enumerate() {
             let uploads = list.run_deferred(&mut batch, &air, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
             firsts.push(lists.len());
-            if let Some(prelude) = list.prelude(&uploads) {
+            if let Some((prelude, record)) = list.prelude(&uploads, late && send_beside()) {
                 #[cfg(feature = "diagnostics")]
                 marks.push((lists.len(), crate::copystat::Timed::Prelude));
                 lists.push(Some(prelude));
+                records.extend(record);
             }
             #[cfg(feature = "diagnostics")]
             marks.push((
@@ -6808,8 +6915,16 @@ impl Host {
             let value = *submitted;
             let signalled: windows::core::Result<()> = if send_beside() {
                 let lists = std::mem::take(&mut lists);
+                let records = std::mem::take(&mut records);
                 send_later(Box::new(move || {
                     let Some(host) = host() else { return };
+                    // The preludes left to this thread (`prelude_beside`):
+                    // recorded and closed before the lists go to the queue.
+                    for record in &records {
+                        // SAFETY: before this submission's sends, after the
+                        // earlier ones' (one thread, in order).
+                        unsafe { record.record() };
+                    }
                     // SAFETY: closed lists; the fence is ours.
                     let signalled = unsafe {
                         let mut from = 0;
@@ -6819,6 +6934,10 @@ impl Host {
                         }
                         host.queue.Signal(&host.fence, value)
                     };
+                    // Sent: the lists' counts of records still to run go
+                    // down only now, so a prelude recorded on the submitting
+                    // thread does not reset a list before it is on the queue.
+                    drop(records);
                     awake::sent(&host.device);
                     host.card_sent();
                     if let Err(e) = signalled {
@@ -7830,10 +7949,34 @@ impl HostList {
     /// from the other, if a list submitted earlier left it behind. For
     /// title-written textures refreshed on this submission (`uploads`), it
     /// records `CopyTextureRegion` right before the list runs.
-    fn prelude(&self, uploads: &[(crate::texture::PreludeUpload, bool)]) -> Option<ID3D12CommandList> {
+    ///
+    /// With `beside` (the submission goes to the queue on the sending
+    /// thread) and [`prelude_beside`], the commands are not recorded here:
+    /// the record comes back with the list, to be run on the sending thread
+    /// before the submission's `ExecuteCommandLists`.
+    fn prelude(
+        &self,
+        uploads: &[(crate::texture::PreludeUpload, bool)],
+        beside: bool,
+    ) -> Option<(ID3D12CommandList, Option<PreludeRecord>)> {
         const COPY_DEST: u32 = 0x400;
         const COPY_SOURCE: u32 = 0x800;
         let host_state = |state: u32| D3D12_RESOURCE_STATES(state as i32);
+        let wanted = beside && prelude_beside();
+        // A prefill is taken while recording and sets `prefilled`, which the
+        // heap sync of this submission reads: that record stays here.
+        let prefill = wanted
+            && uploads
+                .iter()
+                .any(|(u, _)| u.copy.prefill.lock().unwrap_or_else(|e| e.into_inner()).is_some());
+        let defer = wanted && !prefill;
+        // A record of this list's prelude still waits on the sending thread:
+        // it runs and is sent before this one resets the list.
+        if !defer && self.prelude_due.load(Ordering::Acquire) > 0 {
+            send_flush();
+        }
+        // With `defer`: the textures the list's own transitions name.
+        let mut keep = Vec::new();
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         // The copies (depth texture, twin, whether into the twin); the
         // sides are then as this list leaves them.
@@ -7926,8 +8069,12 @@ impl HostList {
         barriers.extend(states.iter().filter_map(|(key, (first, last, copy))| {
             let real = copy.state.swap(*last, Ordering::Relaxed);
             let real = copying.get(key).copied().unwrap_or(real);
-            (real != *first)
-                .then(|| transition(&copy.texture, host_state(real), host_state(*first)))
+            (real != *first).then(|| {
+                if defer {
+                    keep.push(copy.clone());
+                }
+                transition(&copy.texture, host_state(real), host_state(*first))
+            })
         }));
         if barriers.is_empty() && syncs.is_empty() && uploads.is_empty() {
             return None;
@@ -7939,6 +8086,30 @@ impl HostList {
         else {
             fail(format_args!("no host list for a state prelude"));
         };
+        if defer {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::PreludesBeside, 1);
+            self.prelude_due.fetch_add(1, Ordering::AcqRel);
+            let record = PreludeRecord {
+                allocator: allocator.clone(),
+                list: list.clone(),
+                aliasing,
+                to_copy,
+                barriers,
+                syncs,
+                uploads: uploads.iter().map(|(u, _)| u.clone()).collect(),
+                _keep: keep,
+                due: self.prelude_due.clone(),
+            };
+            return list.cast().ok().map(|l| (l, Some(record)));
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            crate::copystat::add(crate::copystat::C::PreludesInline, 1);
+            if prefill {
+                crate::copystat::add(crate::copystat::C::PreludesPrefill, 1);
+            }
+        }
         // SAFETY: the prelude is not executing (every submission is waited
         // for); the textures are live.
         let recorded = unsafe {
@@ -7965,7 +8136,7 @@ impl HostList {
         if let Err(e) = recorded {
             fail(format_args!("a host state prelude did not record ({e})"));
         }
-        list.cast().ok()
+        list.cast().ok().map(|l| (l, None))
     }
 
     /// Notes what the command about to be recorded does, as a marker

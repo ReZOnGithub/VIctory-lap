@@ -884,7 +884,6 @@ impl PreludeUpload {
     /// (the prelude command list). `self.copy.texture` must already be in
     /// `D3D12_RESOURCE_STATE_COPY_DEST`.
     pub(crate) fn record(&self, host_list: &HostList, cmd_list: &ID3D12GraphicsCommandList) {
-        let texture = &self.copy.texture;
         // A host copy made whole from the store (`crate::texstore`): its larger
         // levels, once, before the ones from title memory.
         let prefill = self.copy.prefill.lock().unwrap_or_else(|e| e.into_inner()).take();
@@ -893,6 +892,14 @@ impl PreludeUpload {
         {
             crate::texlate::whole(self.resource);
         }
+        self.record_levels(cmd_list);
+    }
+
+    /// Records the `CopyTextureRegion`s from the staging buffer alone,
+    /// without a prefill: what the sending thread records for an upload
+    /// that has none (`crate::host` `PreludeRecord`).
+    pub(crate) fn record_levels(&self, cmd_list: &ID3D12GraphicsCommandList) {
+        let texture = &self.copy.texture;
         // The staging buffer lives as long as `self.staging`, which the list's
         // deferred steps hold until the list is reset after GPU completion.
         for (i, footprint) in self.staging.footprints.iter().enumerate() {

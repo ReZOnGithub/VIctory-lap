@@ -131,8 +131,17 @@ pub(crate) enum C {
     WaitsForGroups,
     WaitsForBuffers,
     IndirectBounded,
+    /// Preludes recorded on the sending thread (`VICTORY_PRELUDE_BESIDE`),
+    /// on the submitting thread, and of those the ones kept there for a
+    /// level prefill; the microseconds threads waited for the sending
+    /// thread's line to be empty (`send_flush`).
+    PreludesBeside,
+    PreludesInline,
+    PreludesPrefill,
+    SendFlushWaitUs,
 }
 const COUNTERS: usize = 80;
+const _: () = assert!((C::SendFlushWaitUs as usize) < COUNTERS, "more counters than COUNTERS");
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
 /// every list call (what counts here is summed up for the log alone).
@@ -1402,7 +1411,9 @@ pub(crate) fn log(frames: f64) {
          until the first submission; {:.1} ms from the last submission to the present call; \
          lists reset in {:.1} ms; the process ran {user:.0} ms user + {kernel:.0} ms kernel on \
          all threads; what shaders wrote: {:.1} ms finding {:.0} pieces that differ, {:.1} ms \
-         putting them back; texture uploads: {:.0} recorded, {:.0} left out; {:.1} held \
+         putting them back; texture uploads: {:.0} recorded, {:.0} left out; preludes recorded \
+         {:.0} on the sending thread, {:.0} at submission ({:.0} for a prefill); {:.1} ms waited \
+         for the sending thread's line; {:.1} held \
          submissions run at the present with their waits not met; waits for memory values: \
          {:.0} looks {:.1} ms; {:.0} host lists made {:.1} ms; {:.0} parts of held submissions \
          ran alone that the next part could have run with",
@@ -1415,6 +1426,10 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::BackSyncUs as usize]),
         c[C::TexUploads as usize],
         c[C::TexSkipped as usize],
+        c[C::PreludesBeside as usize],
+        c[C::PreludesInline as usize],
+        c[C::PreludesPrefill as usize],
+        ms(c[C::SendFlushWaitUs as usize]),
         c[C::Forced as usize],
         c[C::WaitChecks as usize],
         c[C::WaitCheckNs as usize] / 1e6,
