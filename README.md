@@ -38,7 +38,8 @@ minutes; nobody else has verified them.
 | Main menu | Yes | 60 fps |
 | In-game | Yes | Played from the start through the prison opening and its cutscenes into the first boat mission |
 | Frame rate in-game | **21 to 22 fps** | Boat mission, open water, 3,500 draws a frame: runs average 21.5 to 22.3 fps, single readings 20.3 to 22.7. Cutscenes 24 to 28 fps |
-| 30 fps in-game | No | The card is busy two thirds of a frame at 22 fps; one CPU thread sets the rest |
+| Frame rate in-game with DLSS frame generation (2x) | **43 to 44 fps shown** | Same scene: 21.5 to 22 frames rendered a second and as many generated (DLSS Quality, RTX 5070; Streamline reports 22 presents and 22 generated frames a second, status ok). Generated frames, not rendered ones |
+| 30 fps in-game, rendered | No | The card is busy two thirds of a frame at 22 fps; one CPU thread sets the rest |
 | Stable | Partly | Four-minute scripted runs repeat without a crash or a lost device; longer sessions were played by hand to the boat mission, not timed |
 
 **What works:** boot, menus, video, save and load, cutscenes, on-foot play and
