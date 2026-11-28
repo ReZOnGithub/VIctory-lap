@@ -5626,9 +5626,26 @@ static BUFFERS_CHANGED: AtomicU64 = AtomicU64::new(1);
 /// Answers a thread remembers.
 const FOUND_MOST: usize = 1024;
 
-/// An ask (address, bytes), the count of changes it was answered at, and the
-/// answer.
-type Found = (u64, u64, u64, std::sync::Weak<Shadow>);
+/// What tells which copy one is and where a title address lies in it: its
+/// number, the title memory it is of, and what [`Shadow::offset`] adds for a
+/// copy in place. None of it changes while the copy lives.
+#[derive(Clone, Copy)]
+pub(crate) struct Ids {
+    pub(crate) id: u64,
+    pub(crate) start: u64,
+    pub(crate) len: u64,
+    pub(crate) bias: u64,
+}
+
+impl Ids {
+    fn of(s: &Shadow) -> Ids {
+        Ids { id: s.id, start: s.start, len: s.len, bias: s.place.as_ref().map_or(0, |p| p.1) }
+    }
+}
+
+/// An ask (address, bytes), the count of changes it was answered at, the
+/// answer, and the answer's [`Ids`].
+type Found = (u64, u64, u64, std::sync::Weak<Shadow>, Ids);
 
 thread_local! {
     /// The last answers of [`lookup`] out of [`BUFFERS`], by a hash of the
@@ -5653,7 +5670,7 @@ fn found(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let changed = BUFFERS_CHANGED.load(Ordering::SeqCst);
     let shadow = FOUND.with(|f| {
         let f = f.borrow();
-        let (a, n, at, shadow) = f.get(found_at(address, len))?;
+        let (a, n, at, shadow, _) = f.get(found_at(address, len))?;
         ((*a, *n, *at) == (address, len, changed)).then(|| shadow.upgrade()).flatten()
     })?;
     // Whoever takes the map to let a copy go that nobody holds finds it held
@@ -5667,9 +5684,9 @@ fn remember(address: u64, len: u64, changed: u64, shadow: &Arc<Shadow>) {
     FOUND.with(|f| {
         let mut f = f.borrow_mut();
         if f.is_empty() {
-            f.resize_with(FOUND_MOST, || (0, 0, 0, std::sync::Weak::new()));
+            f.resize_with(FOUND_MOST, || (0, 0, 0, std::sync::Weak::new(), Ids { id: 0, start: 0, len: 0, bias: 0 }));
         }
-        f[found_at(address, len)] = (address, len, changed, Arc::downgrade(shadow));
+        f[found_at(address, len)] = (address, len, changed, Arc::downgrade(shadow), Ids::of(shadow));
     });
 }
 
@@ -5757,6 +5774,27 @@ pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
 /// (a root view: the caller reads on to the copy's end).
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     lookup(address, len, false)
+}
+
+/// As [`find`], for an ask that only compares which copy it is: the ids
+/// from what this thread remembers, with no hold taken while nothing changed
+/// since (the copy is then still in [`BUFFERS`]: only `buffers()` takes one
+/// out, and it bumps the count first). The check of a kept view's slot took
+/// and dropped a hold for each: about 1 ms a frame of the translating
+/// threads.
+pub(crate) fn find_ids(address: u64, len: u64) -> Option<Ids> {
+    if quick_find() {
+        let changed = BUFFERS_CHANGED.load(Ordering::SeqCst);
+        let hit = FOUND.with(|f| {
+            let f = f.borrow();
+            let (a, n, at, _, ids) = f.get(found_at(address, len))?;
+            ((*a, *n, *at) == (address, len, changed)).then_some(*ids)
+        });
+        if hit.is_some() {
+            return hit;
+        }
+    }
+    find(address, len).map(|s| Ids::of(&s))
 }
 
 /// As [`find`], for an ask that is done with the copy when its list has

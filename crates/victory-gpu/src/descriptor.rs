@@ -1669,6 +1669,16 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
     }
 }
 
+/// Whether the record words `i`, `generation` of a table entry still name
+/// the view [`view_at`] gave for them: whether `generation` is still the
+/// entry's (an entry's view changes only after [`forget`] gave it a new
+/// one). `None` when that is not told without the lock: other kinds,
+/// the cache not on, entries past [`VIEW_GENERATIONS_HELD`].
+pub(crate) fn entry_current(i: u32, generation: u32) -> Option<bool> {
+    (generation >> KIND_SHIFT == 0 && view_cache() == ViewCache::On && (i as usize) < VIEW_GENERATIONS_HELD)
+        .then(|| VIEW_GENERATIONS[i as usize].load(std::sync::atomic::Ordering::Acquire) == generation)
+}
+
 /// The words of the record at `handle`, if they are a view's.
 pub(crate) fn record_at(handle: u64) -> Option<[u32; 3]> {
     if handle == 0 {

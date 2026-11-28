@@ -178,7 +178,7 @@ pub(crate) fn external(this: This, work: External) -> bool {
 pub(crate) fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
     let Some(list) = host_list(this) else { return };
     #[cfg(feature = "diagnostics")]
-    let started = std::time::Instant::now();
+    let started = crate::copystat::record_start();
     // SAFETY: the title passes one of our lists.
     let state = unsafe { &(*this.cast::<List>()).state };
     f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
@@ -923,6 +923,19 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
 pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: u32) {
     use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
     if let Some((texture, before)) = list.transition(resource, state) {
+        let state = crate::host::legal_state(texture, state);
+        let barrier = crate::host::transition(texture, State(before as i32), State(state as i32));
+        // SAFETY: an open list and a live texture (the list's states hold
+        // it).
+        unsafe { list.list.barriers(&[barrier]) };
+    }
+}
+
+/// [`ensure_state`] of the host copy `copy` the caller found already.
+#[cfg(windows)]
+pub(crate) fn ensure_state_copy(list: &crate::host::HostList, copy: std::sync::Arc<crate::resource::HostTexture>, state: u32) {
+    use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
+    if let Some((texture, before)) = list.transition_copy(copy, state) {
         let state = crate::host::legal_state(texture, state);
         let barrier = crate::host::transition(texture, State(before as i32), State(state as i32));
         // SAFETY: an open list and a live texture (the list's states hold

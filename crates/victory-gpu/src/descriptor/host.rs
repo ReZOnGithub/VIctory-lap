@@ -169,13 +169,17 @@ pub(crate) struct HostHeap {
     /// A lock for each slot: one for the heap was what the recording threads
     /// waited for most (5.6 % of their time, profile waits-1: each descriptor
     /// made for a draw takes it, and lets go of what the slot held under it).
+    ///
+    /// Not used for the dynamic slots (index >= `count`) with
+    /// `VICTORY_KEEP_FAST` on: `kept_raw` holds theirs.
     kept: Box<[Mutex<Option<ID3D12Resource>>]>,
-    /// Whether each slot of `kept` holds a resource: written with the slot's
-    /// lock held, read without by [`HostHeap::keep`].
-    kept_some: Box<[std::sync::atomic::AtomicBool]>,
-    /// The resource each slot of `kept` holds, as its raw interface pointer (0:
-    /// none): written with the slot's lock held, wherever `kept` is, read
-    /// without by [`HostHeap::keep_ref`] (`VICTORY_KEEP_FAST`).
+    /// The resource each slot holds, as its raw interface pointer (0: none).
+    /// A title slot's names what `kept` holds: written with the slot's lock
+    /// held, wherever `kept` is, and read without it to see that nothing is
+    /// held. A dynamic slot's, with `VICTORY_KEEP_FAST` on, OWNS one COM
+    /// reference (from `into_raw`): the one list that took the slot swaps it,
+    /// with no lock (the lock and the flag beside it were about 5 ms a frame
+    /// of the translating threads), and [`Drop`] releases what is left.
     kept_raw: Box<[std::sync::atomic::AtomicUsize]>,
     /// Of the dynamic slots, the table template each was made from with
     /// [`HostHeap::make_from_template`] and shows a view of still
@@ -1389,13 +1393,22 @@ fn view_home(
     shadow: std::sync::Arc<crate::shadow::Shadow>,
     start: u64,
     len: u64,
-    (stride, raw, format): (u32, bool, u32),
+    kind: (u32, bool, u32),
 ) -> std::sync::Arc<crate::shadow::Shadow> {
     let Some(offset) = shadow.offset_in(start).map(|_| shadow.offset(start)) else {
         return shadow;
     };
-    if !view_bytes() {
+    if !wants_exact(offset, kind) {
         return shadow;
+    }
+    crate::shadow::exact(start, len).unwrap_or(shadow)
+}
+
+/// Whether a buffer view at `offset` of its buffer's copy gets a copy of its
+/// own bytes ([`view_home`]).
+fn wants_exact(offset: u64, (stride, raw, format): (u32, bool, u32)) -> bool {
+    if !view_bytes() {
+        return false;
     }
     let element = crate::resource::element(format).map_or(0, |(bytes, _)| bytes);
     // Pick the same copy when creating the descriptor and when refreshing it,
@@ -1404,10 +1417,19 @@ fn view_home(
         probe_view_limit();
     }
     let has_raw_twins = victory_shader::emit::raw_views() != 0;
-    if !off_elements(offset, stride, raw, element, has_raw_twins) {
-        return shadow;
+    off_elements(offset, stride, raw, element, has_raw_twins)
+}
+
+/// The number of the copy [`view_home`] gives for the copy `found` names,
+/// with no hold taken of that copy.
+fn home_id(found: crate::shadow::Ids, start: u64, len: u64, kind: (u32, bool, u32)) -> u64 {
+    let Some(at) = start.checked_sub(found.start).filter(|&at| at < found.len) else {
+        return found.id;
+    };
+    if !wants_exact(at + found.bias, kind) {
+        return found.id;
     }
-    crate::shadow::exact(start, len).unwrap_or(shadow)
+    crate::shadow::exact(start, len).map_or(found.id, |s| s.id())
 }
 
 /// For device-removed reports: what the slots of the title's view heap that
@@ -1724,6 +1746,23 @@ fn dynamic_slots(count: u32, null: u32) -> u32 {
     null.saturating_sub(count).min(most).max(DYNAMIC)
 }
 
+impl Drop for HostHeap {
+    /// The dynamic slots' references `kept_raw` owns go with the heap, at
+    /// once, as those `kept` holds do.
+    fn drop(&mut self) {
+        if !keep_fast() {
+            return;
+        }
+        for raw in self.kept_raw.iter().skip(self.count as usize) {
+            let p = raw.swap(0, std::sync::atomic::Ordering::AcqRel);
+            if p != 0 {
+                // SAFETY: a pointer stored from `into_raw` (one reference).
+                drop(unsafe { <ID3D12Resource as windows::core::Interface>::from_raw(p as *mut std::ffi::c_void) });
+            }
+        }
+    }
+}
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -1849,7 +1888,6 @@ impl HostHeap {
             waiting: Mutex::default(),
             away: Mutex::default(),
             kept: (0..count + extra).map(|_| Mutex::new(None)).collect(),
-            kept_some: (0..count + extra).map(|_| std::sync::atomic::AtomicBool::new(false)).collect(),
             kept_raw: (0..count + extra).map(|_| std::sync::atomic::AtomicUsize::new(0)).collect(),
             runs: Runs::new(if sampler { 0 } else { extra as usize }),
             next: Mutex::new((0, Taken::new(extra as usize))),
@@ -2969,11 +3007,22 @@ impl HostHeap {
                     views.made.clear();
                 }
             }
-            if kept_on {
-                listed_again(views, recording, words, mode);
-            }
             let twins = self.twins.get(index as usize).is_some();
-            if !views.made.contains_key(&words) {
+            // Made in this recording (views not kept: every entry is): one
+            // probe of the map where there were three (about 2 ms a frame of
+            // the translating threads).
+            if let Some(made) = views.made.get(&words)
+                && (!kept_on || made.recording == recording)
+            {
+                let found = self.listed_tail(views, made, index, twins);
+                if kept_on {
+                    views.counts[0] += 1;
+                }
+                return found;
+            }
+            // (Views not kept: not there, as just seen.)
+            let present = kept_on && listed_again(views, recording, words, mode);
+            if !present {
                 let view = super::view_at(words[1], words[2])?;
                 // (A constant buffer's bytes are copied for each draw.)
                 if matches!(view, View::Constant(..)) {
@@ -2998,19 +3047,28 @@ impl HostHeap {
                 };
                 let used = if kept_on { crate::frame::current() } else { 0 };
                 views.counts[4] += 1;
+                if kept_on {
+                    views.by_frame[(used % 6) as usize].push(words);
+                }
                 views.made.insert(words, ListView { view, at, twin, kept, listed, recording, basis, used });
             }
-            let made = &views.made[&words];
-            self.copy_from(index, views.slot(made.at));
-            if made.twin && twins {
-                self.copy_from(self.raw + index, views.slot(made.at + 1));
-                self.twins[index as usize].store(true, std::sync::atomic::Ordering::Relaxed);
-            } else {
-                self.clear_twin(index);
-            }
-            self.keep_ref(index, made.kept.as_ref());
-            Some((made.listed, made.at, made.twin))
+            self.listed_tail(views, &views.made[&words], index, twins)
         })
+    }
+
+    /// The end of [`HostHeap::make_listed`]: slot `index` shows the entry
+    /// `made` of `views` (and its raw twin, if both have one) and keeps its
+    /// resource.
+    fn listed_tail(&self, views: &ListViews, made: &ListView, index: u32, twins: bool) -> Option<(Listed, u32, bool)> {
+        self.copy_from(index, views.slot(made.at));
+        if made.twin && twins {
+            self.copy_from(self.raw + index, views.slot(made.at + 1));
+            self.twins[index as usize].store(true, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            self.clear_twin(index);
+        }
+        self.keep_ref(index, made.kept.as_ref());
+        Some((made.listed, made.at, made.twin))
     }
 
     /// Makes dynamic slots `first..first + n` from table template `t`
@@ -3210,17 +3268,43 @@ impl HostHeap {
 
     /// [`HostHeap::keep`] under the slot's lock.
     fn keep_locked(&self, index: u32, resource: Option<ID3D12Resource>) {
+        use std::sync::atomic::Ordering;
+        use windows::core::Interface;
+        if index >= self.count && keep_fast() {
+            // A dynamic slot: its one writer swaps the owned pointer.
+            let Some(raw) = self.kept_raw.get(index as usize) else {
+                return;
+            };
+            // Nothing kept and nothing to keep (constant buffers, null
+            // views: many slots of a table).
+            if resource.is_none() && raw.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            let new = resource.map_or(0, |r| r.into_raw() as usize);
+            let old = raw.swap(new, Ordering::AcqRel);
+            if old != 0 {
+                let same = old == new;
+                // SAFETY: a pointer stored above from `into_raw` (one
+                // reference); the swap gave it to this thread alone.
+                let old = unsafe { ID3D12Resource::from_raw(old as *mut std::ffi::c_void) };
+                if same {
+                    // The same again: the slot holds the new reference.
+                    drop(old)
+                } else {
+                    // A running submission may still read the old resource
+                    // through this slot.
+                    crate::host::retire_resource(old)
+                }
+            }
+            return;
+        }
         let Some(slot) = self.kept.get(index as usize) else {
             return;
         };
         let old = {
-            use windows::core::Interface;
-            // Nothing kept and nothing to keep (constant buffers, null
-            // views: many slots of a table), seen without the lock
-            // (`kept_some` is written with the slot's lock held).
-            if resource.is_none()
-                && self.kept_some.get(index as usize).is_some_and(|s| !s.load(std::sync::atomic::Ordering::Acquire))
-            {
+            // Nothing kept and nothing to keep, seen without the lock
+            // (`kept_raw` is written with the slot's lock held).
+            if resource.is_none() && self.kept_raw.get(index as usize).is_some_and(|r| r.load(Ordering::Acquire) == 0) {
                 return;
             }
             let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
@@ -3228,12 +3312,8 @@ impl HostHeap {
             if slot.as_ref().map(Interface::as_raw) == resource.as_ref().map(Interface::as_raw) {
                 return;
             }
-            if let Some(some) = self.kept_some.get(index as usize) {
-                some.store(resource.is_some(), std::sync::atomic::Ordering::Release);
-            }
             if let Some(raw) = self.kept_raw.get(index as usize) {
-                let to = resource.as_ref().map_or(0, |r| Interface::as_raw(r) as usize);
-                raw.store(to, std::sync::atomic::Ordering::Release);
+                raw.store(resource.as_ref().map_or(0, |r| Interface::as_raw(r) as usize), Ordering::Release);
             }
             std::mem::replace(&mut *slot, resource)
         };
@@ -3282,6 +3362,18 @@ impl HostHeap {
 
     /// What slot `index` views.
     fn kept_in(&self, index: u32) -> Option<ID3D12Resource> {
+        if index >= self.count && keep_fast() {
+            let raw = self.kept_raw.get(index as usize)?.load(std::sync::atomic::Ordering::Acquire);
+            if raw == 0 {
+                return None;
+            }
+            // SAFETY: borrowed, not taken; a resource replaced meanwhile is
+            // retired, not released (kept for `bury_lag` submissions).
+            let held = std::mem::ManuallyDrop::new(unsafe {
+                <ID3D12Resource as windows::core::Interface>::from_raw(raw as *mut std::ffi::c_void)
+            });
+            return Some((*held).clone());
+        }
         self.kept.get(index as usize)?.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
@@ -4250,6 +4342,38 @@ fn srv_home(
     Some((shadow, home))
 }
 
+/// The [`Basis`] of what [`srv_home`] gives, from the copies' numbers alone:
+/// the slot check took, cloned and dropped a hold of the copy only to read
+/// two numbers (about 1 ms a frame of the translating threads).
+fn srv_basis(address: u64, len: u64, desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> Option<Basis> {
+    let found = crate::shadow::find_ids(address, len)?;
+    let unit = element_size(desc);
+    // SAFETY: a buffer view's union member.
+    let own = unsafe { desc.Anonymous.Buffer };
+    let start = address + own.FirstElement * unit;
+    let kind = (own.StructureByteStride, own.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0, desc.Format.0 as u32);
+    let home = home_id(found, start, u64::from(own.NumElements) * unit, kind);
+    Some(Basis::Buffer { found: found.id, home })
+}
+
+/// As [`srv_basis`], of what [`uav_home`] gives.
+fn uav_basis(address: u64, len: u64, desc: &D3D12_UNORDERED_ACCESS_VIEW_DESC) -> Option<Basis> {
+    let found = crate::shadow::find_ids(address, len)?;
+    // SAFETY: a buffer view's union member.
+    let own = unsafe { desc.Anonymous.Buffer };
+    let unit = if own.StructureByteStride > 0 {
+        u64::from(own.StructureByteStride)
+    } else if own.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
+        4
+    } else {
+        crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
+    };
+    let start = address + own.FirstElement * unit;
+    let kind = (own.StructureByteStride, own.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0, desc.Format.0 as u32);
+    let home = home_id(found, start, u64::from(own.NumElements) * unit, kind);
+    Some(Basis::Buffer { found: found.id, home })
+}
+
 fn buffer_srv(
     address: u64,
     len: u64,
@@ -4713,23 +4837,18 @@ fn basis_of(view: &View) -> Basis {
             first: crate::resource::first_shown(resource),
         })
     };
-    let ids = |(found, home): (std::sync::Arc<crate::shadow::Shadow>, std::sync::Arc<crate::shadow::Shadow>)| {
-        Basis::Buffer { found: found.id(), home: home.id() }
-    };
     let basis = match view {
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;
             texture(resource).or_else(|| {
                 let ((data, len), desc) = (crate::resource::buffer_bytes(resource)?, desc.as_ref()?);
-                srv_home(data as u64, len, &srv_desc(desc)).map(ids)
+                srv_basis(data as u64, len, &srv_desc(desc))
             })
         }
         View::Unordered(resource, _, desc) => {
             let resource = *resource as crate::object::This;
             match (crate::resource::host_resource(resource), crate::resource::buffer_bytes(resource), desc) {
-                (None, Some((data, len)), Some(desc)) => {
-                    uav_home(data as u64, len, &uav_desc(desc)).map(|(found, home, _)| ids((found, home)))
-                }
+                (None, Some((data, len)), Some(desc)) => uav_basis(data as u64, len, &uav_desc(desc)),
                 _ => None,
             }
         }
@@ -4744,9 +4863,9 @@ fn basis_of(view: &View) -> Basis {
                 if len == 0 {
                     None
                 } else if *unordered {
-                    uav_home(address, len, &uav_desc(words)).map(|(found, home, _)| ids((found, home)))
+                    uav_basis(address, len, &uav_desc(words))
                 } else {
-                    srv_home(address, len, &srv_desc(words)).map(ids)
+                    srv_basis(address, len, &srv_desc(words))
                 }
             }
         },
@@ -6682,6 +6801,10 @@ struct ListViews {
     free: Vec<u32>,
     next: u32,
     swept: u64,
+    /// With views kept: the records whose entry got `used` = a frame, by
+    /// that frame modulo 6 ([`ListViews::new_recording`] looks at one of
+    /// them a frame). A record may be in several, or name no entry any more.
+    by_frame: [Vec<[u32; 3]>; 6],
     /// [`VIEWS_KEPT_COUNTS`] of this thread not yet added there.
     counts: [u64; 7],
     /// One more each time an entry goes, the map is cleared or it is of
@@ -6729,6 +6852,9 @@ impl ListViews {
         }
         if self.next >= self.scratch() {
             self.made.clear();
+            for bucket in &mut self.by_frame {
+                bucket.clear();
+            }
             self.free.clear();
             self.next = 0;
             self.counts[5] += 1;
@@ -6750,15 +6876,43 @@ impl ListViews {
         }
         let frame = crate::frame::current();
         if frame != self.swept {
+            let gap = frame.wrapping_sub(self.swept);
             self.swept = frame;
-            let free = &mut self.free;
-            self.made.retain(|_, m| {
-                let keep = frame.saturating_sub(m.used) <= 4;
-                if !keep {
-                    free.push(m.at);
+            if gap == 1 {
+                // Swept the frame before: all that expires now got `used`
+                // five frames ago, and is in that frame's bucket. Going over
+                // the whole map for it was about 2 ms a frame of the
+                // translating threads.
+                let b = ((frame + 1) % 6) as usize; // (frame - 5) % 6
+                let mut bucket = std::mem::take(&mut self.by_frame[b]);
+                for words in bucket.drain(..) {
+                    // (Used again since, or gone: not this one.)
+                    if let Some(m) = self.made.get(&words)
+                        && frame.saturating_sub(m.used) > 4
+                    {
+                        self.free.push(m.at);
+                        self.made.remove(&words);
+                    }
                 }
-                keep
-            });
+                self.by_frame[b] = bucket;
+            } else {
+                // Frames went by unswept: the whole map, as before, and the
+                // buckets made anew from what is left.
+                let free = &mut self.free;
+                self.made.retain(|_, m| {
+                    let keep = frame.saturating_sub(m.used) <= 4;
+                    if !keep {
+                        free.push(m.at);
+                    }
+                    keep
+                });
+                for bucket in &mut self.by_frame {
+                    bucket.clear();
+                }
+                for (words, m) in &self.made {
+                    self.by_frame[(m.used % 6) as usize].push(*words);
+                }
+            }
         }
     }
 
@@ -6795,6 +6949,7 @@ impl ListViews {
                 free: Vec::new(),
                 next: 0,
                 swept: 0,
+                by_frame: Default::default(),
                 counts: [0; 7],
                 generation: 0,
                 templates: Default::default(),
@@ -6815,13 +6970,15 @@ impl ListViews {
 /// good if the record still names its view and the view's basis is the one
 /// it was made with (see [`ListViews`]); what is known of it in its list is
 /// then forgotten, as a new recording's entry knows nothing.
-fn listed_again(views: &mut ListViews, recording: u64, words: [u32; 3], mode: ViewsKept) {
+///
+/// Whether the entry is there now.
+fn listed_again(views: &mut ListViews, recording: u64, words: [u32; 3], mode: ViewsKept) -> bool {
     let Some(made) = views.made.get(&words) else {
-        return;
+        return false;
     };
     if made.recording == recording {
         views.counts[0] += 1;
-        return;
+        return true;
     }
     let at = made.at;
     let drop = |views: &mut ListViews, count: usize| {
@@ -6831,12 +6988,21 @@ fn listed_again(views: &mut ListViews, recording: u64, words: [u32; 3], mode: Vi
         views.changed(TemplateCount::DroppedView);
     };
     // The record names another view, or none (its resource was released).
-    if super::view_at(words[1], words[2]).as_ref() != Some(&made.view) {
-        return drop(views, 3);
+    // A table entry's generation tells it without the lock and without a
+    // copy of the view to compare (about 1.5 ms a frame of the translating
+    // threads).
+    let named = match super::entry_current(words[1], words[2]) {
+        Some(current) => current,
+        None => super::view_at(words[1], words[2]).as_ref() == Some(&made.view),
+    };
+    if !named {
+        drop(views, 3);
+        return false;
     }
     let basis = basis_of(&made.view);
     if basis == Basis::Recording || basis != made.basis {
-        return drop(views, 2);
+        drop(views, 2);
+        return false;
     }
     if mode == ViewsKept::Check {
         // Made anew beside it: the same descriptor (and twin), the same
@@ -6849,17 +7015,22 @@ fn listed_again(views: &mut ListViews, recording: u64, words: [u32; 3], mode: Vi
             && equal(views.bytes(scratch), views.bytes(at))
             && (!made.twin || equal(views.bytes(scratch + 1), views.bytes(at + 1)));
         if !same {
-            return drop(views, 6);
+            drop(views, 6);
+            return false;
         }
     }
     let frame = crate::frame::current();
     if let Some(made) = views.made.get_mut(&words) {
         made.recording = recording;
+        if made.used != frame {
+            views.by_frame[(frame % 6) as usize].push(words);
+        }
         made.used = frame;
         made.listed.ready = (0, 0, false);
         made.listed.tabled = None;
     }
     views.counts[1] += 1;
+    true
 }
 
 thread_local! {

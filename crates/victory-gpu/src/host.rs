@@ -8332,6 +8332,16 @@ impl HostList {
         wanted: u32,
     ) -> Option<(&'static ID3D12Resource, u32)> {
         let copy = crate::resource::host_copy(resource)?;
+        self.transition_copy(copy, wanted)
+    }
+
+    /// [`HostList::transition`] of the host copy `copy` the caller found
+    /// already.
+    pub(crate) fn transition_copy(
+        &self,
+        copy: std::sync::Arc<crate::resource::HostTexture>,
+        wanted: u32,
+    ) -> Option<(&'static ID3D12Resource, u32)> {
         // SAFETY: as in `crate::resource::host_resource`; the list's states
         // hold the copy from here on.
         let texture: &'static ID3D12Resource = unsafe { &*std::ptr::from_ref(&copy.texture) };
@@ -8403,7 +8413,6 @@ impl HostList {
         colour: bool,
         write: bool,
     ) -> bool {
-        const UNORDERED_ACCESS: u32 = 0x8;
         // Asked for every texture a draw reads: most have no twin.
         let Some(twin) = crate::resource::twin(resource) else {
             return false;
@@ -8411,6 +8420,19 @@ impl HostList {
         let Some(depth) = crate::resource::host_copy(resource) else {
             return false;
         };
+        self.twin_use_with(depth, twin, colour, write)
+    }
+
+    /// [`HostList::twin_use`] of the depth texture's host copy `depth` and
+    /// its colour twin `twin`, which the caller found already.
+    pub(crate) fn twin_use_with(
+        &self,
+        depth: std::sync::Arc<crate::resource::HostTexture>,
+        twin: std::sync::Arc<crate::resource::Twin>,
+        colour: bool,
+        write: bool,
+    ) -> bool {
+        const UNORDERED_ACCESS: u32 = 0x8;
         let side = usize::from(colour);
         let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
         let u = twins
@@ -9666,10 +9688,20 @@ impl std::hash::Hasher for AddressHash {
         self.0
     }
     fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.write_usize(usize::from(b));
+        // Eight bytes a round: a [u32; 3] key is two rounds, not twelve
+        // (1.5 ms a frame of the translating threads).
+        let mut chunks = bytes.chunks_exact(8);
+        for c in &mut chunks {
+            self.write_usize(u64::from_le_bytes(c.try_into().unwrap()) as usize);
+        }
+        let rest = chunks.remainder();
+        if !rest.is_empty() {
+            let mut b = [0u8; 8];
+            b[..rest.len()].copy_from_slice(rest);
+            self.write_usize(u64::from_le_bytes(b) as usize);
         }
     }
+    #[inline]
     fn write_usize(&mut self, n: usize) {
         let h = (self.0.rotate_left(5) ^ n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
         self.0 = h ^ (h >> 32);

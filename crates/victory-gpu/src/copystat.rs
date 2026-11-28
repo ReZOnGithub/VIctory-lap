@@ -1206,20 +1206,41 @@ fn submitter(all: &mut Vec<(u32, Submitter)>, id: u32) -> &mut Submitter {
     &mut all[at].1
 }
 
-/// A list call on this thread that began at `started` has returned.
-pub(crate) fn recorded(started: std::time::Instant) {
-    let took = started.elapsed();
-    let ns = took.as_nanos() as u64;
-    crate::timeline::called(took);
+/// The start of a list call to time: one in 16 per thread, every one while
+/// the timeline records (its runs need each call). With it, the calls its
+/// time stands for. Two clock reads and the statistics around every one of
+/// the 28,100 list calls a frame were about 2 ms of the translating threads.
+pub(crate) fn record_start() -> Option<(std::time::Instant, u64)> {
+    thread_local! { static N: std::cell::Cell<u32> = const { std::cell::Cell::new(0) }; }
+    if crate::timeline::on() {
+        return Some((std::time::Instant::now(), 1));
+    }
+    let n = N.with(|n| {
+        let v = n.get().wrapping_add(1);
+        n.set(v);
+        v
+    });
+    (n & 15 == 0).then(|| (std::time::Instant::now(), 16))
+}
+
+/// A list call on this thread has returned; `started`: when it began and
+/// how many calls it stands for, if it is one that is timed
+/// ([`record_start`]: the times are then estimates from one call in 16).
+pub(crate) fn recorded(started: Option<(std::time::Instant, u64)>) {
     add(C::RecordCalls, 1);
+    let Some((started, scale)) = started else { return };
+    let took = started.elapsed();
+    let real = took.as_nanos() as u64;
+    let ns = real * scale;
+    crate::timeline::called(took);
     add(C::RecordNs, ns);
     if !RECORDED_SINCE.load(Relaxed) && !RECORDED_SINCE.swap(true, Relaxed) {
-        let began = now_us().saturating_sub(ns / 1000);
+        let began = now_us().saturating_sub(real / 1000);
         add(C::UntilRecordUs, began.saturating_sub(PRESENTED_AT.load(Relaxed)));
     }
     OURS.with(|o| o.set(o.get() + ns));
     let (unsent, calls) = UNSENT.with(|u| u.get());
-    let (unsent, calls) = (unsent + ns, calls + 1);
+    let (unsent, calls) = (unsent + ns, calls + scale);
     // By thread, a couple of milliseconds at a time.
     if unsent < 2_000_000 {
         UNSENT.with(|u| u.set((unsent, calls)));

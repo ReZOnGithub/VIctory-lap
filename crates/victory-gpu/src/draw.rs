@@ -685,10 +685,25 @@ fn heap_spread() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SPREAD").is_none_or(|v| v != "0"))
 }
 
+/// Whether a texture a shader reads is looked up once for its upload, its
+/// twin and its state (`VICTORY_HOST_PAIR_ONCE=0`: three times, as before).
+fn host_pair_once() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HOST_PAIR_ONCE").is_none_or(|v| v != "0"))
+}
+
 /// The host copy and range the buffer view of each of a heap's slots reads
 /// ([`State::heap_buffers`]), by slot.
-#[derive(Default)]
-struct HeapRanges<T>(Vec<Option<(T, u64, u64)>>);
+///
+/// Beside them, a bit for each slot that has one: the pass went over every
+/// slot of the heap to find the few that do (about 2 ms a frame).
+struct HeapRanges<T>(Vec<Option<(T, u64, u64)>>, Vec<u64>);
+
+impl<T> Default for HeapRanges<T> {
+    fn default() -> Self {
+        Self(Vec::new(), Vec::new())
+    }
+}
 
 /// Whether the heap buffer pass runs once a frame for each view heap a list
 /// binds, not once for all of them, and a list holds each heap's table of
@@ -711,7 +726,7 @@ pub(crate) struct BufferSweep {
 
 impl Default for BufferSweep {
     fn default() -> Self {
-        Self { passes: 0, ranges: HeapRanges(Vec::new()), unwatched: Default::default() }
+        Self { passes: 0, ranges: HeapRanges::default(), unwatched: Default::default() }
     }
 }
 
@@ -724,17 +739,63 @@ impl<T> HeapRanges<T> {
         if slot >= self.0.len() {
             self.0.resize_with(slot + 1, || None);
         }
+        let words = self.0.len().div_ceil(64);
+        if self.1.len() < words {
+            self.1.resize(words, 0);
+        }
+        let bit = 1u64 << (slot % 64);
+        if range.is_some() {
+            self.1[slot / 64] |= bit
+        } else {
+            self.1[slot / 64] &= !bit
+        }
         self.0[slot] = range;
+    }
+
+    fn clear(&mut self) {
+        self.0.clear();
+        self.1.clear();
     }
 
     /// Forgets the slots of one of `parts` parts
     /// (`HostHeap::buffer_slots_of`).
     fn forget_part(&mut self, part: u32, parts: u32) {
-        self.0.iter_mut().skip(part as usize).step_by(parts as usize).for_each(|r| *r = None);
+        if parts > 0 && 64 % parts == 0 && part < parts {
+            // The part's slots are the same bits of every word.
+            let mask = (0..64 / parts).fold(0u64, |m, k| m | 1u64 << (part + k * parts));
+            for (w, word) in self.1.iter_mut().enumerate() {
+                let mut m = *word & mask;
+                *word &= !mask;
+                while m != 0 {
+                    let b = m.trailing_zeros() as usize;
+                    m &= m - 1;
+                    self.0[w * 64 + b] = None;
+                }
+            }
+        } else {
+            for (i, r) in self.0.iter_mut().enumerate().skip(part as usize).step_by(parts as usize) {
+                *r = None;
+                self.1[i / 64] &= !(1u64 << (i % 64));
+            }
+        }
     }
 
+    /// The ranges, in slot order: only the slots that have one are looked at.
     fn ranges(&self) -> impl Iterator<Item = &(T, u64, u64)> {
-        self.0.iter().flatten()
+        self.1
+            .iter()
+            .enumerate()
+            .flat_map(|(w, &word)| {
+                let mut m = word;
+                std::iter::from_fn(move || {
+                    (m != 0).then(|| {
+                        let b = m.trailing_zeros() as usize;
+                        m &= m - 1;
+                        w * 64 + b
+                    })
+                })
+            })
+            .filter_map(move |i| self.0[i].as_ref())
     }
 }
 
@@ -747,7 +808,7 @@ mod heap_range_tests {
     #[test]
     fn every_slot_is_looked_at_again_in_a_round() {
         const SLOTS: u32 = 1000;
-        let mut ranges = HeapRanges(Vec::new());
+        let mut ranges = HeapRanges::default();
         ranges.set(7, None);
         assert_eq!(ranges.ranges().count(), 0);
         for slot in (0..SLOTS).step_by(3) {
@@ -777,7 +838,7 @@ mod heap_range_tests {
         use std::collections::HashMap;
         use std::sync::Arc;
         let copies: Vec<Arc<u64>> = (0..4400).map(Arc::new).collect();
-        let (mut table, mut slots) = (HashMap::new(), HeapRanges(Vec::new()));
+        let (mut table, mut slots) = (HashMap::new(), HeapRanges::default());
         for slot in 0..72_000u32 {
             let copy = &copies[slot as usize * 7919 % 4400];
             table.insert(slot, (copy.clone(), u64::from(slot), u64::from(slot) + 64));
@@ -959,7 +1020,7 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     let changed = host.buffer_changes();
     let all = *passes == 0 || (*passes % HEAP_ROUND == 0 && !heap_spread());
     let slots = if all {
-        ranges.0.clear();
+        ranges.clear();
         host.buffer_slots()
     } else if heap_spread() {
         // The written ones, and this pass's part of the others.
@@ -4891,6 +4952,10 @@ fn slot_afresh(
     // more if nothing changed in the list since.
     if listed
         && let Some(words) = crate::descriptor::record_at(table + u64::from(k) * 32)
+        // (A constant buffer named whole is never a listed view: make_listed
+        // gives None for it, after a look at this thread's map and two
+        // probes of it, about 1 ms a frame; the match below copies its data.)
+        && !crate::descriptor::record_is_constant(words)
         && let Some((mut listed, at, twin)) = host.make_listed(recording, words, index)
     {
         let kind = group
@@ -5148,8 +5213,19 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // the host (title memory does not have them).
             let aliased = crate::resource::alias_of(*resource as This)
                 .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
-            if !aliased
-                && let Some(t) = crate::resource::host_copy(*resource as This)
+            // The texture's host copy and twin, found once for the three
+            // asks below (each looked the texture up again under its lock:
+            // 1.2 ms a frame of the translating threads).
+            // `VICTORY_HOST_PAIR_ONCE=0`: each asks, as before.
+            let pair = if aliased || !host_pair_once() { None } else { crate::resource::host_pair(*resource as This) };
+            let asked;
+            let copy = if host_pair_once() {
+                pair.as_ref().map(|(copy, _)| copy)
+            } else {
+                asked = if aliased { None } else { crate::resource::host_copy(*resource as This) };
+                asked.as_ref()
+            };
+            if let Some(t) = copy
                 && t.flags() & 0x7 == 0
             {
                 // (A texture the title writes: no target, depth or unordered
@@ -5162,7 +5238,16 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
                 crate::texture::upload_from(list, *resource as This, first);
             }
             // A depth texture shaders also write: what they wrote, first.
-            list.twin_use(*resource as This, false, false);
+            match &pair {
+                Some((depth, twin)) => {
+                    if let Some(twin) = twin {
+                        list.twin_use_with(depth.clone(), twin.clone(), false, false);
+                    }
+                }
+                None => {
+                    list.twin_use(*resource as This, false, false);
+                }
+            }
             // The depth target the draw only tests is read in both ways at
             // once: both read states, which its preparation asks for too.
             let (tested, _) = TESTED_DEPTH.get();
@@ -5172,7 +5257,10 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             } else {
                 SHADER_RESOURCE
             };
-            crate::list::ensure_state(list, *resource as This, state);
+            match pair {
+                Some((copy, _)) => crate::list::ensure_state_copy(list, copy, state),
+                None => crate::list::ensure_state(list, *resource as This, state),
+            }
             #[cfg(feature = "diagnostics")]
             if tracing::enabled!(tracing::Level::DEBUG)
                 && let Some(t) = crate::resource::host_resource(*resource as This)

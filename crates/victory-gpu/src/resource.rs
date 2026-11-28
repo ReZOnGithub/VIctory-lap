@@ -405,7 +405,26 @@ pub(crate) fn twin(this: This) -> Option<std::sync::Arc<Twin>> {
     if this.is_null() {
         return None;
     }
+    // A twin is made only for a texture with depth and unordered access
+    // (`twin_texture`), from its immutable description: the others have
+    // none, and asking `hosted` for it only takes the lock (1.2 ms a frame
+    // of the translating threads, asked for every texture a draw reads).
+    const DEPTH_AND_UNORDERED: u32 = 6;
+    let r = resource(this);
+    if r.desc.dimension == BUFFER || r.desc.flags & DEPTH_AND_UNORDERED != DEPTH_AND_UNORDERED {
+        return None;
+    }
     hosted(this, true).and_then(|made| made.1)
+}
+
+/// A title texture's host copy and its colour twin, if it has one
+/// ([`host_copy`] and [`twin`]), found once.
+#[cfg(windows)]
+pub(crate) fn host_pair(this: This) -> Option<(std::sync::Arc<HostTexture>, Option<std::sync::Arc<Twin>>)> {
+    if this.is_null() {
+        return None;
+    }
+    hosted(this, true)
 }
 
 /// The twin's texture, for the unordered access views of `this`.

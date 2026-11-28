@@ -79,6 +79,8 @@ pub(crate) struct Staging {
     /// How many bytes of the texture's memory were mapped when a list last
     /// recorded an upload of it ([`fill_unlocked`]; 0: not asked).
     expected: std::sync::atomic::AtomicU64,
+    /// The frame (`crate::frame::current`) `expected` was last asked in.
+    expected_frame: std::sync::atomic::AtomicU64,
     /// Levels on demand (`crate::tiles`): the texture's host copy was made
     /// without memory of its own when the staging buffer was made.
     on_demand: bool,
@@ -789,11 +791,19 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
         }
     }
     if no_wait() && fill_unlocked() {
-        let there = match picking {
-            Some(there) if there != u64::MAX => there,
-            _ => mapped_bytes(staging.memory, staging.read),
-        };
-        staging.expected.store(there, Relaxed);
+        match picking {
+            Some(there) if there != u64::MAX => staging.expected.store(there, Relaxed),
+            // Asked once a frame: the same texture is recorded by many
+            // lists, and each asked the kernel two or three times (1.2 ms a
+            // frame of the translating threads). `VICTORY_EXPECTED_ONCE=0`:
+            // for every list, as before.
+            _ => {
+                let frame = crate::frame::current();
+                if !expected_once() || staging.expected_frame.swap(frame, Relaxed) != frame {
+                    staging.expected.store(mapped_bytes(staging.memory, staging.read), Relaxed);
+                }
+            }
+        }
     }
     // At submission time, `staging.refresh()` runs first (in parallel via
     // `Batch::refresh_front` or `Batch::refresh_textures`), and only then does
@@ -1764,6 +1774,14 @@ fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
     (there, of)
 }
 
+/// Whether the bytes of a texture's memory that are mapped are asked once a
+/// frame for each texture, not for every list that records an upload of it
+/// (`VICTORY_EXPECTED_ONCE=0`: for every list, as before).
+fn expected_once() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EXPECTED_ONCE").is_none_or(|v| v != "0"))
+}
+
 fn committed_by_query(at: *const u8, len: usize) -> bool {
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
     let mut p = at as usize;
@@ -1804,7 +1822,8 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
     {
         return there;
     }
-    if !committed(at, 1) && !committed((end - 1) as *const u8, 1) {
+    let first_there = committed(at, 1);
+    if !first_there && !committed((end - 1) as *const u8, 1) {
         return 0;
     }
     if !by_query() {
@@ -1827,7 +1846,9 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
         let mut block = start & !(BLOCK - 1);
         while block < end {
             let (lo, hi) = (block.max(start), block.saturating_add(BLOCK).min(end));
-            if readable(lo, 1, true).0 == 1 {
+            // (The first block's page was asked just above.)
+            let there_now = if lo == start { first_there } else { readable(lo, 1, true).0 == 1 };
+            if there_now {
                 there += (hi - lo) as u64;
             }
             block = block.saturating_add(BLOCK);
@@ -1957,6 +1978,7 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         uploaded: std::sync::atomic::AtomicBool::new(false),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
         expected: std::sync::atomic::AtomicU64::new(0),
+        expected_frame: std::sync::atomic::AtomicU64::new(u64::MAX),
         on_demand,
         detiled: std::sync::atomic::AtomicU32::new(0),
         judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
