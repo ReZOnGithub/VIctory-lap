@@ -44,7 +44,7 @@ minutes; nobody else has verified them.
 | Boots, first frame | Yes | Windows 10 and 11 (Windows 10 needed the Agility SDK fix below) |
 | Main menu | Yes | 60 fps |
 | In-game | Yes | Played from the start through the prison opening and its cutscenes into the first boat mission |
-| Frame rate in-game | **24 fps** | Boat mission, open water, 3,500 draws a frame: run averages 23.8 and 24.1 fps, single readings 22.7 to 25.0 (release build, default settings, 2026-11-28). Cutscenes 24 to 28 fps |
+| Frame rate in-game | **24 fps** | Boat mission, open water, 3,500 draws a frame: run averages 23.8 to 24.3 fps over four runs, single readings 22.7 to 25.0 (release build, default settings, 2026-11-28). Cutscenes 24 to 28 fps |
 | Frame rate in-game with DLSS frame generation (2x) | **43 to 44 fps shown** | Same scene: 21.5 to 22 frames rendered a second and as many generated (DLSS Quality, RTX 5070; Streamline reports 22 presents and 22 generated frames a second, status ok). Generated frames, not rendered ones |
 | Ray tracing (the title's own, `VICTORY_BVH_BUILDER=1`) | **Runs, 19 fps** | Same scene: run average 19.4 fps rendered, single readings 18.7 to 20.0; reflections of the bridge on the water and the shadows are there. Off by default |
 | 30 fps in-game, rendered | No | 24 fps today. See "Where the frame time goes" below: on this processor the title's own threads take about 220 ms of CPU a frame before the layer adds its share |
@@ -78,7 +78,7 @@ machine's numbers.
 | Part | CPU a frame | What it is |
 |---|---|---|
 | The title's own threads | about 220 ms over 20 threads | The game's code, unchanged. One of them waits some 18 ms a frame for results of GPU work |
-| Translating graphics calls | about 180 to 200 ms over 8 threads | 28,000 calls a frame re-recorded for the PC; three quarters of it is binding descriptors for each draw |
+| Translating graphics calls | about 150 ms over 8 threads (183 before the last round of changes) | 28,000 calls a frame re-recorded for the PC; four fifths of it is binding descriptors for each draw |
 | Copy helpers | about 50 ms over 8 threads | Copying and comparing what the title wrote in its memory (about 40 MB a frame) |
 | The thread that prepares submissions | 31 to 35 ms | Asks Windows which pages the title wrote (380 times a frame), refreshes the copies, hands 17 submissions to the card in order |
 | Bringing shader results back | about 15 ms | What shaders wrote goes back into the title's memory after each piece of GPU work |
