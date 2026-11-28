@@ -4,6 +4,13 @@ A fork of the VIctory compatibility layer, which runs an Xbox Series title
 natively on Windows from files the user supplies, tuned for **NVIDIA cards
 and Windows 10**.
 
+It is not an emulator of the console: the title's own x86-64 code runs
+directly on the PC's processor. The layer stands in for the console's
+runtime (the imports a title resolves from `xgameruntime.dll`, `d3d12_xs.dll`
+and the kernel side of the GDK), translates the console's shader binaries to
+DXIL, and re-records the title's Direct3D 12 command lists for a PC graphics
+card.
+
 **This repository contains no game files, code or assets.** You need your own
 copy of the game. It is not affiliated with or endorsed by the game's
 developer or publisher.
@@ -24,7 +31,7 @@ Built on:
 The earlier VIctory-lap tree (built on victory-fork) is on the branch
 `victory-lap-v1`.
 
-## Status (2026-11-27)
+## Status (2026-11-28)
 
 Self-reported, measured on one machine: Windows 10, Ryzen 7 3700X (8 cores),
 32 GB RAM, **NVIDIA GeForce RTX 5070**, ray tracing off, Series S profile
@@ -40,7 +47,7 @@ minutes; nobody else has verified them.
 | Frame rate in-game | **24 fps** | Boat mission, open water, 3,500 draws a frame: run average 24.1 fps, single readings 22.7 to 25.0 (release build, 2026-11-28). Cutscenes 24 to 28 fps |
 | Frame rate in-game with DLSS frame generation (2x) | **43 to 44 fps shown** | Same scene: 21.5 to 22 frames rendered a second and as many generated (DLSS Quality, RTX 5070; Streamline reports 22 presents and 22 generated frames a second, status ok). Generated frames, not rendered ones |
 | Ray tracing (the title's own, `VICTORY_BVH_BUILDER=1`) | **Runs, 19 fps** | Same scene: run average 19.4 fps rendered, single readings 18.7 to 20.0; reflections of the bridge on the water and the shadows are there. Off by default |
-| 30 fps in-game, rendered | No | One CPU thread of ours sets the frame (busy all but 1.6 ms of a 42 ms frame); the card is busy two thirds of it |
+| 30 fps in-game, rendered | No | 24 fps today. See "Where the frame time goes" below: on this processor the title's own threads take about 220 ms of CPU a frame before the layer adds its share |
 | Stable | Partly | Four-minute scripted runs repeat without a crash or a lost device; longer sessions were played by hand to the boat mission, not timed |
 
 **What works:** boot, menus, video, save and load, cutscenes, on-foot play and
@@ -61,6 +68,58 @@ under "How it renders".
 Earlier in the same build: the prison opening ran at about 9 fps (4,500 draws
 a frame) before the later changes in the table below; it has not been
 measured again.
+
+### Where the frame time goes
+
+Measured on the machine above in the boat mission (about 3,450 draws a frame,
+41 ms a frame), with the layer's own profiler and timeline. All of it is one
+machine's numbers.
+
+| Part | CPU a frame | What it is |
+|---|---|---|
+| The title's own threads | about 220 ms over 20 threads | The game's code, unchanged. One of them waits some 18 ms a frame for results of GPU work |
+| Translating graphics calls | about 180 to 200 ms over 8 threads | 28,000 calls a frame re-recorded for the PC; three quarters of it is binding descriptors for each draw |
+| Copy helpers | about 50 ms over 8 threads | Copying and comparing what the title wrote in its memory (about 40 MB a frame) |
+| The thread that prepares submissions | 31 to 35 ms | Asks Windows which pages the title wrote (380 times a frame), refreshes the copies, hands 17 submissions to the card in order |
+| Bringing shader results back | about 15 ms | What shaders wrote goes back into the title's memory after each piece of GPU work |
+| Sound | about 10 ms | Decoding the title's audio streams |
+
+The whole process uses 470 to 480 ms of CPU a frame, about twelve of this
+processor's sixteen threads. The card is busy 70 % of the frame; nine tenths
+of that is the title's own work.
+
+Why it is this shape: the console has one memory that its processor and its
+GPU share, and a title written for it writes buffers and expects the GPU to
+see them, and reads back what shaders wrote, with no copy in between. A PC
+with a graphics card of its own has two memories. The layer keeps a copy of
+the title's buffers on the card, finds out what changed, sends that up, and
+brings back what shaders wrote. Most of what is listed above is that.
+
+### What was tried for speed, and what it gave
+
+Kept, in the order they came (frame rate in the boat mission):
+
+| Change | Before | After |
+|---|---|---|
+| Release build with thin LTO, another allocator | 12 to 14 | 16.0 to 16.5 |
+| Submissions sent to the card by a thread of their own; write watch asked ahead by another | 16.5 | 17.3 to 17.5 |
+| Shader results of big buffers left on the card (nothing in the scenes played reads them) | 17.5 | 20.7 |
+| Textures hashed again only every 64th frame | 20.7 | about 22 |
+| Fewer walks, locks and clock reads on the hot paths (several rounds) | 22 | 22.9 to 23.6 |
+| Constant buffers read through slots of their own, so that their tables are read where the title has them; one asking of the write watch shared by submissions queued together | 23 | 24.1 |
+
+Measured and not kept, because the frame rate did not move: a second stage
+for the submitting thread; telling the title earlier that GPU work is done;
+longer spinning in the helpers and at the title's waits; reusing whole
+descriptor tables (107 of 7,071 a frame were the same as an earlier one);
+profile-guided optimisation (3 %, not worth its build time); fat LTO and
+newer processor instructions (slower).
+
+One experiment is the reason for the next piece of work: with the shader
+results not brought back at all and the title told at once (the picture is
+wrong that way), the same scene runs at 26.3 fps. A correct form of it, the
+results brought back only when the title touches them, is in the tree behind
+`VICTORY_LAND_LAZY` and not yet verified.
 
 ### How it renders
 
@@ -206,6 +265,30 @@ target\release\victory.exe warm --used                     # pipelines earlier r
 Commands, debugging switches and upstream's own description:
 [docs/README-fxceless.md](docs/README-fxceless.md). Every `VICTORY_...` switch is
 described in a comment where it is read.
+
+## Measuring it yourself
+
+The numbers in this file come from tools that are in the tree (diagnostics
+builds):
+
+- The frame line in the log every five seconds: frame rate, draws, megabytes
+  copied, what the submitting thread did.
+- `VICTORY_PROFILE=1`: a sampling profiler of the layer's and the title's
+  threads, written as a report and as folded stacks for a flame graph
+  (`VICTORY_PROFILE_THREADS`, `VICTORY_PROFILE_AFTER`, `VICTORY_PROFILE_FOR`,
+  `VICTORY_PROFILE_OUT`).
+- `VICTORY_TIMELINE=<seconds>,<frames>,<file>`: a few frames as a trace with
+  every thread, wait and GPU submission, and a text summary of what each
+  frame waited for.
+- `VICTORY_AB=<seconds>,<switch>[,<switch>]`: switches flipped while the title
+  runs, each phase's frame times logged, so that one run compares both sides
+  in the same scene.
+- `VICTORY_GPU_TIMING=1`: the card's time for every list, one at a time.
+- `VICTORY_CAPTURE=<folder>`: frames written as pictures while it runs.
+
+Other programs on the PC matter at this point: a browser and a chat program
+open cost about 1.5 fps here, and the title in the world holds about 21 GB
+of RAM on this build.
 
 ## License
 
