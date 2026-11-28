@@ -4590,20 +4590,9 @@ impl Shadow {
         // then).
         let mut force = Vec::new();
         if crate::lazy::armed_over(from, to) {
-            let (skip, due, given) = crate::lazy::before_refresh(self, from, to);
+            let (skip, due) = crate::lazy::before_refresh(self, from, to);
             busy.extend(skip);
             force = due;
-            // Another copy's armed pages that the title wrote before: their
-            // bytes from the entry's snapshot (title memory as it is), and
-            // left alone below.
-            for (a, b, snap, base) in given {
-                let pending: Vec<(usize, usize)> =
-                    self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().filter(|&(x, y)| x < b && y > a).collect();
-                for (x, y) in outside(a, b, pending) {
-                    self.take_given(x, &snap[x - base..y - base]);
-                }
-                busy.push((a, b));
-            }
         }
         if !force.is_empty() {
             // Another copy's armed bytes, landed just now: taken whatever
@@ -5546,11 +5535,8 @@ impl Shadow {
         if crate::inplace::shown_bytes(first, last - first).is_some() || crate::watch::guarded(first, last) {
             return (Err(Why::View), 0);
         }
-        if !self.plainly_watched() {
+        if !self.plainly_watched() || !crate::inplace::private_whole(first, last - first) {
             return (Err(Why::Unwatched), 0);
-        }
-        if !crate::inplace::private_whole(first, last - first) {
-            return (Err(Why::NotPrivate), 0);
         }
         let kinds = self.others_over(first, last);
         if kinds != 0 && !crate::lazy::shared_on() {
@@ -5564,42 +5550,26 @@ impl Shadow {
     /// holds it, is what the copy's CPU side holds, so that the copy has
     /// nothing to take from those pages while they are armed. A page that
     /// cannot be read is not.
-    pub(crate) fn lazy_same(&self, at: usize, title: &[u8]) -> bool {
+    pub(crate) fn lazy_clean(&self, from: usize, to: usize) -> bool {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-        let (from, to) = (at.max(start), (at + title.len()).min(end));
+        let (from, to) = (from.max(start), to.min(end));
         if from >= to {
             return true;
         }
-        // SAFETY: inside the CPU side's mapping (`[from, to)` is inside the
-        // buffer); what writes it meanwhile writes title bytes, which are
-        // these.
-        let held = unsafe { std::slice::from_raw_parts(self.data.add(from - start).cast_const(), to - from) };
-        held == &title[from - at..to - at]
-    }
-
-    /// `VICTORY_LAND_LAZY`: title memory `[at, at + title.len())`, as an
-    /// armed entry's snapshot has it (the title cannot have written it
-    /// since), goes into the copy as a refresh of it would put it: the
-    /// dwords that differ, sent up to the card's side after. The caller
-    /// leaves out the ranges this copy's shaders may be writing. Returns the
-    /// bytes looked at.
-    pub(crate) fn take_given(&self, at: usize, title: &[u8]) -> usize {
-        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-        let (from, to) = (at.max(start), (at + title.len()).min(end));
-        if from >= to || self.place.is_some() {
-            return 0;
+        thread_local! {
+            static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
-        let title = &title[from - at..to - at];
-        // SAFETY: inside the copy's mapping; nothing else writes these bytes
-        // during a refresh of them (no shader's range holds them).
-        let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(from - start), to - from) };
-        let runs = dword_runs(from, held, title, 0);
-        for &(a, len) in &runs {
-            held[a..a + len].copy_from_slice(&title[a..a + len]);
-            self.changed(from - start + a, from - start + a + len);
-        }
-        self.card_changed_runs(runs.iter().map(|&(a, len)| (from - start + a, from - start + a + len)));
-        to - from
+        TITLE.with_borrow_mut(|title| {
+            title.resize(to - from, 0);
+            if !crate::host::read_into(from as *const u8, title) {
+                return false;
+            }
+            // SAFETY: inside the CPU side's mapping (`[from, to)` is inside
+            // the buffer); what writes it meanwhile writes title bytes,
+            // which are these.
+            let held = unsafe { std::slice::from_raw_parts(self.data.add(from - start).cast_const(), to - from) };
+            held == &title[..]
+        })
     }
 
     /// The kinds of other copies that hold title memory of `[first, last)`:

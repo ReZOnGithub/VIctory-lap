@@ -6432,7 +6432,7 @@ impl Host {
                 let extra = crate::lazy::why_bits(
                     &failed.iter().map(|f| f.3).chain((!demoted.is_empty()).then_some(crate::lazy::Why::Beside)).collect::<Vec<_>>(),
                 );
-                pieces.extend(demoted.into_iter().map(|(s, lo, hi, ..)| (s, lo, hi, 0)));
+                pieces.extend(demoted.into_iter().map(|(s, lo, hi, _)| (s, lo, hi, 0)));
                 pieces.extend(failed.into_iter().map(|(s, lo, hi, _)| (s, lo, hi, 0)));
                 crate::lazy::landing_fetched(&pieces, &whys, extra);
                 total = 0;
@@ -6961,15 +6961,6 @@ impl Host {
                     crate::land::spent(crate::land::stat::TOLD, telling)
                 }
             };
-        }
-        // `VICTORY_LAND_LAZY`: what is armed to land soon (hot copies, title
-        // bytes the copies had not taken, two copies on the same pages) is
-        // landed now, the title told: its traps held meanwhile.
-        if crate::lazy::mode() == crate::lazy::Mode::Lazy {
-            let soon = crate::lazy::take_soon();
-            if !soon.is_empty() {
-                self.lazy_land(&soon, false);
-            }
         }
         // In the flights' order, as it was done among the telling.
         for mut flight in tidy {
