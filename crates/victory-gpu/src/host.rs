@@ -3516,6 +3516,11 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// The resources [`HostList::keep_once`] kept, by address. (With the
+    /// standard hash: [`AddressHash`] spreads the addresses of COM objects
+    /// badly, and an insert was 300 ns of looking through full groups,
+    /// 12 ms a frame for 40,000, profile p8.)
+    kept_once: std::collections::HashSet<usize>,
     /// The pipelines [`HostList::bind_pipeline`] kept, by address.
     bound: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
     /// Buffer ranges refreshed since the last title copy (host copy,
@@ -9645,6 +9650,20 @@ impl HostList {
         if let Ok(object) = object.cast::<windows::core::IUnknown>() {
             self.deferred().kept.push(object);
         }
+    }
+
+    /// [`HostList::keep`] of a resource the list may be asked to keep many
+    /// times (what its dynamic descriptor slots view,
+    /// `crate::descriptor::host::keep_by_list`): kept the first time.
+    /// Whether this was the first.
+    pub(crate) fn keep_once(&self, resource: &ID3D12Resource) -> bool {
+        let mut deferred = self.deferred();
+        if !deferred.kept_once.insert(resource.as_raw() as usize) {
+            return false;
+        }
+        // (An interface pointer of its own, as `keep` takes: a reference.)
+        deferred.kept.push(windows::core::IUnknown::from(resource.clone()));
+        true
     }
 
     /// Whether this is the first time since the reset that the list asks

@@ -1702,6 +1702,9 @@ impl State {
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        // What the dynamic slots made from here on view is this list's to
+        // keep (`crate::descriptor::host::keep_by_list`).
+        let _keeping = crate::descriptor::host::keeping(list);
         let l = &list.list;
         #[cfg(feature = "diagnostics")]
         self.apart_bound.clear();
@@ -5050,7 +5053,9 @@ static APART: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 #[cfg(feature = "diagnostics")]
 fn apart_text(f: f64) -> String {
     let [looked, known, moved] = std::array::from_fn(|i| DIRECT_ONCE[i].swap(0, Ordering::Relaxed) as f64 / f);
-    let direct = format!("draws' tables read in place: {looked:.0} looked through ({moved:.0} of them seen before, the list's epoch moved), {known:.0} found up to date (VICTORY_DIRECT_ONCE)");
+    let [by_list, by_list_first] =
+        std::array::from_fn(|i| crate::descriptor::host::KEEP_BY_LIST[i].swap(0, Ordering::Relaxed) as f64 / f);
+    let direct = format!("draws' tables read in place: {looked:.0} looked through ({moved:.0} of them seen before, the list's epoch moved), {known:.0} found up to date (VICTORY_DIRECT_ONCE); dynamic slots whose resource their list keeps {by_list:.0}, {by_list_first:.0} of them the list's first of it (VICTORY_KEEP_BY_LIST)");
     if !victory_shader::emit::table_cbvs_apart() {
         return format!("{direct}; constant buffers apart: off");
     }

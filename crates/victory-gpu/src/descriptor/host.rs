@@ -3365,10 +3365,55 @@ impl HostHeap {
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
         // (Made anew: no template's view any more.)
         self.unrun(index);
+        if self.kept_by_list(index, resource.as_ref()) {
+            return;
+        }
         if self.kept_already(index, resource.as_ref()) {
             return;
         }
         self.keep_locked(index, resource);
+    }
+
+    /// With [`keep_by_list`]: a dynamic slot made while a list binds on this
+    /// thread ([`keeping`]) has what it views kept by that list, once for
+    /// all of the list's slots that view it. Whether that was done.
+    fn kept_by_list(&self, index: u32, resource: Option<&ID3D12Resource>) -> bool {
+        if index < self.count || !keep_by_list() {
+            return false;
+        }
+        let list = KEEPER.get();
+        if list.is_null() {
+            return false;
+        }
+        if let Some(resource) = resource {
+            // SAFETY: set by [`keeping`] from a list borrowed for as long as
+            // its guard lives, on this thread; the guard takes it back.
+            let list = unsafe { &*list };
+            // What this thread has had the list keep since the list last
+            // changed: asked here, in the thread's own memory. (Asking the
+            // list for every slot was 13 ms a frame, 300 ns a slot, at the
+            // first touch of what the list keeps, whichever hash its set
+            // had: profiles p8 and p9.) The list's epoch is a number of its
+            // own from every reset on, so what was kept under it is still
+            // kept; when it moves the list is asked again, which keeps a
+            // resource once whatever this thread remembers.
+            let key = (std::ptr::from_ref(list) as usize, list.epoch());
+            let raw = windows::core::Interface::as_raw(resource) as usize;
+            let fresh = KEPT_SEEN.with(|seen| {
+                let mut seen = seen.borrow_mut();
+                if seen.0 != key {
+                    seen.0 = key;
+                    seen.1.clear();
+                }
+                seen.1.insert(raw)
+            });
+            let first = fresh && list.keep_once(resource);
+            #[cfg(feature = "diagnostics")]
+            keep_by_list_count(first);
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = first;
+        }
+        true
     }
 
     /// [`HostHeap::keep`] under the slot's lock.
@@ -3433,6 +3478,9 @@ impl HostHeap {
     /// reference taken) only if the slot does not hold it already.
     fn keep_ref(&self, index: u32, resource: Option<&ID3D12Resource>) {
         self.unrun(index);
+        if self.kept_by_list(index, resource) {
+            return;
+        }
         if self.kept_already(index, resource) {
             return;
         }
@@ -6824,6 +6872,80 @@ pub(crate) fn views_kept_counts() -> [u64; 7] {
 fn keep_fast() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_KEEP_FAST").is_none_or(|v| v != "0"))
+}
+
+/// Whether what a dynamic slot views is kept by the list that took the slot,
+/// not by the slot (`VICTORY_KEEP_BY_LIST=0`: by the slot, as before; on by
+/// default).
+///
+/// A dynamic slot is a list's from when the list takes it until the list's
+/// submissions have run, and a list keeps what its commands name until then
+/// already (`HostList::keep`, dropped at its reset, which comes after its
+/// slots are given back). Each slot kept its resource on its own instead: a
+/// reference taken, the slot's pointer swapped and the resource it showed
+/// before retired, for every slot of every table made afresh, nine in ten of
+/// them a change (65,029 slots a frame, 6,229 holding theirs already, run
+/// s2): 25.6 ms a frame of the translating threads with what it calls, 10.4
+/// of them in the swap itself (profile p6). A list sees the same few
+/// resources in most of its slots; it keeps each once.
+///
+/// Only while a list binds on the thread ([`keeping`]): a dynamic slot made
+/// elsewhere keeps its resource itself, as before. A slot's own pointer is
+/// not written then, so it is not what [`HostHeap::kept_already`] may go by:
+/// this is asked first.
+fn keep_by_list() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_KEEP_BY_LIST").is_none_or(|v| v != "0"))
+}
+
+thread_local! {
+    /// The list that binds on this thread now ([`keeping`]); null: none.
+    static KEEPER: std::cell::Cell<*const crate::host::HostList> = const { std::cell::Cell::new(std::ptr::null()) };
+    /// The resources this thread had a list keep ([`HostHeap::kept_by_list`]),
+    /// for one list and epoch of its: (the list, its epoch), their addresses.
+    static KEPT_SEEN: std::cell::RefCell<((usize, u64), std::collections::HashSet<usize>)> =
+        std::cell::RefCell::new(((0, 0), std::collections::HashSet::new()));
+}
+
+/// While it lives, dynamic slots made on this thread have what they view
+/// kept by `list` ([`keep_by_list`]).
+pub(crate) struct Keeping(*const crate::host::HostList);
+
+/// See [`Keeping`]. The list is the one whose tables are being made: the one
+/// that takes the dynamic slots.
+pub(crate) fn keeping(list: &crate::host::HostList) -> Keeping {
+    Keeping(KEEPER.replace(std::ptr::from_ref(list)))
+}
+
+impl Drop for Keeping {
+    fn drop(&mut self) {
+        KEEPER.set(self.0);
+    }
+}
+
+/// Dynamic slots whose resource their list keeps ([`keep_by_list`]) since
+/// the last frame line: all, and those that were the list's first of it.
+#[cfg(feature = "diagnostics")]
+pub(crate) static KEEP_BY_LIST: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+#[cfg(feature = "diagnostics")]
+thread_local! {
+    static KEEP_BY_LIST_LOCAL: std::cell::Cell<(u32, u32)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+#[cfg(feature = "diagnostics")]
+fn keep_by_list_count(first: bool) {
+    KEEP_BY_LIST_LOCAL.with(|local| {
+        let (mut all, mut firsts) = local.get();
+        all += 1;
+        firsts += u32::from(first);
+        if all >= 1024 {
+            KEEP_BY_LIST[0].fetch_add(u64::from(all), std::sync::atomic::Ordering::Relaxed);
+            KEEP_BY_LIST[1].fetch_add(u64::from(firsts), std::sync::atomic::Ordering::Relaxed);
+            (all, firsts) = (0, 0);
+        }
+        local.set((all, firsts));
+    });
 }
 
 /// [`HostHeap::kept_already`]'s answers since the last frame line: held
