@@ -171,8 +171,10 @@ under Windows 10 it crashed at boot, then ran at 2.5 fps. Step by step:
   leaves what shaders write into buffers of 1 MB and more on the card.
   Smaller ones are read by the title: with 64 KB its ray tracing fails at the
   start and fewer textures arrive while moving; with none brought down the
-  picture goes white. `VICTORY_LAND_NOT_KB=64` is about 1 fps faster without
-  ray tracing; `VICTORY_LAND_NOT_KB=100000000` brings everything down.
+  picture goes white. Lowering it further gains nothing on the current build:
+  with almost nothing brought down the same scene ran at 24.1 fps, as with
+  the default (2026-11-28), and the picture is wrong that way.
+  `VICTORY_LAND_NOT_KB=100000000` brings everything down.
 - **Not usable on NVIDIA:** renderer ports 1 and 5 (`VICTORY_PORT_CONSTANTS`,
   `VICTORY_PORT_CBV`, the title's memory read in place by the card): the card
   reads the PC's memory several times slower, and the picture is black with
