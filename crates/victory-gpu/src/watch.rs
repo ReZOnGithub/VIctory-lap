@@ -2376,7 +2376,7 @@ fn known_views(first: usize, last: usize) -> bool {
 
 /// A bit per block of the address space, in pieces made when first needed
 /// and never let go.
-struct Bits([std::sync::atomic::AtomicPtr<BitsPiece>; Bits::PIECES]);
+pub(crate) struct Bits([std::sync::atomic::AtomicPtr<BitsPiece>; Bits::PIECES]);
 
 /// The bits of 4 GiB.
 type BitsPiece = [std::sync::atomic::AtomicU64; Bits::WORDS];
@@ -2386,7 +2386,7 @@ impl Bits {
     /// 128 TiB, what a process has.
     const PIECES: usize = 1 << 15;
 
-    const fn new() -> Bits {
+    pub(crate) const fn new() -> Bits {
         Bits([const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; Bits::PIECES])
     }
 
@@ -2396,7 +2396,7 @@ impl Bits {
         unsafe { piece.as_ref() }
     }
 
-    fn set(&self, block: usize) {
+    pub(crate) fn set(&self, block: usize) {
         use std::sync::atomic::Ordering::{AcqRel, Acquire, SeqCst};
         let word = block / 64;
         let Some(place) = self.0.get(word / Bits::WORDS) else {
@@ -2499,7 +2499,7 @@ impl Bits {
         }
     }
 
-    fn clear(&self, block: usize) {
+    pub(crate) fn clear(&self, block: usize) {
         let word = block / 64;
         if let Some(piece) = self.piece(word) {
             // Ahead of the protection's change, and seen by whoever the
@@ -2509,7 +2509,7 @@ impl Bits {
     }
 
     /// Whether a bit of `[first, last)` is set.
-    fn any(&self, first: usize, last: usize) -> bool {
+    pub(crate) fn any(&self, first: usize, last: usize) -> bool {
         let mut block = first;
         while block < last {
             let word = block / 64;
@@ -2803,6 +2803,9 @@ fn placeholder(block: usize) -> bool {
 /// The runtime gave the title memory at `[at, at + len)`, allocated or
 /// committed: what was known of holes there is asked again.
 pub fn title_memory_allocated(at: usize, len: usize) {
+    // A commit makes pages read-write: what was armed there is no trap any
+    // more (memory freed with nobody telling, or committed again).
+    crate::lazy::forget(at, len, |inside| allocation_end(at, inside));
     if len == 0 || !known_holes() {
         return;
     }
@@ -3945,6 +3948,9 @@ fn unguard(g: &Guards, blocks: &[usize]) {
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
+    // `VICTORY_LAND_LAZY`: the kernel's write would fail on a no-access
+    // page, so what is armed there lands first.
+    crate::lazy::before_kernel(at, len);
     // The length is the title's (`fread`'s size times count, saturated).
     let last = at.saturating_add(len).div_ceil(BLOCK);
     if !light() || PROTECTED.any(at / BLOCK, last) {
@@ -3972,6 +3978,9 @@ pub struct KernelWrite(usize, usize);
 /// write fail (the kernel does not fault into our handler): a read cut
 /// short, which the title takes for what the file holds.
 pub fn kernel_writing(at: usize, len: usize) -> KernelWrite {
+    // As in [`writing`]. (A block armed again before the call is done is one
+    // a flight wrote in the middle of the title's file read into it.)
+    crate::lazy::before_kernel(at, len);
     let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     {
         let mut g = guards_timed();
@@ -4377,11 +4386,20 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
     }
 }
 
+/// The runtime is about to release the allocation at `at` with no
+/// [`title_memory_freed`] (`XMemFreeDefault`): only what `VICTORY_LAND_LAZY`
+/// armed there is forgotten (nothing at all with it off).
+pub fn title_memory_released(at: usize) {
+    crate::lazy::forget(at, 0, |inside| allocation_end(at, inside));
+}
+
 /// The title is about to free or decommit memory of its own,
 /// `[at, at + len)`, or with no length the whole allocation at `at`: what
 /// was noted of its blocks (guarded, clean, absent) would be taken for true
 /// of the next memory at the address.
 pub fn title_memory_freed(at: usize, len: usize) {
+    // What is armed there to land on touch is the freed memory's.
+    crate::lazy::forget(at, len, |inside| allocation_end(at, inside));
     if len != 0 {
         forget_views(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     } else if VIEWS.any(at / BLOCK, at / BLOCK + 1) {
@@ -4504,6 +4522,21 @@ pub(crate) fn install() {
             unsafe { (*context).Rip = exit as u64 };
             EXCEPTION_CONTINUE_EXECUTION
         };
+        // `VICTORY_LAND_LAZY`: a page made no-access until what shaders
+        // wrote there lands, read or written (by the title, or a copy of
+        // ours): landed, and the access goes again. Nothing is armed, and
+        // this is one load, with the switch off.
+        if r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION as NTSTATUS && r.NumberParameters >= 2 && crate::lazy::any() {
+            match crate::lazy::touched(r.ExceptionInformation[1], r.ExceptionInformation[0] == WRITE, ours.is_some()) {
+                crate::lazy::Touch::Again => return EXCEPTION_CONTINUE_EXECUTION,
+                crate::lazy::Touch::Fail => {
+                    if let Some(exit) = ours {
+                        return fail(exit);
+                    }
+                }
+                crate::lazy::Touch::Not => {}
+            }
+        }
         if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS
             || r.NumberParameters < 2
             || r.ExceptionInformation[0] != WRITE

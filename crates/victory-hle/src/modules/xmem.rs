@@ -394,12 +394,16 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
+            // (What the GPU side armed to land on touch there goes first:
+            // the address may be other memory's the moment it is free.)
+            victory_gpu::title_memory_released(address as usize);
             VirtualFree(address, 0, MEM_RELEASE);
             return;
         }
         let user = address.cast::<u8>();
         let [size, align] = user.sub(HEADER).cast::<[usize; 2]>().read();
         if size & WATCHED_BLOCK != 0 {
+            victory_gpu::title_memory_released(user.sub(align) as usize);
             VirtualFree(user.sub(align).cast(), 0, MEM_RELEASE);
             return;
         }

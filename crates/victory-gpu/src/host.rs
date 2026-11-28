@@ -3778,6 +3778,30 @@ fn relay_copy() -> bool {
 /// what queues hold.
 static RELAY_MOVED: std::sync::Condvar = std::sync::Condvar::new();
 
+/// [`relay_copy`], for `crate::lazy`.
+pub(crate) fn relay_copy_on() -> bool {
+    relay_copy()
+}
+
+/// Whether `VICTORY_LAND_EVERY_MS` is set, for `crate::lazy`.
+pub(crate) fn land_every_on() -> bool {
+    land_every().is_some()
+}
+
+/// `crate::lazy`: a touch waits for the thread that lands flights, which may
+/// be waiting for the line to move (with the switch it looks again within
+/// 5 ms whatever happens; this is the quick way).
+pub(crate) fn relay_wake() {
+    RELAY_MOVED.notify_all();
+}
+
+thread_local! {
+    /// `crate::lazy`, on the thread that lands flights: its own list, fence,
+    /// event and memory for landing on touch (beside [`RelayFetch`] of the
+    /// eager landing, which a landing on touch may interrupt in the handler).
+    static LAZY_RIG: std::cell::RefCell<Option<RelayFetch>> = const { std::cell::RefCell::new(None) };
+}
+
 /// Told when flights have landed ([`relay`]): who waits for that looks
 /// again.
 static LINE_LANDED: std::sync::Condvar = std::sync::Condvar::new();
@@ -4890,12 +4914,32 @@ fn relay_worker() {
         fail(format_args!("no event for the thread that lands submissions sent ahead (VICTORY_RELAY=1)"));
     };
     let mut fetch: Option<RelayFetch> = None;
+    let lazy = crate::lazy::on();
+    if lazy {
+        crate::lazy::this_is_the_relay();
+    }
     loop {
+        // `VICTORY_LAND_LAZY`: touches waiting for a landing, first.
+        if lazy && crate::lazy::asked() {
+            let blocks = crate::lazy::take_asked();
+            if !blocks.is_empty() {
+                host.lazy_land(&blocks, true);
+            }
+        }
         let next = {
             let mut line = line();
             loop {
                 if line.line.is_empty() {
-                    line = RELAY_MOVED.wait(line).unwrap_or_else(|e| e.into_inner());
+                    if lazy {
+                        if crate::lazy::asked() {
+                            break Err(None);
+                        }
+                        // (A touch's wake may come between the look and
+                        // the wait: looked at again soon whatever comes.)
+                        line = RELAY_MOVED.wait_timeout(line, std::time::Duration::from_millis(5)).unwrap_or_else(|e| e.into_inner()).0;
+                    } else {
+                        line = RELAY_MOVED.wait(line).unwrap_or_else(|e| e.into_inner());
+                    }
                     continue;
                 }
                 let fences: Vec<Option<u64>> = line
@@ -4911,7 +4955,7 @@ fn relay_worker() {
                 let n = landable(&fences, completed);
                 if n == 0 {
                     // The first thing is a flight the card has not run.
-                    break Err(fences[0].unwrap_or(0));
+                    break Err(Some(fences[0].unwrap_or(0)));
                 }
                 line.settling = true;
                 let items: Vec<Late> = line.line.drain(..n).collect();
@@ -4930,14 +4974,21 @@ fn relay_worker() {
         };
         match next {
             Ok(items) => host.relay_land(items, &mut fetch),
-            Err(target) => {
+            Err(None) => {}
+            Err(Some(target)) => {
                 let waiting = std::time::Instant::now();
                 #[cfg(feature = "diagnostics")]
                 let _card = crate::timeline::card_wait(Some(target));
-                // SAFETY: the host's fence and this thread's event.
+                // SAFETY: the host's fence and this thread's event; with
+                // `VICTORY_LAND_LAZY` also the event a touch sets.
                 let waited = unsafe {
                     host.fence.SetEventOnCompletion(target, event).map(|()| {
-                        WaitForSingleObject(event, INFINITE);
+                        if lazy {
+                            let events = [event.0, crate::lazy::event() as windows_sys::Win32::Foundation::HANDLE];
+                            windows_sys::Win32::System::Threading::WaitForMultipleObjects(2, events.as_ptr(), 0, INFINITE);
+                        } else {
+                            WaitForSingleObject(event, INFINITE);
+                        }
                     })
                 };
                 if waited.is_err() {
@@ -6343,6 +6394,15 @@ impl Host {
         // a scene where the title's CPU reads such a buffer sees it as it
         // was before the shaders wrote. Bringing it down when the title
         // first touches it would be the whole answer.
+        // `VICTORY_LAND_LAZY` (`crate::lazy`): of the pieces of copies
+        // that may be armed, none is fetched (`=check`: all are, as before);
+        // `VICTORY_LAND_NOT_KB` then says of the others what it said.
+        let lazy = crate::lazy::mode();
+        let mut arms: Vec<crate::lazy::Arm> = Vec::new();
+        if lazy != crate::lazy::Mode::Off {
+            crate::lazy::flights_landed(plans.iter().map(|p| p.0.sent_as).max().unwrap_or(0));
+            arms = crate::lazy::split(&mut pieces, land_not_least());
+        }
         {
             let least = land_not_least();
             if least != u64::MAX {
@@ -6354,6 +6414,47 @@ impl Host {
                 }
             }
         }
+        match lazy {
+            crate::lazy::Mode::Lazy => {
+                // What lands as before writes title memory at its address:
+                // what is armed where it writes lands first, and an arm
+                // beside it lands with it. Armed before the fetch: what
+                // cannot be lands with it too.
+                let eager_at: Vec<(usize, usize)> = pieces.iter().map(|(s, lo, hi, _)| (s.span().0 as usize + lo, hi - lo)).collect();
+                let (demoted, first) = crate::lazy::before_eager(&eager_at, &mut arms);
+                if !first.is_empty() {
+                    self.lazy_land(&first, false);
+                }
+                let failed = crate::lazy::arm(std::mem::take(&mut arms));
+                pieces.extend(demoted.into_iter().map(|(s, lo, hi, _)| (s, lo, hi, 0)));
+                pieces.extend(failed.into_iter().map(|(s, lo, hi)| (s, lo, hi, 0)));
+                total = 0;
+                for piece in &mut pieces {
+                    piece.3 = total;
+                    total += (piece.2 - piece.1) as u64;
+                }
+            }
+            crate::lazy::Mode::Check if crate::lazy::any() => {
+                // What the landing below writes is no-access since an
+                // earlier landing: opened first, not compared (it is about
+                // to be written).
+                let first: Vec<usize> = pieces
+                    .iter()
+                    .flat_map(|(s, lo, hi, _)| crate::lazy::blocks_over(s.span().0 as usize + lo, s.span().0 as usize + hi))
+                    .collect();
+                if !first.is_empty() {
+                    self.lazy_land(&first, false);
+                }
+            }
+            _ => {}
+        }
+        // `=check`: armed when the landing is done.
+        let check_arms = std::mem::take(&mut arms);
+        let arm_checked = move || {
+            if !check_arms.is_empty() {
+                crate::lazy::arm(check_arms);
+            }
+        };
         // `VICTORY_LAND_EVERY_MS=<n>`: the pieces are brought down together,
         // every n ms at most, and not after each flight, as long as other
         // flights are in the air (with none, at once: whatever waits for all
@@ -6423,6 +6524,7 @@ impl Host {
                 false => *QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()),
             };
             crate::shadow::relay_fetched(after);
+            arm_checked();
             return;
         }
         let Some(f) = fetch.as_mut() else {
@@ -6558,6 +6660,118 @@ impl Host {
         }
         // Sends up to `after` are of no use to any later merge.
         crate::shadow::relay_fetched(after);
+        arm_checked();
+    }
+
+    /// `crate::lazy`, on the thread that lands flights: the entries of
+    /// `blocks` (and the runs of their copy around them) are fetched on its
+    /// copy queue, their pages opened and what the card wrote put into title
+    /// memory as the eager landing puts it (`Shadow::land_card`, with the
+    /// sends known to be on the card: `crate::lazy::behind`). With `=check`
+    /// nothing is put; with `compare`, what would be is compared with title
+    /// memory. A flight still in the air that writes a block is not waited
+    /// for (as the eager fetch, this may bring some of its bytes; its own
+    /// landing arms the block again).
+    pub(crate) fn lazy_land(&self, blocks: &[usize], compare: bool) {
+        use crate::lazy;
+        if lazy::serving(true) {
+            // (Within one: left to it.)
+            return;
+        }
+        let began = std::time::Instant::now();
+        let _landing = crate::timeline::span("landing on touch");
+        let taken = lazy::taking(blocks);
+        if taken.is_empty() {
+            lazy::serving(false);
+            return;
+        }
+        let mut total = 0u64;
+        let offsets: Vec<u64> = taken
+            .iter()
+            .map(|t| {
+                let at = total;
+                total += (t.entry.hi - t.entry.lo) as u64;
+                at
+            })
+            .collect();
+        let (data, after) = LAZY_RIG.with_borrow_mut(|rig| {
+            if rig.is_none() {
+                *rig = self.make_relay_fetch();
+            }
+            let Some(f) = rig.as_mut() else {
+                fail(format_args!("no list, fence or event to land on touch (VICTORY_LAND_LAZY)"));
+            };
+            let Some(queue) = f.queue.clone() else {
+                fail(format_args!("no copy queue to land on touch (VICTORY_LAND_LAZY needs VICTORY_RELAY_COPY=1)"));
+            };
+            if f.buffer.as_ref().is_none_or(|b| b.2 < total) {
+                let size = total.next_multiple_of(16 << 20);
+                f.buffer = self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
+            }
+            let Some((buffer, data, _)) = f.buffer.clone() else {
+                fail(format_args!("no memory to land on touch ({total} bytes, VICTORY_LAND_LAZY)"));
+            };
+            f.sent += 1;
+            // Every send up to this is on the card before the fetch runs:
+            // what went up after it is left out of the merge.
+            let after = lazy::behind();
+            let ((allocator, list), fence, event, sent) = (&f.list, &f.fence, f.event, f.sent);
+            // SAFETY: the list's last run was waited for by this thread;
+            // live buffers (the entries hold their copies); the fence and
+            // the event are this thread's.
+            let ran = unsafe {
+                (|| -> windows::core::Result<()> {
+                    allocator.Reset()?;
+                    list.Reset(allocator, None)?;
+                    for (t, at) in taken.iter().zip(&offsets) {
+                        list.CopyBufferRegion(&buffer, *at, &t.entry.shadow.buffer, t.entry.lo as u64, (t.entry.hi - t.entry.lo) as u64);
+                    }
+                    list.Close()?;
+                    queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>()?)]);
+                    queue.Signal(fence, sent)?;
+                    fence.SetEventOnCompletion(sent, event)?;
+                    WaitForSingleObject(event, INFINITE);
+                    Ok(())
+                })()
+            };
+            if let Err(e) = ran {
+                fail(format_args!("what shaders wrote could not be fetched to land on touch ({e}, VICTORY_LAND_LAZY)"));
+            }
+            (data, after)
+        });
+        let whole = lazy::open(&taken);
+        let check = lazy::mode() == lazy::Mode::Check;
+        let mut put = 0u64;
+        let mut notes = crate::land::Notes::default();
+        for ((t, at), whole) in taken.iter().zip(&offsets).zip(whole) {
+            if !whole {
+                continue;
+            }
+            let (shadow, lo, hi) = (&t.entry.shadow, t.entry.lo, t.entry.hi);
+            let now = data + *at as usize;
+            if check {
+                let start = shadow.span().0 as usize;
+                if !compare {
+                    lazy::not_compared(false, 1);
+                } else if shadow.writes_pending_in(start + lo, start + hi) {
+                    lazy::not_compared(true, 1);
+                } else {
+                    // SAFETY: the fetched bytes, `hi - lo` of them at `now`;
+                    // the copy into them has run, and the next waits for
+                    // this thread.
+                    let (would, differ) = unsafe { shadow.lazy_compare(lo, hi, now as *const u8, after) };
+                    lazy::checked(&t.entry, would, differ);
+                }
+                continue;
+            }
+            // SAFETY: as above; the piece lies in one block of title
+            // memory, whose pages are open now.
+            put += unsafe { shadow.land_card(&[(lo, hi, now)], after, &mut notes) };
+        }
+        notes.flush();
+        COPY_BACK[1].fetch_add(put, Ordering::Relaxed);
+        lazy::done(&taken, put, total, began);
+        lazy::serving(false);
     }
 
     /// [`relay`], on the thread that lands flights: `items` are the first
@@ -6611,6 +6825,15 @@ impl Host {
                     }
                 });
                 stage.next("landing: copies in the PC's memory");
+                // `VICTORY_LAND_LAZY`: what they write that is armed lands
+                // first (the merge writes title memory at its address).
+                if crate::lazy::any() {
+                    let blocks: Vec<usize> =
+                        back.iter().flat_map(|(_, r)| r.iter().flat_map(|&(a, e)| crate::lazy::blocks_over(a, e))).collect();
+                    if !blocks.is_empty() {
+                        self.lazy_land(&blocks, false);
+                    }
+                }
                 hand_back.merge();
                 stage.next("landing: ranges done with");
                 let finishing = std::time::Instant::now();
@@ -6641,6 +6864,15 @@ impl Host {
             telling = match item {
                 Late::Run(mut flight) => {
                     last = flight.number;
+                    // `VICTORY_LAND_LAZY`: texture read-backs write title
+                    // memory; what is armed there lands first.
+                    if crate::lazy::any() {
+                        let blocks: Vec<usize> =
+                            flight.texture_back_ranges.iter().flat_map(|&(a, e)| crate::lazy::blocks_over(a, e)).collect();
+                        if !blocks.is_empty() {
+                            self.lazy_land(&blocks, false);
+                        }
+                    }
                     for &i in &flight.order {
                         read_backs(flight.lists[i].host());
                     }
@@ -6661,10 +6893,21 @@ impl Host {
                     crate::land::spent(crate::land::stat::READ_BACKS, telling)
                 }
                 Late::Write(at, what, bytes) => {
+                    if crate::lazy::on() {
+                        // (A value written into a page armed to land on
+                        // touch: the landing first.)
+                        if crate::lazy::armed_over(at, at + bytes) {
+                            crate::lazy::land_over(at, at + bytes);
+                        }
+                        crate::lazy::told(1);
+                    }
                     what.write(at as *mut u8, bytes);
                     crate::land::spent(crate::land::stat::TOLD, telling)
                 }
                 Late::Signal(fence, value) => {
+                    if crate::lazy::on() {
+                        crate::lazy::told(1);
+                    }
                     crate::fence::set(fence as crate::object::This, value);
                     crate::land::spent(crate::land::stat::TOLD, telling)
                 }

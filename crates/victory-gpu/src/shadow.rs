@@ -1141,6 +1141,12 @@ pub(crate) fn relay_fetched(number: u64) {
     RELAY_FETCHED.fetch_max(number, Ordering::AcqRel);
 }
 
+/// The highest send number [`relay_fetched`] was told: notes of sends up to
+/// it may be forgotten (`card_dirty`), and every such send is on the card.
+pub(crate) fn relay_fetched_now() -> u64 {
+    RELAY_FETCHED.load(Ordering::Acquire)
+}
+
 /// With [`relay`]: how many submissions that are not copied back yet
 /// declared each range shaders may be writing (range, count, the last
 /// submission that declared it).
@@ -2312,13 +2318,14 @@ fn note_stale(why: usize) {
 /// [`STALE_WHY`] in words (diagnostics).
 #[cfg(feature = "diagnostics")]
 pub(crate) fn stale_why() -> &'static str {
-    const WHY: [&str; 4] = [
+    const WHY: [&str; 5] = [
         "the memory is not watched",
         "the journal does not say what was written",
         "more changed runs than a submission sends up",
         "no snapshot",
+        "a page is armed to land on touch",
     ];
-    WHY[STALE_WHY.load(Ordering::Relaxed).min(3)]
+    WHY[STALE_WHY.load(Ordering::Relaxed).min(4)]
 }
 
 /// Since the last frame-rate line, where [`Shadow::merge_under_writes`]'s
@@ -4338,6 +4345,16 @@ impl Shadow {
                 note_stale(3);
                 return true;
             }
+            // `VICTORY_LAND_LAZY`: a page to compare that is no-access (the
+            // title wrote it before what shaders wrote there was armed)
+            // would fault on the threads below, which the relay, waiting for
+            // this lock, cannot serve. The flights are settled, and the
+            // refresh after that lands it first (`crate::lazy::before_refresh`).
+            // Looked at under the lock: arming takes it shared.
+            if crate::lazy::any() && pieces.iter().any(|&(_, lo, hi)| crate::lazy::trapped_over(lo, hi)) {
+                note_stale(4);
+                return true;
+            }
             let t = under_ns(2, t);
             // A piece of a page in the range, compared and put in: the runs
             // it changed; none for a page that is not there (left as it is,
@@ -4537,6 +4554,13 @@ impl Shadow {
             .copied()
             .filter(|&(a, e)| a < to && e > from)
             .collect();
+        // `VICTORY_LAND_LAZY`: where what shaders wrote is armed to land on
+        // touch, the copy is newer than title memory, as under a flight's
+        // ranges (looked at after `pending`: a range armed since was pending
+        // then).
+        if crate::lazy::armed_over(from, to) {
+            busy.extend(crate::lazy::before_refresh(self, from, to));
+        }
         if !busy.is_empty() {
             // Around ranges shaders are writing: the gaps, each as below
             // (in the world most submissions have such ranges; copying the
@@ -5416,6 +5440,114 @@ impl Shadow {
             copied.set(page, at.max(now));
         }
         held
+    }
+
+    /// `VICTORY_LAND_LAZY`: whether what shaders write in this copy may be
+    /// armed to land on touch (`crate::lazy` says why only this): a copy in
+    /// the card's memory of a title buffer of private memory the kernel
+    /// write-watches, all of it committed read-write, with no view of
+    /// physical pages, no guard and no other copy over its pages. Asked once
+    /// a copy (one `VirtualQuery`, and a look through the copies).
+    pub(crate) fn lazy_fit(&self, big_enough: bool) -> Result<(), crate::lazy::Why> {
+        use crate::lazy::Why;
+        if self.card.is_none() || self.window || self.mapped || self.place.is_some() {
+            return Err(Why::Kind);
+        }
+        if !big_enough {
+            return Err(Why::Small);
+        }
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (first, last) = (start / KERNEL_PAGE * KERNEL_PAGE, end.div_ceil(KERNEL_PAGE) * KERNEL_PAGE);
+        if crate::inplace::shown_bytes(first, last - first).is_some() || crate::watch::guarded(first, last) {
+            return Err(Why::View);
+        }
+        if !self.plainly_watched() || !crate::inplace::private_whole(first, last - first) {
+            return Err(Why::Unwatched);
+        }
+        if self.others_over(first, last) {
+            return Err(Why::Shared);
+        }
+        Ok(())
+    }
+
+    /// Whether another copy (of a buffer, a window, an exact view) holds
+    /// title memory of `[first, last)`.
+    fn others_over(&self, first: usize, last: usize) -> bool {
+        let over = |s: &Shadow| !std::ptr::eq(s, self) && (s.start as usize) < last && ((s.start + s.len) as usize) > first;
+        if buffers_read().range(..(last as u64, 0)).any(|(_, e)| e.end as usize > first && e.shadow.as_deref().is_some_and(over)) {
+            return true;
+        }
+        if LOOSE.read().unwrap_or_else(|e| e.into_inner()).values().any(|s| over(s)) {
+            return true;
+        }
+        EXACT.lock().unwrap_or_else(|e| e.into_inner()).1.values().any(|(s, _)| over(s))
+    }
+
+    /// `VICTORY_LAND_LAZY`: held while the copy's blocks are armed, which
+    /// [`Shadow::merge_under_writes`] keeps out while it reads title memory.
+    pub(crate) fn lazy_hold(&self) -> std::sync::RwLockReadGuard<'_, ()> {
+        self.merging.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Whether the journal says, without asking, that the title wrote
+    /// nothing of `[from, to)` since the copy took it ([`Shadow::nothing_new`]
+    /// leaving out the ranges shaders write).
+    pub(crate) fn journal_clean(&self, from: usize, to: usize) -> bool {
+        if !matches!(self.watched.load(Ordering::Relaxed), 1 | GUARDED) {
+            return false;
+        }
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (from.max(start), to.min(end));
+        if from >= to {
+            // (Outside the copy: no refresh of it reads there.)
+            return true;
+        }
+        let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        crate::watch::nothing_new(from, to, start / PAGE, &copied.pages, &copied.chunk_taken, self.ranged(from, to))
+    }
+
+    /// `VICTORY_LAND_LAZY=check`: of offsets `[lo, hi)` fetched to `now`
+    /// from the card after send `after`, the bytes [`Shadow::land_card`]
+    /// would put (those the card holds unlike the CPU's side, title bytes
+    /// not yet on the card left out), and of them those title memory holds
+    /// otherwise. Nothing is written. The pages are open.
+    ///
+    /// # Safety
+    /// `now` holds `hi - lo` bytes that stay during the call.
+    pub(crate) unsafe fn lazy_compare(&self, lo: usize, hi: usize, now: *const u8, after: u64) -> (u64, u64) {
+        let Some(card) = &self.card else {
+            return (0, 0);
+        };
+        if lo >= hi || hi > self.len as usize {
+            return (0, 0);
+        }
+        let _merging = self.merging.read().unwrap_or_else(|e| e.into_inner());
+        let skip: Vec<(usize, usize)> = {
+            let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+            let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
+            let mut skip: Vec<(usize, usize)> = dirty.iter().copied().filter(|&(a, b)| a < hi && b > lo).collect();
+            sent.near(after, lo, hi, &mut skip);
+            skip
+        };
+        let n = hi - lo;
+        let mut title = vec![0u8; n];
+        if !crate::host::read_into((self.start as usize + lo) as *const u8, &mut title) {
+            return (0, 0);
+        }
+        // SAFETY: the caller's; inside the CPU side's mapping (checked
+        // above), which only the relay (this thread) and the refreshes of
+        // other ranges write.
+        let (now, held) = unsafe { (std::slice::from_raw_parts(now, n), std::slice::from_raw_parts(self.data.add(lo).cast_const(), n)) };
+        let (mut would, mut differ) = (0u64, 0u64);
+        for (a, b) in outside(lo, hi, skip) {
+            for i in a - lo..b - lo {
+                if now[i] != held[i] {
+                    would += 1;
+                    differ += u64::from(title[i] != now[i]);
+                }
+            }
+        }
+        (would, differ)
     }
 }
 

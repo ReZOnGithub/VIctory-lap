@@ -143,6 +143,8 @@ pub(crate) fn log(frames: f64) {
             u8::from(taken()),
         );
     }
+    #[cfg(feature = "diagnostics")]
+    crate::lazy::log(frames);
     let s: Vec<f64> = STATS.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     if s[stat::PIECES] == 0.0 && s[stat::REST] == 0.0 {
         return;
@@ -238,6 +240,13 @@ impl Pool {
         for i in 1..threads {
             // (A helper that is not there is only missed.)
             let _ = std::thread::Builder::new().name(format!("{name}-{i}")).spawn(move || {
+                // `VICTORY_LAND_LAZY`: the relay waits for the landing's
+                // helpers, and the submitting thread (holding a copy's lock
+                // a landing takes) for those under flights' writes: a trap
+                // they meet is not waited for.
+                if matches!(name, "victory-land" | "victory-under") {
+                    crate::lazy::this_never_waits();
+                }
                 if name == "victory-land" {
                     crate::cores::keep_helper_on_fast_cores(name);
                 } else {
