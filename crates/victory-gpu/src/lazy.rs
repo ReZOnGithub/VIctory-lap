@@ -144,7 +144,9 @@ pub(crate) enum Why {
     /// Not private memory the kernel watches, all of it committed read-write
     /// (or not known yet: a copy not refreshed once).
     Unwatched,
-    /// Another copy over its pages.
+    /// Another copy over its pages, with `VICTORY_LAND_LAZY_SHARED=0` (by
+    /// default such copies are armed: [`before_refresh`] says how the other
+    /// copies get what shaders wrote).
     Shared,
     /// A window, a mapped window, in place.
     Kind,
@@ -159,7 +161,7 @@ pub(crate) enum Why {
 }
 const WHYS: usize = 8;
 #[cfg(feature = "diagnostics")]
-const WHY_NAMES: [&str; WHYS] = ["view memory", "not watched private", "another copy over it", "window", "small", "hot", "no protection", "beside an eager piece"];
+const WHY_NAMES: [&str; WHYS] = ["view memory", "not watched private", "another copy over it", "window", "small", "hot", "no protection", "beside an eager piece or another copy's in the block"];
 
 /// Counts since the last frame line.
 mod stat {
@@ -187,8 +189,54 @@ mod stat {
     pub(super) const IN_FLIGHT: usize = 21;
     pub(super) const SUPERSEDED: usize = 22;
     pub(super) const SERVE_US: usize = 23;
-    pub(super) const EAGER: usize = 24;
-    pub(super) const COUNT: usize = EAGER + super::WHYS;
+    /// Blocks landed for our own readers and writers, by [`super::For`].
+    pub(super) const FOR: usize = 24;
+    /// Pieces armed of copies with others over them: of buffers, windows,
+    /// exact copies of views.
+    pub(super) const SHARED: usize = 29;
+    /// Landings of the relay; those that still fetched before telling (in
+    /// `=check`: would in `=1`); those with copies in the PC's memory to
+    /// merge.
+    pub(super) const LANDINGS_ALL: usize = 32;
+    pub(super) const LANDINGS_FETCH: usize = 33;
+    pub(super) const LANDINGS_PC: usize = 34;
+    /// `=check` at the eager merge: bytes compared, bytes differing,
+    /// pieces looked at.
+    pub(super) const SAMPLED: usize = 35;
+    pub(super) const SAMPLE_DIFFER: usize = 36;
+    pub(super) const SAMPLE_PIECES: usize = 37;
+    /// Arms of two copies in one block in one landing (land as before).
+    pub(super) const CONFLICT: usize = 38;
+    pub(super) const EAGER: usize = 40;
+    /// Landings that fetched for pieces of each [`super::Why`].
+    pub(super) const CLASS: usize = EAGER + super::WHYS;
+    pub(super) const COUNT: usize = CLASS + super::WHYS;
+}
+
+/// Who a landing for our own readers and writers was for.
+#[derive(Clone, Copy)]
+pub(crate) enum For {
+    /// A refresh of a copy reads a no-access page the journal says the title
+    /// wrote (before it was armed, or we did, landing it as before).
+    Refresh = 0,
+    /// A refresh of another copy over what one copy armed: it needs what
+    /// shaders wrote, as it would have after an eager landing.
+    OtherCopy,
+    /// The kernel reads or writes for the title (file reads).
+    Kernel,
+    /// The relay's own writes: a value when a list has run, copies in the
+    /// PC's memory, texture read-backs.
+    Relay,
+    /// A piece of another copy, or of the same, that lands as before.
+    Eager,
+}
+#[cfg(feature = "diagnostics")]
+const FOR_NAMES: [&str; 5] = ["a refresh, the title wrote", "another copy's refresh", "the kernel", "the relay's own writes", "pieces landing as before"];
+
+/// Counts blocks landed for `source`.
+pub(crate) fn for_us(source: For, n: u64) {
+    count(stat::FOR_US, n);
+    count(stat::FOR + source as usize, n);
 }
 
 static STATS: [AtomicU64; stat::COUNT] = [const { AtomicU64::new(0) }; stat::COUNT];
@@ -230,8 +278,11 @@ struct Registry {
     entries: BTreeMap<usize, Entry>,
     /// Blocks touched, to be landed by the relay.
     asked: Vec<usize>,
-    /// By copy number: whether its memory may be armed (`Err`: why not).
-    fit: HashMap<u64, Result<(), Why>>,
+    /// By copy number: whether its memory may be armed (`Err`: why not),
+    /// and the kinds of other copies over it (`Shadow::lazy_fit`).
+    fit: HashMap<u64, (Result<(), Why>, u8)>,
+    /// The copies with others over them that were armed since the last line.
+    shared: std::collections::HashSet<u64>,
     /// By copy number: the frame of its touches, how many, and the frame
     /// until which it lands as before.
     hot: HashMap<u64, (u64, u32, u64)>,
@@ -357,21 +408,21 @@ pub(crate) type Arm = (Arc<Shadow>, usize, usize, bool);
 /// with `=check` they stay (and land as before too). `least` is
 /// `VICTORY_LAND_NOT_KB`'s: with `=check`, whether the landing as before
 /// leaves the piece out.
-pub(crate) fn split(pieces: &mut Vec<(Arc<Shadow>, usize, usize, u64)>, least: u64) -> Vec<Arm> {
+pub(crate) fn split(pieces: &mut Vec<(Arc<Shadow>, usize, usize, u64)>, least: u64, whys: &mut HashMap<u64, Why>) -> Vec<Arm> {
     let check = mode() == Mode::Check;
     let frame = crate::frame::current();
     let mut arms = Vec::new();
     // What is not known of the copies is asked without the registry's lock:
     // it looks through the copies, the views and Windows, whose locks a
     // thread that waits for a landing may hold.
-    let known: Vec<Option<Result<(), Why>>> = {
+    let known: Vec<Option<(Result<(), Why>, u8)>> = {
         let mut reg = reg();
         if reg.fit.len() > 1 << 16 {
             reg.fit.clear();
         }
         pieces.iter().map(|p| reg.fit.get(&p.0.id()).copied()).collect()
     };
-    let mut asked: HashMap<u64, Result<(), Why>> = HashMap::new();
+    let mut asked: HashMap<u64, (Result<(), Why>, u8)> = HashMap::new();
     for (piece, known) in pieces.iter().zip(&known) {
         if known.is_none() && !asked.contains_key(&piece.0.id()) {
             asked.insert(piece.0.id(), piece.0.lazy_fit(least_ok(&piece.0)));
@@ -381,12 +432,12 @@ pub(crate) fn split(pieces: &mut Vec<(Arc<Shadow>, usize, usize, u64)>, least: u
     let mut keep = Vec::with_capacity(pieces.len());
     for (piece, known) in pieces.drain(..).zip(known) {
         let shadow = &piece.0;
-        let fit = match known {
+        let (fit, kinds) = match known {
             Some(fit) => fit,
             None => {
                 let fit = asked[&shadow.id()];
                 // (Not known yet: asked again.)
-                if !matches!(fit, Err(Why::Unwatched)) || shadow.plainly_watched() {
+                if !matches!(fit.0, Err(Why::Unwatched)) || shadow.plainly_watched() {
                     reg.fit.insert(shadow.id(), fit);
                 }
                 fit
@@ -395,6 +446,14 @@ pub(crate) fn split(pieces: &mut Vec<(Arc<Shadow>, usize, usize, u64)>, least: u
         let hot_now = reg.hot.get(&shadow.id()).is_some_and(|h| h.2 > frame);
         match fit {
             Ok(()) if !hot_now => {
+                for k in 0..3 {
+                    if kinds >> k & 1 != 0 {
+                        count(stat::SHARED + k, 1);
+                    }
+                }
+                if kinds != 0 {
+                    reg.shared.insert(shadow.id());
+                }
                 arms.push((shadow.clone(), piece.1, piece.2, check && shadow.span().1 >= least));
                 if check {
                     keep.push(piece);
@@ -402,10 +461,12 @@ pub(crate) fn split(pieces: &mut Vec<(Arc<Shadow>, usize, usize, u64)>, least: u
             }
             Ok(()) => {
                 eager(Why::Hot, 1);
+                whys.insert(shadow.id(), Why::Hot);
                 keep.push(piece);
             }
             Err(why) => {
                 eager(why, 1);
+                whys.insert(shadow.id(), why);
                 keep.push(piece);
             }
         }
@@ -417,6 +478,83 @@ pub(crate) fn split(pieces: &mut Vec<(Arc<Shadow>, usize, usize, u64)>, least: u
 fn least_ok(shadow: &Shadow) -> bool {
     shadow.span().1 as usize >= least()
 }
+
+/// Whether copies with other copies over them are armed
+/// (`VICTORY_LAND_LAZY_SHARED=0`: they land as before, as in 5a072133).
+pub(crate) fn shared_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_LAZY_SHARED").is_none_or(|v| v != "0"))
+}
+
+/// What the relay's landing in hand fetched before it told the title, set
+/// by `Host::relay_card_back` (the classes of [`Why`] a bit each, and bit 15
+/// whether anything was fetched) and taken by [`landing_done`].
+static LANDING_MASK: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+
+/// `Host::relay_card_back`: of the pieces fetched before the telling
+/// (`pieces`, after `VICTORY_LAND_NOT_KB`), the classes (`whys`, by copy
+/// number: those not there are armed, and with `=check` land as before only
+/// to be compared), and `extra` (classes of arms that land as before after
+/// all).
+pub(crate) fn landing_fetched(pieces: &[(Arc<Shadow>, usize, usize, u64)], whys: &HashMap<u64, Why>, extra: u16) {
+    let mut mask = extra;
+    for piece in pieces {
+        if let Some(&why) = whys.get(&piece.0.id()) {
+            mask |= 1 << why as usize;
+        }
+    }
+    if mode() == Mode::Lazy && !pieces.is_empty() {
+        mask |= 1 << 15;
+    }
+    if mask & 0xff != 0 {
+        mask |= 1 << 15;
+    }
+    LANDING_MASK.fetch_or(mask, Ordering::Relaxed);
+}
+
+/// `Host::relay_land`, before it tells: one landing, with copies in the PC's
+/// memory to merge or not.
+pub(crate) fn landing_done(pc: bool) {
+    let mask = LANDING_MASK.swap(0, Ordering::Relaxed);
+    count(stat::LANDINGS_ALL, 1);
+    count(stat::LANDINGS_PC, u64::from(pc));
+    if mask & 1 << 15 != 0 {
+        count(stat::LANDINGS_FETCH, 1);
+    }
+    for i in 0..WHYS {
+        if mask >> i & 1 != 0 {
+            count(stat::CLASS + i, 1);
+        }
+    }
+}
+
+/// The bit of [`landing_fetched`]'s `extra` for arms that land as before.
+pub(crate) fn beside_bit() -> u16 {
+    1 << Why::Beside as usize | 1 << Why::Protect as usize
+}
+
+/// `=check` at the eager merge: of a piece of an armed copy, `bytes` looked
+/// at, `differ` of them not as a landing on touch would have put them.
+pub(crate) fn sampled(bytes: u64, differ: u64) {
+    count(stat::SAMPLED, bytes);
+    count(stat::SAMPLE_DIFFER, differ);
+    count(stat::SAMPLE_PIECES, 1);
+}
+
+/// `=check`: whether a piece of this many bytes is compared at the eager
+/// merge (about [`SAMPLE_MOST`] a frame).
+pub(crate) fn sample_room(bytes: usize) -> bool {
+    static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
+    static TAKEN: AtomicU64 = AtomicU64::new(0);
+    let frame = crate::frame::current();
+    if FRAME.swap(frame, Ordering::Relaxed) != frame {
+        TAKEN.store(0, Ordering::Relaxed);
+    }
+    TAKEN.fetch_add(bytes as u64, Ordering::Relaxed) < SAMPLE_MOST
+}
+
+/// What `=check` compares at the eager merge, a frame.
+const SAMPLE_MOST: u64 = 512 << 10;
 
 /// [`Mode::Lazy`], before the pieces that land as before (`eager`, title
 /// address and bytes) are fetched: the arms whose pages one of them touches
@@ -433,6 +571,30 @@ pub(crate) fn before_eager(eager_at: &[(usize, usize)], arms: &mut Vec<Arm>) -> 
         touched[i..].iter().take_while(|t| t.0 < b).any(|t| t.1 > a)
     };
     let mut demoted = Vec::new();
+    // Two copies' arms in one block (their title memory is one): each block
+    // keeps one copy's entry, and two flights' pieces must land in their
+    // order, which the landing as before keeps (`crate::land::ordered`).
+    {
+        let mut first_of: HashMap<usize, *const Shadow> = HashMap::new();
+        let mut two: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for arm in arms.iter() {
+            let block = (arm.0.span().0 as usize + arm.1) / BLOCK;
+            let at = *first_of.entry(block).or_insert(Arc::as_ptr(&arm.0));
+            if at != Arc::as_ptr(&arm.0) {
+                two.insert(block);
+            }
+        }
+        if !two.is_empty() {
+            arms.retain(|arm| {
+                let keep = !two.contains(&((arm.0.span().0 as usize + arm.1) / BLOCK));
+                if !keep {
+                    count(stat::CONFLICT, 1);
+                    demoted.push(arm.clone());
+                }
+                keep
+            });
+        }
+    }
     arms.retain(|arm| {
         let start = arm.0.span().0 as usize;
         let (a, b) = pages(start + arm.1, start + arm.2);
@@ -879,13 +1041,13 @@ fn reachable(at: usize, write: bool) -> bool {
 /// refresh, the kernel for the title, a write of ours): what is armed there
 /// lands first, by the relay (on the relay, here). The caller holds no lock a
 /// landing takes. Whether nothing was left armed there.
-pub(crate) fn land_over(from: usize, to: usize) -> bool {
+pub(crate) fn land_over(from: usize, to: usize, source: For) -> bool {
     let blocks = blocks_over(from, to);
-    land_blocks(&blocks)
+    land_blocks(&blocks, source)
 }
 
 /// [`land_over`] of whole blocks.
-pub(crate) fn land_blocks(blocks: &[usize]) -> bool {
+pub(crate) fn land_blocks(blocks: &[usize], source: For) -> bool {
     if blocks.is_empty() {
         return true;
     }
@@ -894,7 +1056,7 @@ pub(crate) fn land_blocks(blocks: &[usize]) -> bool {
             // (The landing's own writes into the blocks it is landing.)
             return false;
         }
-        count(stat::FOR_US, blocks.len() as u64);
+        for_us(source, blocks.len() as u64);
         if let Some(host) = crate::host::host() {
             host.lazy_land(blocks, true);
         }
@@ -908,7 +1070,7 @@ pub(crate) fn land_blocks(blocks: &[usize]) -> bool {
     if wanted.is_empty() {
         return true;
     }
-    count(stat::FOR_US, wanted.len() as u64);
+    for_us(source, wanted.len() as u64);
     reg.asked.extend(wanted.iter().map(|w| w.0));
     ASKED.store(true, Ordering::Release);
     wait(reg, &wanted, None)
@@ -919,22 +1081,37 @@ pub(crate) fn land_blocks(blocks: &[usize]) -> bool {
 pub(crate) fn before_kernel(at: usize, len: usize) {
     let to = at.saturating_add(len);
     if armed_over(at, to) {
-        land_over(at, to);
+        land_over(at, to, For::Kernel);
     }
 }
 
-/// `Shadow::update` of `[from, to)` of `shadow` meets armed blocks: the
-/// ranges of the copy's own entries there, to be left alone as the ranges
-/// shaders write are (title memory there is older than the copy). Where the
-/// journal cannot say that the refresh reads nothing of the no-access pages
-/// (the title wrote a page before it was armed, or the memory is not
-/// watched), what is armed there lands first, and the refresh reads it as it
-/// would after a landing.
-pub(crate) fn before_refresh(shadow: &Shadow, from: usize, to: usize) -> Vec<(usize, usize)> {
+/// `Shadow::update` of `[from, to)` of `shadow` meets armed blocks. Returns
+/// the ranges to leave alone and those to copy whatever the journal says.
+///
+/// The copy's own entries: title memory there is older than the copy, so
+/// the refresh leaves them alone as it leaves the ranges shaders write,
+/// where the journal says, without asking, that the title wrote nothing on
+/// those no-access pages since the copy took them. Where it cannot say so
+/// (the title wrote a page before it was armed, we wrote it landing as
+/// before, or the memory is not watched), what is armed there lands first
+/// and the refresh reads it as after any landing.
+///
+/// Another copy's entries over bytes of this refresh: this copy needs what
+/// the shaders wrote there, as it would have read it from title memory after
+/// an eager landing. That rule is exact because the landing on touch puts
+/// into title memory exactly what the eager landing would (`land_card`, the
+/// same pieces, the same notes of sends), and the refresh then takes it: the
+/// entries land first, and their bytes in this range are copied whatever the
+/// journal says, since the submission's asking was made before our write.
+/// (No other copy can be newer there: a block holds one copy's entry, and
+/// one copy's pieces of a block in one landing; another copy that wrote
+/// there later landed this one first, `before_eager`.)
+pub(crate) fn before_refresh(shadow: &Shadow, from: usize, to: usize) -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
+    let mut force: Vec<(usize, usize)> = Vec::new();
     for _ in 0..4 {
-        let (own, runs, blocks) = {
+        let (own, runs, blocks, others, other_bytes) = {
             let reg = reg();
-            let (mut own, mut runs, mut blocks) = (Vec::new(), Vec::new(), Vec::new());
+            let (mut own, mut runs, mut blocks, mut others, mut other_bytes) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
             for (&b, e) in reg.entries.range(from / BLOCK..to.div_ceil(BLOCK)) {
                 let pages = pages_in(b, e.pages, from, to);
                 if pages == 0 {
@@ -942,11 +1119,14 @@ pub(crate) fn before_refresh(shadow: &Shadow, from: usize, to: usize) -> Vec<(us
                 }
                 blocks.push(b);
                 let start = e.shadow.span().0 as usize;
+                let (a, z) = ((start + e.lo).max(from), (start + e.hi).min(to));
                 if std::ptr::eq(Arc::as_ptr(&e.shadow), shadow) {
-                    let (a, z) = ((start + e.lo).max(from), (start + e.hi).min(to));
                     if a < z {
                         own.push((a, z));
                     }
+                } else if a < z {
+                    others.push(b);
+                    other_bytes.push((a, z));
                 }
                 for p in 0..16 {
                     if pages >> p & 1 != 0 {
@@ -955,19 +1135,25 @@ pub(crate) fn before_refresh(shadow: &Shadow, from: usize, to: usize) -> Vec<(us
                     }
                 }
             }
-            (own, runs, blocks)
+            (own, runs, blocks, others, other_bytes)
         };
         if runs.is_empty() {
-            return Vec::new();
+            return (Vec::new(), force);
+        }
+        if !others.is_empty() {
+            land_blocks(&others, For::OtherCopy);
+            force.extend(other_bytes);
+            continue;
         }
         if runs.iter().all(|&(a, z)| shadow.journal_clean(a, z)) {
-            return own;
+            return (own, force);
         }
-        land_blocks(&blocks);
+        land_blocks(&blocks, For::Refresh);
     }
     // (Armed again and again meanwhile: left alone as shaders' ranges are.)
     let reg = reg();
-    reg.entries
+    let own = reg
+        .entries
         .range(from / BLOCK..to.div_ceil(BLOCK))
         .filter(|(_, e)| std::ptr::eq(Arc::as_ptr(&e.shadow), shadow))
         .map(|(_, e)| {
@@ -975,7 +1161,22 @@ pub(crate) fn before_refresh(shadow: &Shadow, from: usize, to: usize) -> Vec<(us
             ((start + e.lo).max(from), (start + e.hi).min(to))
         })
         .filter(|r| r.0 < r.1)
-        .collect()
+        .collect();
+    (own, force)
+}
+
+/// Whether another copy than `shadow` has armed bytes in `[from, to)`: a
+/// refresh of `shadow` there is due whatever the journal says
+/// ([`before_refresh`]).
+pub(crate) fn others_over(shadow: &Shadow, from: usize, to: usize) -> bool {
+    if !armed_over(from, to) {
+        return false;
+    }
+    let reg = reg();
+    reg.entries.range(from / BLOCK..to.div_ceil(BLOCK)).any(|(_, e)| {
+        let start = e.shadow.span().0 as usize;
+        !std::ptr::eq(Arc::as_ptr(&e.shadow), shadow) && start + e.lo < to && start + e.hi > from
+    })
 }
 
 /// Title memory `[at, at + len)` is freed or given again (`len` 0: the
@@ -1033,10 +1234,12 @@ pub(crate) fn log(frames: f64) {
     let kb = |v: f64| v / 1024.0;
     tracing::info!(
         "landing on touch per frame (VICTORY_LAND_LAZY={:?}): armed {:.0} pieces, {:.0} pages newly no-access, {} blocks armed now; \
-         {:.0} protection calls {:.2} ms; first touches {:.0} reads, {:.0} writes, {:.0} by our copies; title threads in the handler \
-         {:.2} ms (longest {:.2} ms); {:.0} landings of {:.0} blocks, {:.0} KB fetched, {:.0} KB put, {:.2} ms on the relay; {:.0} \
-         blocks landed for our own readers and writers; {:.0} traps given up, {:.0} copies of ours failed, {:.0} entries whose \
-         memory changed, {:.0} forgotten with their memory; told at the card's completion {:.0}; landed as before: [{}]",
+         {:.0} protection calls {:.2} ms; first touches {:.1} reads, {:.1} writes, {:.1} by our copies; title threads in the handler \
+         {:.2} ms (longest {:.2} ms); {:.1} landings of {:.1} blocks, {:.0} KB fetched, {:.0} KB put, {:.2} ms on the relay; {:.1} \
+         blocks landed for our own readers and writers [{}]; {:.0} traps given up, {:.0} copies of ours failed, {:.0} entries whose \
+         memory changed, {:.0} forgotten with their memory; told at the card's completion {:.0}; landed as before: [{}]; armed \
+         pieces of copies with others over them: of buffers {:.0}, windows {:.0}, exact copies {:.0} ({} copies since the last \
+         line); two copies in a block {:.1}",
         mode(),
         s[stat::ARMED_PIECES],
         s[stat::ARMED_PAGES],
@@ -1054,18 +1257,38 @@ pub(crate) fn log(frames: f64) {
         kb(s[stat::LANDED_BYTES]),
         s[stat::SERVE_US] / 1000.0,
         s[stat::FOR_US],
+        (0..5).filter(|&i| s[stat::FOR + i] > 0.0).map(|i| format!("{} {:.1}", FOR_NAMES[i], s[stat::FOR + i])).collect::<Vec<_>>().join(", "),
         s[stat::GAVE_UP],
         s[stat::OURS_FAILED],
         s[stat::LOST],
         s[stat::FORGOTTEN],
         s[stat::TOLD],
         eager.join(", "),
+        s[stat::SHARED],
+        s[stat::SHARED + 1],
+        s[stat::SHARED + 2],
+        std::mem::take(&mut reg().shared).len(),
+        s[stat::CONFLICT],
+    );
+    let classes: Vec<String> =
+        (0..WHYS).filter(|&i| s[stat::CLASS + i] > 0.0).map(|i| format!("{} {:.1}", WHY_NAMES[i], s[stat::CLASS + i])).collect();
+    tracing::info!(
+        "landing on touch, telling per frame: {:.1} landings, {:.1} of them fetched from the card before the title was told \
+         (in =check: would in =1), for pieces of [{}]; {:.1} with copies in the PC's memory to merge before it",
+        s[stat::LANDINGS_ALL],
+        s[stat::LANDINGS_FETCH],
+        classes.join(", "),
+        s[stat::LANDINGS_PC],
     );
     if mode() == Mode::Check {
         tracing::info!(
-            "landing on touch, check: of {:.0} bytes a landing on touch would put, {:.0} differ from title memory (must be 0), \
-             {:.0} more in pieces VICTORY_LAND_NOT_KB leaves out (what it would add); not compared: {:.0} landings a flight still \
-             writes, {:.0} that the landing as before writes next",
+            "landing on touch, check: at the eager merge {:.0} pieces of armed copies, {:.0} bytes, compared with what a landing \
+             on touch would have put: {:.0} differ (must be 0); at a touch, of {:.0} bytes a landing on touch would put, {:.0} \
+             differ from title memory (must be 0), {:.0} more in pieces VICTORY_LAND_NOT_KB leaves out (what it would add); not \
+             compared: {:.1} landings a flight still writes, {:.1} that the landing as before writes next",
+            s[stat::SAMPLE_PIECES],
+            s[stat::SAMPLED],
+            s[stat::SAMPLE_DIFFER],
             s[stat::CHECKED],
             s[stat::DIFFER],
             s[stat::DIFFER_LEFT_OUT],

@@ -4558,8 +4558,25 @@ impl Shadow {
         // touch, the copy is newer than title memory, as under a flight's
         // ranges (looked at after `pending`: a range armed since was pending
         // then).
+        let mut force = Vec::new();
         if crate::lazy::armed_over(from, to) {
-            busy.extend(crate::lazy::before_refresh(self, from, to));
+            let (skip, due) = crate::lazy::before_refresh(self, from, to);
+            busy.extend(skip);
+            force = due;
+        }
+        if !force.is_empty() {
+            // Another copy's armed bytes, landed just now: taken whatever
+            // the journal says (its asking was before our write), around
+            // the ranges this copy's own shaders write.
+            let mut bytes = self.update_around(from, to, busy);
+            for (a, b) in force {
+                let pending: Vec<(usize, usize)> =
+                    self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().filter(|&(x, y)| x < b && y > a).collect();
+                for (x, y) in outside(a, b, pending) {
+                    bytes += self.copy(x, y);
+                }
+            }
+            return bytes;
         }
         if !busy.is_empty() {
             // Around ranges shaders are writing: the gaps, each as below
@@ -4581,6 +4598,26 @@ impl Shadow {
         self.update_free(from, to)
     }
 
+    /// [`Shadow::update`] of `[from, to)` around `busy` (and all of it with
+    /// none).
+    fn update_around(&self, from: usize, to: usize, mut busy: Vec<(usize, usize)>) -> usize {
+        if busy.is_empty() {
+            return self.update_free(from, to);
+        }
+        busy.sort_unstable();
+        let (mut at, mut bytes) = (from, 0);
+        for (a, e) in busy {
+            if a > at {
+                bytes += self.update_free(at, a.min(to));
+            }
+            at = at.max(e);
+        }
+        if at < to {
+            bytes += self.update_free(at, to);
+        }
+        bytes
+    }
+
     /// Whether [`Shadow::update`] of `[address, address + len)` would copy
     /// nothing, and knows it without asking anything
     /// (`crate::watch::nothing_new`). `false` if it would have to ask.
@@ -4594,6 +4631,11 @@ impl Shadow {
             return true;
         }
         if !matches!(self.watched.load(Ordering::Relaxed), 1 | GUARDED) {
+            return false;
+        }
+        // `VICTORY_LAND_LAZY`: what another copy armed here is due to this
+        // one whatever the journal says (`crate::lazy::before_refresh`).
+        if crate::lazy::others_over(self, from, to) {
             return false;
         }
         // Around ranges shaders are writing the refresh asks gap by gap.
@@ -5446,41 +5488,87 @@ impl Shadow {
     /// armed to land on touch (`crate::lazy` says why only this): a copy in
     /// the card's memory of a title buffer of private memory the kernel
     /// write-watches, all of it committed read-write, with no view of
-    /// physical pages, no guard and no other copy over its pages. Asked once
-    /// a copy (one `VirtualQuery`, and a look through the copies).
-    pub(crate) fn lazy_fit(&self, big_enough: bool) -> Result<(), crate::lazy::Why> {
+    /// physical pages and no guard over it. With the kinds of other copies
+    /// over its pages (bits: buffers, windows, exact copies of views); with
+    /// `VICTORY_LAND_LAZY_SHARED=0` such a copy is not armed. Asked once a
+    /// copy (one `VirtualQuery`, and a look through the copies).
+    pub(crate) fn lazy_fit(&self, big_enough: bool) -> (Result<(), crate::lazy::Why>, u8) {
         use crate::lazy::Why;
         if self.card.is_none() || self.window || self.mapped || self.place.is_some() {
-            return Err(Why::Kind);
+            return (Err(Why::Kind), 0);
         }
         if !big_enough {
-            return Err(Why::Small);
+            return (Err(Why::Small), 0);
         }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (first, last) = (start / KERNEL_PAGE * KERNEL_PAGE, end.div_ceil(KERNEL_PAGE) * KERNEL_PAGE);
         if crate::inplace::shown_bytes(first, last - first).is_some() || crate::watch::guarded(first, last) {
-            return Err(Why::View);
+            return (Err(Why::View), 0);
         }
         if !self.plainly_watched() || !crate::inplace::private_whole(first, last - first) {
-            return Err(Why::Unwatched);
+            return (Err(Why::Unwatched), 0);
         }
-        if self.others_over(first, last) {
-            return Err(Why::Shared);
+        let kinds = self.others_over(first, last);
+        if kinds != 0 && !crate::lazy::shared_on() {
+            return (Err(Why::Shared), kinds);
         }
-        Ok(())
+        (Ok(()), kinds)
     }
 
-    /// Whether another copy (of a buffer, a window, an exact view) holds
-    /// title memory of `[first, last)`.
-    fn others_over(&self, first: usize, last: usize) -> bool {
+    /// The kinds of other copies that hold title memory of `[first, last)`:
+    /// bit 0 a buffer's, 1 a window, 2 an exact copy of a view.
+    fn others_over(&self, first: usize, last: usize) -> u8 {
         let over = |s: &Shadow| !std::ptr::eq(s, self) && (s.start as usize) < last && ((s.start + s.len) as usize) > first;
+        let mut kinds = 0;
         if buffers_read().range(..(last as u64, 0)).any(|(_, e)| e.end as usize > first && e.shadow.as_deref().is_some_and(over)) {
-            return true;
+            kinds |= 1;
         }
         if LOOSE.read().unwrap_or_else(|e| e.into_inner()).values().any(|s| over(s)) {
-            return true;
+            kinds |= 2;
         }
-        EXACT.lock().unwrap_or_else(|e| e.into_inner()).1.values().any(|(s, _)| over(s))
+        if EXACT.lock().unwrap_or_else(|e| e.into_inner()).1.values().any(|(s, _)| over(s)) {
+            kinds |= 4;
+        }
+        kinds
+    }
+
+    /// `VICTORY_LAND_LAZY=check`, at the eager merge, before it: what title
+    /// memory `[lo, hi)` of the copy (`title`, read now) would hold after a
+    /// landing on touch of the bytes fetched to `now` with the sends known
+    /// on the card up to `after`: the card's byte where it differs from the
+    /// CPU's side and is not left out by the notes of sends, else the
+    /// title's. Empty if it cannot be said.
+    ///
+    /// # Safety
+    /// `now` holds `hi - lo` bytes that stay during the call.
+    pub(crate) unsafe fn lazy_predict(&self, lo: usize, hi: usize, now: *const u8, after: u64, title: &[u8]) -> Vec<u8> {
+        let Some(card) = &self.card else {
+            return Vec::new();
+        };
+        if lo >= hi || hi > self.len as usize || title.len() != hi - lo {
+            return Vec::new();
+        }
+        let _merging = self.merging.read().unwrap_or_else(|e| e.into_inner());
+        let skip: Vec<(usize, usize)> = {
+            let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+            let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
+            let mut skip: Vec<(usize, usize)> = dirty.iter().copied().filter(|&(a, b)| a < hi && b > lo).collect();
+            sent.near(after, lo, hi, &mut skip);
+            skip
+        };
+        let n = hi - lo;
+        // SAFETY: the caller's; inside the CPU side's mapping (checked
+        // above), which the merge to come writes only after this.
+        let (now, held) = unsafe { (std::slice::from_raw_parts(now, n), std::slice::from_raw_parts(self.data.add(lo).cast_const(), n)) };
+        let mut out = title.to_vec();
+        for (a, b) in outside(lo, hi, skip) {
+            for i in a - lo..b - lo {
+                if now[i] != held[i] {
+                    out[i] = now[i];
+                }
+            }
+        }
+        out
     }
 
     /// `VICTORY_LAND_LAZY`: held while the copy's blocks are armed, which

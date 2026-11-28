@@ -6399,9 +6399,11 @@ impl Host {
         // `VICTORY_LAND_NOT_KB` then says of the others what it said.
         let lazy = crate::lazy::mode();
         let mut arms: Vec<crate::lazy::Arm> = Vec::new();
+        // By copy: why its pieces land as before (those armed are not here).
+        let mut whys = std::collections::HashMap::new();
         if lazy != crate::lazy::Mode::Off {
             crate::lazy::flights_landed(plans.iter().map(|p| p.0.sent_as).max().unwrap_or(0));
-            arms = crate::lazy::split(&mut pieces, land_not_least());
+            arms = crate::lazy::split(&mut pieces, land_not_least(), &mut whys);
         }
         {
             let least = land_not_least();
@@ -6423,11 +6425,14 @@ impl Host {
                 let eager_at: Vec<(usize, usize)> = pieces.iter().map(|(s, lo, hi, _)| (s.span().0 as usize + lo, hi - lo)).collect();
                 let (demoted, first) = crate::lazy::before_eager(&eager_at, &mut arms);
                 if !first.is_empty() {
+                    crate::lazy::for_us(crate::lazy::For::Eager, first.len() as u64);
                     self.lazy_land(&first, false);
                 }
                 let failed = crate::lazy::arm(std::mem::take(&mut arms));
+                let extra = if demoted.is_empty() && failed.is_empty() { 0 } else { crate::lazy::beside_bit() };
                 pieces.extend(demoted.into_iter().map(|(s, lo, hi, _)| (s, lo, hi, 0)));
                 pieces.extend(failed.into_iter().map(|(s, lo, hi)| (s, lo, hi, 0)));
+                crate::lazy::landing_fetched(&pieces, &whys, extra);
                 total = 0;
                 for piece in &mut pieces {
                     piece.3 = total;
@@ -6445,10 +6450,15 @@ impl Host {
                 if !first.is_empty() {
                     self.lazy_land(&first, false);
                 }
+                crate::lazy::landing_fetched(&pieces, &whys, 0);
             }
+            crate::lazy::Mode::Check => crate::lazy::landing_fetched(&pieces, &whys, 0),
             _ => {}
         }
-        // `=check`: armed when the landing is done.
+        // `=check`: armed when the landing is done; meanwhile the eager merge
+        // of their copies' pieces is compared with what a landing on touch
+        // would have put.
+        let armed_ids: std::collections::HashSet<u64> = arms.iter().map(|a| a.0.id()).collect();
         let check_arms = std::mem::take(&mut arms);
         let arm_checked = move || {
             if !check_arms.is_empty() {
@@ -6604,6 +6614,30 @@ impl Host {
         }
         let merging = std::time::Instant::now();
         let _merging = crate::timeline::span("landing: merging fetched pieces");
+        // `VICTORY_LAND_LAZY=check`: for some of the pieces of armed copies,
+        // what a landing on touch of these fetched bytes would leave in title
+        // memory (`Shadow::lazy_predict`, its numbering of sends: what
+        // `crate::lazy::behind` says), to be compared after the merge.
+        let samples: Vec<(usize, Vec<u8>)> = if lazy == crate::lazy::Mode::Check && !armed_ids.is_empty() {
+            pieces
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| armed_ids.contains(&p.0.id()) && crate::lazy::sample_room(p.2 - p.1))
+                .filter_map(|(i, (shadow, lo, hi, at))| {
+                    let mut title = vec![0u8; hi - lo];
+                    if !read_into((shadow.span().0 as usize + lo) as *const u8, &mut title) {
+                        return None;
+                    }
+                    // SAFETY: the mapping of the fetched bytes, `total` of
+                    // them; the copy into it has run, and the next waits for
+                    // this thread.
+                    let would = unsafe { shadow.lazy_predict(*lo, *hi, (data + *at as usize) as *const u8, crate::lazy::behind(), &title) };
+                    (!would.is_empty()).then_some((i, would))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let mut written = 0;
         if land::on() {
             let titles: Vec<(usize, usize)> =
@@ -6648,6 +6682,14 @@ impl Host {
             }
         }
         land::spent(land::stat::CARD, merging);
+        for (i, would) in samples {
+            let (shadow, lo, _, _) = &pieces[i];
+            let mut title = vec![0u8; would.len()];
+            if read_into((shadow.span().0 as usize + lo) as *const u8, &mut title) {
+                let differ = title.iter().zip(&would).filter(|(a, b)| a != b).count();
+                crate::lazy::sampled(would.len() as u64, differ as u64);
+            }
+        }
         COPY_BACK[1].fetch_add(written, Ordering::Relaxed);
         if let Some(f) = fetch.as_mut() {
             if let Some(check) = &check {
@@ -6831,8 +6873,12 @@ impl Host {
                     let blocks: Vec<usize> =
                         back.iter().flat_map(|(_, r)| r.iter().flat_map(|&(a, e)| crate::lazy::blocks_over(a, e))).collect();
                     if !blocks.is_empty() {
+                        crate::lazy::for_us(crate::lazy::For::Relay, blocks.len() as u64);
                         self.lazy_land(&blocks, false);
                     }
+                }
+                if crate::lazy::on() {
+                    crate::lazy::landing_done(!back.is_empty());
                 }
                 hand_back.merge();
                 stage.next("landing: ranges done with");
@@ -6870,6 +6916,7 @@ impl Host {
                         let blocks: Vec<usize> =
                             flight.texture_back_ranges.iter().flat_map(|&(a, e)| crate::lazy::blocks_over(a, e)).collect();
                         if !blocks.is_empty() {
+                            crate::lazy::for_us(crate::lazy::For::Relay, blocks.len() as u64);
                             self.lazy_land(&blocks, false);
                         }
                     }
@@ -6897,7 +6944,7 @@ impl Host {
                         // (A value written into a page armed to land on
                         // touch: the landing first.)
                         if crate::lazy::armed_over(at, at + bytes) {
-                            crate::lazy::land_over(at, at + bytes);
+                            crate::lazy::land_over(at, at + bytes, crate::lazy::For::Relay);
                         }
                         crate::lazy::told(1);
                     }
