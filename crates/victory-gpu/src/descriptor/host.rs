@@ -6932,9 +6932,13 @@ pub(crate) enum TemplateMode {
 pub(crate) fn table_templates() -> TemplateMode {
     static MODE: std::sync::OnceLock<TemplateMode> = std::sync::OnceLock::new();
     let mode = *MODE.get_or_init(|| match std::env::var_os("VICTORY_TABLE_TEMPLATES") {
-        Some(v) if v == "0" => TemplateMode::Off,
+        // (Off unless asked for: run v1 at the boat found 107 of 7,071
+        // tables made afresh a frame made from a template, and 3,623
+        // templates made for them. The tables differ in more than their
+        // constant buffers.)
+        Some(v) if v == "1" => TemplateMode::On,
         Some(v) if v == "check" => TemplateMode::Check,
-        _ => TemplateMode::On,
+        _ => TemplateMode::Off,
     });
     // (Named in `VICTORY_AB`: on, or `check` if the variable says so, in the
     // phases that have its bit; off in the others.)
