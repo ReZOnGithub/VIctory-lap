@@ -461,6 +461,11 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u32, u64), FreshTable, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
+    /// Tables read in place that a reader had brought up to date, by a hash
+    /// of where they are, what their entries hold and who reads
+    /// ([`direct_once`]): the list's epoch then, and whether a view of the
+    /// tested depth target was among them.
+    direct_ready: std::collections::HashMap<u64, (u64, bool)>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list has run, is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -554,6 +559,7 @@ impl State {
             }
         }
         self.fresh_tables.clear();
+        self.direct_ready.clear();
         self.recording = 0;
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
@@ -3682,15 +3688,78 @@ impl State {
                 fresh[usize::from(slot / 64)] |= 1u64 << (slot % 64);
             }
         }
-        for &(g, e) in &plan.direct {
-            let group = &plan.groups[g];
-            if !selected_slot(&fresh, group.slot) {
+        // What the tables read in place hold, for this reader: brought up to
+        // date once while nothing in the list changes ([`direct_once`]).
+        let mut direct_key = None;
+        if direct_once() && ready_once() {
+            let mut h = RecordHash::default();
+            let mut any = false;
+            let mut plain = true;
+            for &(g, e) in &plan.direct {
+                let group = &plan.groups[g];
+                if selected_slot(&fresh, group.slot) {
+                    continue;
+                }
                 let u = &group.entries[e];
-                // (Its own slot, `table_cbvs`: the title's holds bytes on 16.)
                 if group.apart && u.kind == ResourceType::Cbv {
                     continue;
                 }
-                self.table_entry(list, u, compute);
+                if group.has_uav || !group.indexed.is_empty() {
+                    plain = false;
+                    break;
+                }
+                let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
+                    continue;
+                };
+                let at = table + u64::from(u.table_offset_dwords / 8) * 32;
+                h.add([(at >> 32) as u32, at as u32, u.table_offset_dwords]);
+                // SAFETY: a descriptor slot in title memory, as the tables
+                // made afresh read theirs below.
+                h.add(unsafe { (at as *const [u32; 3]).read_unaligned() });
+                any = true;
+            }
+            if plain && any {
+                h.add([std::ptr::from_ref(plan) as usize as u32, (std::ptr::from_ref(plan) as usize >> 32) as u32, u32::from(STORES.get())]);
+                let tested = TESTED_DEPTH.get().0;
+                h.add([tested as u32, (tested >> 32) as u32, u32::from(compute)]);
+                direct_key = Some(h.0);
+            }
+        }
+        let direct_known = direct_key.and_then(|key| self.direct_ready.get(&key).copied()).filter(|known| known.0 == list.epoch());
+        #[cfg(feature = "diagnostics")]
+        if direct_key.is_some() {
+            DIRECT_ONCE[usize::from(direct_known.is_some())].fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some((_, depth)) = direct_known {
+            if depth {
+                let tested = TESTED_DEPTH.get();
+                TESTED_DEPTH.set((tested.0, true));
+            }
+        } else {
+            let depth_before = TESTED_DEPTH.get();
+            if direct_key.is_some() {
+                TESTED_DEPTH.set((depth_before.0, false));
+            }
+            for &(g, e) in &plan.direct {
+                let group = &plan.groups[g];
+                if !selected_slot(&fresh, group.slot) {
+                    let u = &group.entries[e];
+                    // (Its own slot, `table_cbvs`: the title's holds bytes on 16.)
+                    if group.apart && u.kind == ResourceType::Cbv {
+                        continue;
+                    }
+                    self.table_entry(list, u, compute);
+                }
+            }
+            if let Some(key) = direct_key {
+                let depth = TESTED_DEPTH.get().1;
+                TESTED_DEPTH.set((depth_before.0, depth_before.1 || depth));
+                // (The epoch as it is now: what this changed itself it need
+                // not do again.)
+                if self.direct_ready.len() >= 8192 {
+                    self.direct_ready.clear();
+                }
+                self.direct_ready.insert(key, (list.epoch(), depth));
             }
         }
         let mut made = Few::default();
@@ -4909,13 +4978,15 @@ static APART: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 /// (since the start).
 #[cfg(feature = "diagnostics")]
 fn apart_text(f: f64) -> String {
+    let [looked, known] = std::array::from_fn(|i| DIRECT_ONCE[i].swap(0, Ordering::Relaxed) as f64 / f);
+    let direct = format!("draws' tables read in place: {looked:.0} looked through, {known:.0} found up to date (VICTORY_DIRECT_ONCE)");
     if !victory_shader::emit::table_cbvs_apart() {
-        return "constant buffers apart: off".into();
+        return format!("{direct}; constant buffers apart: off");
     }
     let [read_in_place, made, found, kept, uav, indexed, past] =
         std::array::from_fn(|i| APART[i].swap(0, Ordering::Relaxed) as f64 / f);
     format!(
-        "constant buffers apart: {read_in_place:.0} tables read in place, {made:.0} slots made for their constant buffers and {found:.0} found made in the list; made afresh all the same: {kept:.0} read through the base, {uav:.0} with unordered views, {indexed:.0} with views picked by a constant, {past:.0} past the host heap; {} pipelines' user data in a root constant buffer for room",
+        "{direct}; constant buffers apart: {read_in_place:.0} tables read in place, {made:.0} slots made for their constant buffers and {found:.0} found made in the list; made afresh all the same: {kept:.0} read through the base, {uav:.0} with unordered views, {indexed:.0} with views picked by a constant, {past:.0} past the host heap; {} pipelines' user data in a root constant buffer for room",
         crate::pipeline::host::USER_DATA_BY_VIEW.load(Ordering::Relaxed)
     )
 }
@@ -5008,6 +5079,23 @@ fn table_seen() -> bool {
 /// Whether a table a list reads again, with nothing changed in the list
 /// since, is left as it is (`VICTORY_READY_ONCE=0`: every entry is gone
 /// through again at every draw).
+/// Whether the entries of tables read in place are brought up to date once
+/// for a reader while nothing in the list changes, as the tables made afresh
+/// are (`VICTORY_DIRECT_ONCE=0` turns it off; on by default). With the
+/// constant buffers bound apart (`VICTORY_TABLE_CBV_APART=1`) 4,476 tables a
+/// frame are read in place, and every draw mirrored and looked through each
+/// entry again: the process ran 579 and 598 ms a frame against 507 without
+/// (runs x1, x3 and x2).
+fn direct_once() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DIRECT_ONCE").is_none_or(|v| v != "0"))
+}
+
+/// Diagnostics: draws whose tables read in place were looked through, and
+/// those found brought up to date ([`direct_once`]), since the last line.
+#[cfg(feature = "diagnostics")]
+static DIRECT_ONCE: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
 fn ready_once() -> bool {
     crate::toggled!("VICTORY_READY_ONCE")
 }
