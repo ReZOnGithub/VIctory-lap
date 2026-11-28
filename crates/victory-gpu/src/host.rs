@@ -4518,6 +4518,25 @@ fn summary_mismatch(which: usize, what: &str) {
     }
 }
 
+/// Whether a landing tells the title everything (the bottom-of-pipe writes
+/// and the fence signals behind its flights, in their order, each after the
+/// read-backs of the flights before it) before it tidies what is only ours
+/// of those flights: the plans' lists and memory given back, the tables'
+/// slots (`VICTORY_TELL_FIRST=0` turns it off; on by default).
+///
+/// The title's processor waits for these values some twenty times a frame
+/// and writes the next value a queue of its own waits for, so what stands
+/// between a flight's end on the card and the telling is on the path of the
+/// frame: in run r2 a landing spent 0.35 ms on "read-backs and lists" ahead
+/// of the telling, 12.4 landings a frame. Title memory is complete before
+/// anything is told either way: the read-backs stay where they were. What
+/// waits is bookkeeping the submitting thread already lives with for every
+/// flight still in the air.
+fn tell_first() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TELL_FIRST").is_none_or(|v| v != "0"))
+}
+
 /// Whether a bottom-of-pipe write of `list` meets `wait`.
 pub(crate) fn will_meet(list: &HostList, wait: &crate::list::ValueWait) -> bool {
     let (address, bytes) = wait.place();
@@ -6581,6 +6600,11 @@ impl Host {
         let mut last = 0;
         let mut landed = Vec::new();
         let mut telling = std::time::Instant::now();
+        // With [`tell_first`]: what is only ours to tidy of each flight (its
+        // plan's lists and memory given back, its tables' slots) waits until
+        // the title has been told everything of this landing.
+        let tell_first = tell_first();
+        let mut tidy = Vec::new();
         for item in items {
             telling = match item {
                 Late::Run(mut flight) => {
@@ -6588,16 +6612,20 @@ impl Host {
                     for &i in &flight.order {
                         read_backs(flight.lists[i].host());
                     }
-                    if let Some(card) = flight.card {
-                        self.card_done(card);
+                    if tell_first {
+                        tidy.push(flight);
+                    } else {
+                        if let Some(card) = flight.card {
+                            self.card_done(card);
+                        }
+                        if let Some(own) = flight.own {
+                            own.landed();
+                        }
+                        for detached in &mut flight.lists {
+                            detached.release_tables();
+                        }
+                        landed.push((flight.lists, flight.order));
                     }
-                    if let Some(own) = flight.own {
-                        own.landed();
-                    }
-                    for detached in &mut flight.lists {
-                        detached.release_tables();
-                    }
-                    landed.push((flight.lists, flight.order));
                     crate::land::spent(crate::land::stat::READ_BACKS, telling)
                 }
                 Late::Write(at, what, bytes) => {
@@ -6609,6 +6637,20 @@ impl Host {
                     crate::land::spent(crate::land::stat::TOLD, telling)
                 }
             };
+        }
+        // In the flights' order, as it was done among the telling.
+        for mut flight in tidy {
+            if let Some(card) = flight.card {
+                self.card_done(card);
+            }
+            if let Some(own) = flight.own {
+                own.landed();
+            }
+            for detached in &mut flight.lists {
+                detached.release_tables();
+            }
+            landed.push((flight.lists, flight.order));
+            telling = crate::land::spent(crate::land::stat::READ_BACKS, telling);
         }
         if last > 0 {
             FINISHED.store(last, Ordering::Release);
