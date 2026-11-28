@@ -2339,6 +2339,78 @@ pub(crate) fn under_stats() -> [u64; 10] {
     std::array::from_fn(|i| UNDER_NS[i].swap(0, Ordering::Relaxed))
 }
 
+/// Since the last frame-rate line, of [`Shadow::merge_under_writes`]: ranges
+/// passed over by [`under_stamp`], ranges asked about, bytes compared, and
+/// the bytes of the stale pages in their ranges (what was compared before
+/// [`under_parts`]).
+static UNDER_VISITS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// [`UNDER_VISITS`], taken.
+pub(crate) fn under_visits() -> [u64; 4] {
+    std::array::from_fn(|i| UNDER_VISITS[i].swap(0, Ordering::Relaxed))
+}
+
+/// Whether [`Shadow::merge_under_writes`] first asks the journal by chunks
+/// whether anything of a range is stale (`VICTORY_UNDER_STAMP=0`: as
+/// before; A/B-able).
+///
+/// Each of the 17 submissions of a frame visits the copies it refreshes
+/// that flights may be writing, 212-280 ranges a frame (runs r2, q2), and
+/// for each built the list of every note the journal has in the range and
+/// looked through its pages: 1.7 + 0.3 ms a frame of the submitting thread
+/// in q2, for 199 stale pages, most of them in a few copies. The answer
+/// "no page stale" is what `crate::watch::nothing_new` gives, by chunks of
+/// 1 MiB (a chunk's highest note against the copy's lowest take of it) and
+/// page by page only where a chunk cannot say.
+///
+/// Exact: a page is stale (`stale_pages_in`) when the copy never took it or
+/// the journal has a note of it above its take; `nothing_new` with no range
+/// taken whole (`ranged` 0) says yes only when every page was taken and no
+/// note is above its take, the same question of the same journal, which it
+/// answers only where `writes` would answer from the journal too (the
+/// submission's asking holds the range, or its blocks are known by their
+/// bits); elsewhere it says no and the range is asked about as before. A
+/// note that comes in after the look is a write after the submission's
+/// asking, which the walk could have missed as well. Nothing is kept: it is
+/// safe to flip at any moment.
+fn under_stamp() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_UNDER_STAMP") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_UNDER_STAMP").is_none_or(|v| v != "0"))
+}
+
+/// Whether [`Shadow::merge_under_writes`] compares, of a stale page the copy
+/// took before, only the 4 KiB parts the kernel found written since the take
+/// (`VICTORY_UNDER_PARTS=0`: the whole 64 KiB page, as before; A/B-able).
+///
+/// In q2 a frame compared 199 stale pages whole, 12.7 MB of title memory
+/// read and compared with the reference for 0.64 MB changed: 2.6 ms of the
+/// submitting thread, 4.4 ms of all threads.
+///
+/// Exact as the refresh is (`by_parts`, which takes those parts alone): the
+/// copy and its reference held the title's bytes of the page when it was
+/// taken (a refresh's take or a merge's), and since then the reference
+/// changed only with title memory (a merge puts the title's bytes into both,
+/// `relay_merge` the card's into both) or where shaders write, which is what
+/// is kept; title memory changed only where a part was written, and every
+/// write before the submission's asking, the title's or ours, is a note of
+/// a part above the take. So a part without one has the title's bytes in
+/// the reference already, and comparing it puts nothing in. (A write after
+/// the asking is seen by the next submission's, as the refresh sees it.) A
+/// page never taken, or whose parts the journal does not keep (written
+/// whole, guarded memory, `VICTORY_PAGE_PARTS=0`), is compared whole.
+fn under_parts() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_UNDER_PARTS") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_UNDER_PARTS").is_none_or(|v| v != "0"))
+}
+
 /// [`MERGED`], taken.
 pub(crate) fn merged_stats() -> [u64; 3] {
     [0, 1, 2].map(|i| MERGED[i].swap(0, Ordering::Relaxed))
@@ -2639,6 +2711,14 @@ fn under_wide() -> bool {
 /// shortcut: a piece with very many runs has them joined over small gaps,
 /// where the old race is left.
 fn put_changed(at: usize, title: &[u8], merged: &[u8]) -> usize {
+    let written = put_changed_now(at, title, merged);
+    // In: the askings' marks learn it (`crate::watch::we_wrote`).
+    crate::watch::we_wrote(at, title.len());
+    written
+}
+
+/// [`put_changed`], before the askings' marks are told.
+fn put_changed_now(at: usize, title: &[u8], merged: &[u8]) -> usize {
     crate::watch::landing(at, title.len());
     if !exact_back() {
         crate::host::write_mapped(at as *mut u8, merged.as_ptr(), merged.len());
@@ -4155,6 +4235,23 @@ impl Shadow {
         UNDER_NS[9].fetch_add(1, Ordering::Relaxed);
         for (a, e) in busy {
             let t = std::time::Instant::now();
+            // `VICTORY_UNDER_STAMP`: the journal says, in a step per chunk of
+            // 1 MiB, that no page of the range is stale (`nothing_new`, the
+            // question `stale_pages_in` answers below, asked of the same
+            // journal and takes without building the list of every note in
+            // the range).
+            if under_stamp() {
+                let same = {
+                    let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                    crate::watch::nothing_new(a, e, base, &copied.pages, &copied.chunk_taken, 0)
+                };
+                if same {
+                    UNDER_VISITS[0].fetch_add(1, Ordering::Relaxed);
+                    under_ns(1, t);
+                    continue;
+                }
+            }
+            UNDER_VISITS[1].fetch_add(1, Ordering::Relaxed);
             // As the refresh itself asks (`update_free`): the journal if
             // the submission's asking covered the range, else the kernel,
             // else the guards. The journal alone said nothing for copies
@@ -4166,15 +4263,62 @@ impl Shadow {
                 return true;
             };
             let t = under_ns(0, t);
-            let stale: Vec<usize> = {
+            let (stale, parts): (Vec<usize>, Vec<u16>) = {
                 let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                stale_pages_in(base, &copied, a, e, &written)
+                let stale = stale_pages_in(base, &copied, a, e, &written);
+                // `VICTORY_UNDER_PARTS`: of a page the copy took before, the
+                // 4 KiB parts written since (as the refresh takes them,
+                // `by_parts`); a page never taken, or whose parts are not
+                // known, whole.
+                let parts = if under_parts() {
+                    let taken: Vec<(usize, u64)> = stale.iter().map(|&page| (page, copied[page - base])).collect();
+                    let mut parts = crate::watch::parts_written(&taken);
+                    for (mask, &(_, at)) in parts.iter_mut().zip(&taken) {
+                        if at == 0 || *mask == 0 {
+                            *mask = u16::MAX;
+                        }
+                    }
+                    parts
+                } else {
+                    vec![u16::MAX; stale.len()]
+                };
+                (stale, parts)
             };
             UNDER_NS[8].fetch_add(stale.len() as u64, Ordering::Relaxed);
             let t = under_ns(1, t);
             if stale.is_empty() {
                 continue;
             }
+            // The pieces compared: (index in `stale`, title address from,
+            // to), each in one page and in `[a, e)`.
+            const PART: usize = PAGE / 16;
+            let mut pieces: Vec<(usize, usize, usize)> = Vec::with_capacity(stale.len());
+            let (mut whole_bytes, mut part_bytes) = (0u64, 0u64);
+            // Per page of `stale`: whether some of it is in `[a, e)` (a page
+            // whose parts written since lie outside the range has nothing to
+            // compare, and is as good as compared).
+            let mut looked = vec![false; stale.len()];
+            for (i, (&page, &mask)) in stale.iter().zip(&parts).enumerate() {
+                let (lo, hi) = ((page * PAGE).max(a), ((page + 1) * PAGE).min(e));
+                if lo >= hi {
+                    continue;
+                }
+                looked[i] = true;
+                whole_bytes += (hi - lo) as u64;
+                let mut m = mask;
+                while m != 0 {
+                    let first = m.trailing_zeros() as usize;
+                    let past = first + (!(m >> first)).trailing_zeros() as usize;
+                    m = if past >= 16 { 0 } else { m & (u16::MAX << past) };
+                    let (from, to) = ((page * PAGE + first * PART).max(lo), (page * PAGE + past.min(16) * PART).min(hi));
+                    if from < to {
+                        part_bytes += (to - from) as u64;
+                        pieces.push((i, from, to));
+                    }
+                }
+            }
+            UNDER_VISITS[2].fetch_add(part_bytes, Ordering::Relaxed);
+            UNDER_VISITS[3].fetch_add(whole_bytes, Ordering::Relaxed);
             // The lock of the copy's reference (the snapshot, or the
             // CPU's side of a copy in the card's memory), from before
             // title memory is read until the title's bytes are in: with
@@ -4195,21 +4339,21 @@ impl Shadow {
                 return true;
             }
             let t = under_ns(2, t);
-            // A page's part in the range, compared and put in: the runs it
-            // changed; none for a page that is not there (left as it is, and
-            // looked at again next time) or that had too many.
+            // A piece of a page in the range, compared and put in: the runs
+            // it changed; none for a page that is not there (left as it is,
+            // and looked at again next time) or that had too many.
             type Done = Option<Vec<(usize, usize)>>;
             let left = std::sync::atomic::AtomicI64::new(*runs_left as i64);
             let over = std::sync::atomic::AtomicBool::new(false);
-            let done: Vec<Mutex<Done>> = stale.iter().map(|_| Mutex::new(None)).collect();
-            let page_of = |i: usize| -> (usize, usize) { ((stale[i] * PAGE).max(a), ((stale[i] + 1) * PAGE).min(e)) };
+            let done: Vec<Mutex<Done>> = pieces.iter().map(|_| Mutex::new(None)).collect();
             let one = |i: usize| {
-                let (lo, hi) = page_of(i);
+                let (_, lo, hi) = pieces[i];
                 if lo < hi && !over.load(Ordering::Relaxed) {
                     // SAFETY: the reference holds the copy's bytes at the
                     // copy's offsets, and these are in a declared range; the
                     // locks held above keep out what else writes them, and
-                    // no two pages are the same.
+                    // no two pieces overlap (each is a run of parts of one
+                    // page, the pages each once).
                     let runs = unsafe { self.merge_page_under_writes(lo, hi - lo, held as *mut u8, &left) };
                     match runs {
                         Ok(runs) => *done[i].lock().unwrap_or_else(|e| e.into_inner()) = runs,
@@ -4219,10 +4363,10 @@ impl Shadow {
             };
             // (Not on the threads of `wide`: the thread that waits there
             // takes whatever work comes, and a landing's takes the lock.)
-            if stale.len() > 2 && under_wide() {
-                crate::land::each_under(stale.len(), &one);
+            if pieces.len() > 2 && under_wide() {
+                crate::land::each_under(pieces.len(), &one);
             } else {
-                (0..stale.len()).for_each(one);
+                (0..pieces.len()).for_each(one);
             }
             let t = under_ns(3, t);
             *runs_left = left.into_inner().max(0) as usize;
@@ -4231,23 +4375,30 @@ impl Shadow {
             // sorted and joined when it is taken).
             let mut changed: Vec<(usize, usize)> = Vec::new();
             let (mut runs_in, mut bytes_in) = (0u64, 0u64);
-            for (i, runs) in done.into_iter().enumerate() {
+            // Per page of `stale`: whether every piece of it was put in.
+            let mut all_in = vec![true; stale.len()];
+            for (k, runs) in done.into_iter().enumerate() {
+                let (i, lo, _) = pieces[k];
                 let Some(runs) = runs.into_inner().unwrap_or_else(|e| e.into_inner()) else {
+                    all_in[i] = false;
                     continue;
                 };
-                let (lo, hi) = ((stale[i] * PAGE).max(a), ((stale[i] + 1) * PAGE).min(e));
                 runs_in += runs.len() as u64;
                 bytes_in += runs.iter().map(|r| r.1 as u64).sum::<u64>();
                 if self.card.is_some() {
                     changed.extend(runs.into_iter().map(|(r, m)| (lo - start + r, lo - start + r + m)));
                 }
-                // Taken, if the range holds all of the page that is in the
-                // copy; else the rest of it is the refresh's, which notes
-                // only whole pages, and the page is looked at again.
-                if lo < hi && (stale[i] * PAGE).max(start) >= a && ((stale[i] + 1) * PAGE).min(end) <= e {
-                    taken.push(stale[i]);
+            }
+            for (i, &page) in stale.iter().enumerate() {
+                // Taken, if every piece of it was put in and the range holds
+                // all of the page that is in the copy; else the rest of it
+                // is the refresh's, which notes only whole pages, and the
+                // page is looked at again.
+                if looked[i] && all_in[i] && (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= e {
+                    taken.push(page);
                 }
             }
+            MERGED[0].fetch_add(looked.iter().filter(|&&l| l).count() as u64, Ordering::Relaxed);
             MERGED[1].fetch_add(runs_in, Ordering::Relaxed);
             MERGED[2].fetch_add(bytes_in, Ordering::Relaxed);
             self.card_changed_runs(changed.into_iter());
@@ -4299,7 +4450,6 @@ impl Shadow {
             }
             let t = under_ns(5, t);
             let _compared = Compared(t);
-            MERGED[0].fetch_add(1, Ordering::Relaxed);
             let at = lo - self.start as usize;
             // SAFETY: the caller's.
             let held = unsafe { std::slice::from_raw_parts_mut(held.add(at), n) };

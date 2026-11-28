@@ -595,6 +595,9 @@ unsafe fn piece_at(
     // stays; else it is opened once for the piece.
     let mut differing = [true; BLOCK / PAGE + 1];
     let base = title / PAGE;
+    // Title memory written at its own address, told to the askings' marks
+    // when the bytes are in (`crate::watch::we_wrote`).
+    let mut direct: Option<(usize, usize)> = None;
     if beside.is_none() {
         drop(reading);
         differing.fill(false);
@@ -613,6 +616,7 @@ unsafe fn piece_at(
         let opening = std::time::Instant::now();
         crate::watch::landing(from, to - from);
         spent(stat::NOTES, opening);
+        direct = Some((from, to));
     }
     let into = beside.unwrap_or(title);
     let since = crate::watch::changes();
@@ -661,6 +665,9 @@ unsafe fn piece_at(
             }
         }
     });
+    if let Some((from, to)) = direct {
+        crate::watch::we_wrote(from, to - from);
+    }
     if let Some((from, to)) = span {
         notes.spans.push((from, to - from));
         // Not through a copy that is not to be noted, if that is asked: the

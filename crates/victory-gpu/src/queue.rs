@@ -868,6 +868,9 @@ impl Written {
                 at.cast::<u64>().write_unaligned(value);
             }
         }
+        // In title memory: the askings' marks learn it.
+        #[cfg(windows)]
+        crate::watch::we_wrote(at as usize, bytes);
     }
 }
 

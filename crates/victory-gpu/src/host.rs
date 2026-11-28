@@ -5163,8 +5163,9 @@ fn late_line(frames: f64) {
         let u = crate::shadow::under_stats().map(|n| n as f64 / frames);
         let ms = |i: usize| u[i] / 1e6;
         let set = UNDER_SET.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64);
+        let v = crate::shadow::under_visits().map(|n| n as f64 / frames);
         tracing::info!(
-            "of those, ms a frame: {:.2} finding copies in the lists' refreshes, {:.0} calls: {:.2} asking what was written, {:.2} finding the pages, {:.2} waiting for the locks, {:.2} comparing pages (threads together: {:.2} reading title memory, {:.2} comparing and putting in), {:.2} noting the runs; {:.0} stale pages; copies with pending writes (VICTORY_PENDING_SET) {:.1} a call, {:.0} of {:.0} calls a frame found none",
+            "of those, ms a frame: {:.2} finding copies in the lists' refreshes, {:.0} calls: {:.2} asking what was written, {:.2} finding the pages, {:.2} waiting for the locks, {:.2} comparing pages (threads together: {:.2} reading title memory, {:.2} comparing and putting in), {:.2} noting the runs; {:.0} stale pages; copies with pending writes (VICTORY_PENDING_SET) {:.1} a call, {:.0} of {:.0} calls a frame found none; ranges known clean by the journal's chunks {:.0}, asked {:.0} (VICTORY_UNDER_STAMP); {:.2} MB compared of {:.2} MB of stale pages (VICTORY_UNDER_PARTS)",
             UNDER_SCAN.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames,
             u[9],
             ms(0),
@@ -5178,6 +5179,10 @@ fn late_line(frames: f64) {
             set[0] / set[2].max(1.0),
             set[1] / frames,
             set[2] / frames,
+            v[0],
+            v[1],
+            v[2] / (1 << 20) as f64,
+            v[3] / (1 << 20) as f64,
         );
     }
 }
@@ -9513,12 +9518,18 @@ impl HostList {
                         crate::port_journal::prep_wrote();
                     }
                     let _step = crate::timeline::span("a step of ours");
+                    crate::watch::run_begins();
                     work();
+                    let told = crate::watch::run_ends();
                     // It wrote title memory, where is not known here: the
                     // submission's one asking ends, later refreshes ask anew.
+                    // (Unless it told where, `crate::watch::run_wrote`, every
+                    // submission's mark goes up to now.)
                     if matches!(step, Step::Run(_)) {
                         crate::watch::ask_once_end();
-                        crate::watch::wrote_unnoted();
+                        if !told {
+                            crate::watch::wrote_unnoted();
+                        }
                     }
                     #[cfg(feature = "diagnostics")]
                     {
@@ -9735,6 +9746,7 @@ fn split_line(frames: f64) {
     let a: Vec<f64> = crate::watch::asks().iter().map(|&n| n as f64 / frames).collect();
     let h: Vec<f64> = crate::draw::HEAP_SPLIT.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames).collect();
     let s: Vec<f64> = crate::shadow::send_stats().iter().map(|&n| n as f64 / frames).collect();
+    let shared = crate::watch::shared_counts().map(|n| n as f64 / frames);
     let sc: Vec<f64> = SPANS_CALLER.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames).collect();
     let tr: Vec<f64> = TITLE_RANGE.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
@@ -9782,7 +9794,8 @@ fn split_line(frames: f64) {
          written, {:.0} askings refused, {:.0} large ranges asked apart (VICTORY_ASK_RUNS_APART)); {:.0} questions about holes; view ranges: {:.0} answered by their \
          bits, {:.0} by the guards whole, {:.0} block by block; {:.0} blocks made read-only, {:.0} opened by ourselves; {:.1} ms \
          waiting for the guards, {:.1} ms changing protections; pages taken for the card: {:.1} MB compared, {:.1} MB of them \
-         as they were, {:.1} MB to go up in {:.0} runs (VICTORY_SEND_CHANGED)",
+         as they were, {:.1} MB to go up in {:.0} runs (VICTORY_SEND_CHANGED); left to askings since the submission was queued \
+         (VICTORY_ASK_SHARED): {:.1} runs ahead and {:.1} ranges alone, {:.0} MB, {:.1} ranges alone still asked",
         a[0],
         a[1] / 1024.0,
         a[11] / 1e6,
@@ -9801,6 +9814,10 @@ fn split_line(frames: f64) {
         s[1] / 1048576.0,
         s[2] / 1048576.0,
         s[3],
+        shared[0],
+        shared[1],
+        shared[2] * (crate::watch::PAGE >> 10) as f64 / 1024.0,
+        shared[3],
     );
     tracing::info!(
         "the pass over the heap's views per frame: {:.1} ms looking at slots, {:.1} their copies' spans and refreshes, {:.1} textures; the \

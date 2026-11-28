@@ -758,9 +758,10 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         let keep = no_reset();
-        // (`ask_marks`: what the title wrote before this number was taken
-        // is in the answer.)
-        let stamp = if ask_marks() { next_asking() } else { 0 };
+        // (`ask_marks`, `ask_shared`: what the title wrote before this
+        // number was taken is in the answer. Taken whether or not they are
+        // on, so that either can be switched on at any moment.)
+        let stamp = next_asking();
         // SAFETY: the answer buffer holds `count` entries.
         let failed = unsafe {
             GetWriteWatch(
@@ -917,14 +918,75 @@ thread_local! {
 /// ([`wrote_unnoted`]).
 static ASK_FLOOR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// We wrote title memory ourselves and did not note it in the journal (a
-/// step of a submission done when it is prepared, behind its one asking or
-/// anywhere): only an asking of the kernel after this finds it, whenever the
-/// submissions that read it were queued.
+/// We wrote title memory ourselves and did not note it in the journal, and
+/// where is not known (a step of ours that does not tell, `Step::Run`): only
+/// an asking of the kernel after this finds it, whenever the submissions
+/// that read it were queued. Kept whether or not marks are used, so that
+/// they can be switched on at any moment.
 pub(crate) fn wrote_unnoted() {
-    if ask_marks() {
-        ASK_FLOOR.fetch_max(next_asking(), std::sync::atomic::Ordering::Relaxed);
+    ASK_FLOOR.fetch_max(next_asking(), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// By piece of [`EARLY_PIECE`] pages: a number taken after we last wrote
+/// title memory there without noting it in the journal ([`we_wrote`]). A
+/// mark counts there only with an asking after it.
+static FLOORS: Mutex<BTreeMap<usize, u64>> = Mutex::new(BTreeMap::new());
+
+/// We wrote title memory `[at, at + len)` (the bytes are in) and did not
+/// note it in the journal: what shaders wrote put into it (a landing, a
+/// flight's copy-back, a value written when a list has run), a title buffer
+/// copy of ours with no asking standing. The kernel's dirty bits have it,
+/// and the next asking of it finds it; a submission queued before it, whose
+/// asking would have been made after it, may not leave its asking to one
+/// made earlier ([`asked_since`]). Its pieces' floors go up to a number
+/// taken now, after the write: an asking whose number is above it began
+/// after the write. Kept whether or not marks are used.
+pub(crate) fn we_wrote(at: usize, len: usize) {
+    if len == 0 {
+        return;
     }
+    let floor = next_asking();
+    let mut floors = FLOORS.lock().unwrap_or_else(|e| e.into_inner());
+    for piece in at / PAGE / EARLY_PIECE..=(at + len - 1) / PAGE / EARLY_PIECE {
+        let at = floors.entry(piece).or_insert(0);
+        *at = (*at).max(floor);
+    }
+}
+
+/// The floor of pages `[first, last)`: the highest of [`ASK_FLOOR`] and the
+/// [`FLOORS`] of their pieces.
+fn floor_of(first: usize, last: usize) -> u64 {
+    let floors = FLOORS.lock().unwrap_or_else(|e| e.into_inner());
+    let here = floors.range(first / EARLY_PIECE..last.div_ceil(EARLY_PIECE)).map(|(_, &f)| f).max().unwrap_or(0);
+    here.max(ASK_FLOOR.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+thread_local! {
+    /// Whether the step of ours running on this thread told what it wrote
+    /// ([`run_wrote`]).
+    static RUN_TOLD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A step of ours that may write title memory (`Step::Run`) begins on this
+/// thread.
+pub(crate) fn run_begins() {
+    RUN_TOLD.set(false);
+}
+
+/// The step of ours running wrote title memory `[at, at + len)` (a copy the
+/// title recorded in a list, `CopyMemoryToMemoryX`), the bytes are in: its
+/// pieces' floors go up ([`we_wrote`]), and not [`ASK_FLOOR`], every
+/// submission's, which such a step raised 49-50 times a frame (q2: "49
+/// runs"). The journal learns it as before: the submission's asking ends
+/// after the step, and the kernel is asked again.
+pub(crate) fn run_wrote(at: usize, len: usize) {
+    we_wrote(at, len);
+    RUN_TOLD.set(true);
+}
+
+/// The step of ours is done: whether it told what it wrote.
+pub(crate) fn run_ends() -> bool {
+    RUN_TOLD.replace(false)
 }
 
 /// The number of the last asking so far: a submission queued now needs
@@ -939,10 +1001,59 @@ pub(crate) fn set_ask_mark(mark: u64) {
     ASK_MARK.set(mark);
 }
 
-/// By piece ([`EARLY_PIECE`] pages): the number taken before the last kernel
-/// asking that covered the whole piece and whose pages are noted.
-static STAMPS: std::sync::LazyLock<RwLock<std::collections::HashMap<usize, u64>>> =
-    std::sync::LazyLock::new(|| RwLock::new(std::collections::HashMap::new()));
+/// Page ranges and the number taken before the last kernel asking about each
+/// whose pages are noted: by first page, (last page, number), the ranges
+/// apart. By piece of 2 MiB, covered whole, as it was, a range that does not
+/// begin and end on a piece's edge was never known as asked: the ranges a
+/// submission asks alone are such (q2: 0x960710000+0x2d00000, asked 7.9
+/// times a frame, nothing found in any).
+struct Stamps(BTreeMap<usize, (usize, u64)>);
+
+impl Stamps {
+    const fn new() -> Stamps {
+        Stamps(BTreeMap::new())
+    }
+
+    /// Pages `[first, last)` were asked about after number `stamp`. What it
+    /// overlaps takes its number, lower or not: a lower one says less.
+    fn put(&mut self, first: usize, last: usize, stamp: u64) {
+        if first >= last {
+            return;
+        }
+        // (Forgetting says less too.)
+        if self.0.len() >= 1 << 14 {
+            self.0.clear();
+        }
+        // Those that begin before `last` and end after `first`: the ranges
+        // are apart, so their ends are in the order of their beginnings.
+        let over: Vec<(usize, (usize, u64))> =
+            self.0.range(..last).rev().take_while(|(_, (end, _))| *end > first).map(|(&a, &v)| (a, v)).collect();
+        for (a, (end, s)) in over {
+            self.0.remove(&a);
+            if a < first {
+                self.0.insert(a, (first, s));
+            }
+            if end > last {
+                self.0.insert(last, (end, s));
+            }
+        }
+        self.0.insert(first, (last, stamp));
+    }
+
+    /// Whether every page of `[first, last)` was asked about after `above`.
+    fn above(&self, first: usize, last: usize, above: u64) -> bool {
+        let mut at = first;
+        while at < last {
+            match self.0.range(..=at).next_back() {
+                Some((_, &(end, s))) if end > at && s > above => at = end,
+                _ => return false,
+            }
+        }
+        true
+    }
+}
+
+static STAMPS: RwLock<Stamps> = RwLock::new(Stamps::new());
 
 /// Pieces a submission had to ask the kernel about lately, and for how many
 /// more rounds the early thread asks about them.
@@ -952,8 +1063,58 @@ static WANTED: Mutex<BTreeMap<usize, u32>> = Mutex::new(BTreeMap::new());
 /// runs asked.
 static MARKED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
-/// The askings this thread made are noted in the journal: the pieces they
-/// covered whole are known as asked.
+/// Whether a submission leaves out of its asking what was asked about since
+/// it was queued (`VICTORY_ASK_SHARED=0`: it asks about everything, as
+/// before; A/B-able): one asking serves every submission queued before it.
+///
+/// What it was (q2): 470 kernel askings a frame over 2.2 GB of all threads,
+/// 18.6 ms; of the submitting thread's 7.4 ms asking, 5.1 ms were 113
+/// ranges asked alone, nearly all of which found nothing (0x960710000 +
+/// 45 MB asked 7.9 times a frame, 0.0 pages found, 0.98 ms; 0x9891f0000 +
+/// 24 MB 4.9 times, 0.53 ms). The same range is asked by one submission
+/// after another while the line holds 15 the title queued well before.
+///
+/// Why nothing is missed. The submission's one asking (`VICTORY_ASK_ONCE`)
+/// already stands on this: what a submission's lists read the title wrote
+/// before it submitted them; what it writes later is for later submissions
+/// and found by their askings. A submission carries its mark, the asking
+/// number when the title queued it (raised to the latest of the parts it is
+/// joined with and of the waits its queue went past, `crate::queue`). A
+/// kernel asking whose number (taken just before it walks) is above the
+/// mark began after every such write: each was in its answer, or reset by
+/// an asking before it whose answer was noted first, and its pages are
+/// noted before its range is known as asked ([`stamps_publish`]). So the
+/// journal holds them, and the submission's refreshes take them from it as
+/// from an answer of its own. What we write ourselves after the mark (a
+/// copy of a list's step, what shaders wrote going into title memory, a
+/// value written when a list has run) the journal is told, or a floor is
+/// raised where it lies ([`we_wrote`]), or every mark ([`wrote_unnoted`]),
+/// and only an asking after that serves. Ranges are known as asked to the
+/// page ([`Stamps`]), each asking's own, published by every thread that
+/// asks (`writes`), not only the early one. Nothing is kept that is valid
+/// for one setting only: numbers, ranges and floors are kept either way.
+fn ask_shared() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_ASK_SHARED") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_SHARED").is_none_or(|v| v != "0"))
+}
+
+/// Since the last frame line, with marks: runs of a submission's asking
+/// ahead left out, ranges it asks alone left out, pages of 64 KiB those
+/// hold, and alone ranges asked.
+static SHARED: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// [`SHARED`], taken.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn shared_counts() -> [u64; 4] {
+    std::array::from_fn(|i| SHARED[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
+/// The askings this thread made are noted in the journal: their ranges are
+/// known as asked.
 fn stamps_publish() {
     let done = STAMPED.with(|s| std::mem::take(&mut *s.borrow_mut()));
     if done.is_empty() {
@@ -961,21 +1122,18 @@ fn stamps_publish() {
     }
     let mut stamps = STAMPS.write().unwrap_or_else(|e| e.into_inner());
     for (first, last, stamp) in done {
-        for piece in first.div_ceil(EARLY_PIECE)..last / EARLY_PIECE {
-            let at = stamps.entry(piece).or_insert(0);
-            *at = (*at).max(stamp);
-        }
+        stamps.put(first, last, stamp);
     }
 }
 
-/// Whether every piece that holds some of pages `[first, last)` was asked
-/// about after `mark`.
+/// Whether every page of `[first, last)` was asked about after `mark`, and
+/// after the floors there ([`floor_of`]: what we wrote ourselves since).
 fn asked_since(first: usize, last: usize, mark: u64) -> bool {
     if mark == 0 || first >= last {
         return false;
     }
-    let stamps = STAMPS.read().unwrap_or_else(|e| e.into_inner());
-    (first / EARLY_PIECE..last.div_ceil(EARLY_PIECE)).all(|piece| stamps.get(&piece).is_some_and(|&s| s > mark))
+    let above = mark.max(floor_of(first, last));
+    STAMPS.read().unwrap_or_else(|e| e.into_inner()).above(first, last, above)
 }
 
 /// A submission asked the kernel about pages `[first, last)` itself.
@@ -1145,14 +1303,21 @@ fn ask_ahead_held(ranges: &[(usize, usize)], held: bool, mark: u64) {
     // submission was queued is in the journal already.)
     if mark != 0 {
         let before = runs.len();
+        // (`VICTORY_ASK_MARKS` has the early thread ask what was asked here;
+        // `ask_shared` not: that moves the askings, it does not save them.)
+        let wanting = ask_marks();
         runs.retain(|run| {
             let first = pieces[run.start].0;
             let last = pieces[run.clone()].iter().map(|p| p.1).max().unwrap_or(first);
             if asked_since(first, last, mark) {
                 asked.push((first, last));
+                SHARED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                SHARED[2].fetch_add((last - first) as u64, std::sync::atomic::Ordering::Relaxed);
                 false
             } else {
-                want(first, last);
+                if wanting {
+                    want(first, last);
+                }
                 true
             }
         });
@@ -1471,23 +1636,21 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     // other asking comes between the two parts.
     let _all = Asking::hold_all();
     // (The mark is this submission's alone: taken, not left for the next.)
-    let mark = if ask_marks() {
-        match ASK_MARK.replace(0) {
-            0 => 0,
-            mark => mark.max(ASK_FLOOR.load(std::sync::atomic::Ordering::Relaxed)),
-        }
-    } else {
-        0
+    let mark = match ASK_MARK.replace(0) {
+        0 => 0,
+        _ if !ask_marks() && !ask_shared() => 0,
+        mark => mark.max(ASK_FLOOR.load(std::sync::atomic::Ordering::Relaxed)),
     };
     ask_ahead_held(ranges, true, mark);
     spent.next("asking: the rest");
-    ask_rest(ranges, true);
+    ask_rest(ranges, true, if ask_shared() { mark } else { 0 });
     spent.end();
 }
 
 /// [`ask_once`] after its [`ask_ahead`]: what that left to `writes`, and the
-/// asking stands.
-fn ask_rest(ranges: &[(usize, usize)], held: bool) {
+/// asking stands. With `mark` ([`ask_shared`]), a range asked about since
+/// the submission's mark is not asked again.
+fn ask_rest(ranges: &[(usize, usize)], held: bool, mark: u64) {
     let _all = (!held).then(Asking::hold_all);
     let mut ahead = {
         let mut j = journal_mut();
@@ -1513,6 +1676,21 @@ fn ask_rest(ranges: &[(usize, usize)], held: bool) {
         }
     }
     let mut ahead = held_ahead.take();
+    // (`ask_shared`: everything the title wrote before the submission was
+    // queued is in the journal for these, as for the runs left out ahead.)
+    if mark != 0 {
+        alone_ranges.retain(|&(first, last)| {
+            if asked_since(first, last, mark) {
+                ahead.push((first, last));
+                SHARED[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                SHARED[2].fetch_add((last - first) as u64, std::sync::atomic::Ordering::Relaxed);
+                false
+            } else {
+                SHARED[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                true
+            }
+        });
+    }
     let answers = spread_each(alone_ranges.len(), |r| {
         let (first, last) = alone_ranges[r];
         #[cfg(feature = "diagnostics")]
@@ -1520,9 +1698,12 @@ fn ask_rest(ranges: &[(usize, usize)], held: bool) {
         let found = kernel_written(first, last);
         #[cfg(feature = "diagnostics")]
         alone(first * PAGE, last * PAGE, found.as_ref().map_or(0, Vec::len), asking.elapsed());
-        found
+        // (The number of an asking on another thread: published here once
+        // the pages are noted, as `ask_ahead_held` does.)
+        (found, STAMPED.with(|s| std::mem::take(&mut *s.borrow_mut())))
     });
-    for (&(first, last), found) in alone_ranges.iter().zip(answers) {
+    for (&(first, last), (found, stamped)) in alone_ranges.iter().zip(answers) {
+        STAMPED.with(|s| s.borrow_mut().extend(stamped));
         if let Some(pages) = found {
             written.extend(pages);
             ahead.push((first, last));
@@ -1540,6 +1721,9 @@ fn ask_rest(ranges: &[(usize, usize)], held: bool) {
         j.ahead_asked = now;
         j.kept = !ahead.is_empty();
         j.ahead.set(ahead);
+        drop(j);
+        // Noted: known as asked from now on.
+        stamps_publish();
         return;
     }
     let mut j = journal_mut();
@@ -1550,6 +1734,8 @@ fn ask_rest(ranges: &[(usize, usize)], held: bool) {
     }
     j.kept = !ahead.is_empty();
     j.ahead.set(ahead);
+    drop(j);
+    stamps_publish();
 }
 
 /// Diagnostics: the ranges a submission's asking asks about alone
@@ -1616,14 +1802,15 @@ pub(crate) fn wrote(at: usize, len: usize) {
     // which is seen shared. (Standing, its number moves: alone, as before.)
     if port_journal() && (len == 0 || !journal().kept) {
         port7_count(P7_SKIPPED, 1);
-        // (Not noted: the kernel is to be asked about it. `ask_marks`.)
-        wrote_unnoted();
+        // (Not noted: the kernel is to be asked about it. The marks learn
+        // where, `we_wrote`; they had every submission's go up to now.)
+        we_wrote(at, len);
         return;
     }
     let mut j = journal_mut();
     if !j.kept || len == 0 {
         drop(j);
-        wrote_unnoted();
+        we_wrote(at, len);
         return;
     }
     let now = next_asking();
@@ -1772,7 +1959,9 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         }
     };
     if pages.is_empty() {
-        // Nothing to note: the others may go on reading.
+        // Nothing to note: the others may go on reading. (Known as asked
+        // from now on, `ask_shared`.)
+        stamps_publish();
         return Some(fresh());
     }
     let answer = if port_journal() {
@@ -1800,6 +1989,8 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     if guards_asked && light() {
         publish(&pages.iter().map(|p| p.0).collect::<Vec<_>>());
     }
+    // Its pages noted: known as asked from now on (`ask_shared`).
+    stamps_publish();
     Some(answer)
 }
 
@@ -4877,7 +5068,7 @@ mod tests {
         let (copied, _) = writes(p, p + 4 * PAGE, false).expect("watched");
         // SAFETY: committed pages of ours.
         unsafe { ((p + PAGE) as *mut u8).write_volatile(1) };
-        ask_rest(&ranges, false);
+        ask_rest(&ranges, false, 0);
         let last = journal().notes.range(p / PAGE + 1, p / PAGE + 2).first().map(|n| n.1);
         ask_once_end();
         assert!(last.is_some_and(|last| last > copied), "{last:?} is not after {copied}");
