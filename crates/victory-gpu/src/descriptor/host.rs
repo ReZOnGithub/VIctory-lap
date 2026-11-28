@@ -1741,7 +1741,18 @@ fn dynamic_slots(count: u32, null: u32) -> u32 {
             .unwrap_or(DYNAMIC << 2)
     });
     if null < PORTABLE_VIEWS {
-        return DYNAMIC;
+        // (`VICTORY_DYNAMIC_SLOTS_CAPPED=<n>`: on a host whose heap is capped,
+        // where these slots come out of the title's. With the constant
+        // buffers read through slots of their own, 4,630 of the 4,760
+        // tables still made afresh a frame at the boat are made so only
+        // because they reach past the title slots that are left, run z5.)
+        static CAPPED: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        return *CAPPED.get_or_init(|| {
+            std::env::var("VICTORY_DYNAMIC_SLOTS_CAPPED")
+                .ok()
+                .and_then(|v| v.trim().parse::<u32>().ok())
+                .map_or(DYNAMIC, |n| n.clamp(1 << 14, DYNAMIC))
+        });
     }
     null.saturating_sub(count).min(most).max(DYNAMIC)
 }
