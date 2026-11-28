@@ -295,6 +295,11 @@ struct Lower<'a> {
     params: HashMap<Value, (usize, u32)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
+    /// With [`super::shader::table_cbvs_apart`]: the root parameters (title
+    /// slots) of tables holding a constant buffer that the code reads through
+    /// the table's base in a way that may reach a constant buffer or a slot
+    /// the used-resource list does not name ([`Self::note_table_read`]).
+    kept_tables: std::collections::BTreeSet<u8>,
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
     scalar: HashMap<Site, Address>,
@@ -2059,6 +2064,7 @@ impl<'a> Lower<'a> {
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
             user_reads: BTreeMap::new(),
+            kept_tables: Default::default(),
             samplers: Vec::new(),
             descriptors: x
                 .res
@@ -2849,6 +2855,12 @@ impl<'a> Lower<'a> {
             self.exit(b)?;
         }
         self.fill_phis()?;
+        // The tables whose constant buffers the host must make afresh with
+        // the rest of them, as before (`table_cbvs_apart`): a dword each,
+        // after every other.
+        for slot in std::mem::take(&mut self.kept_tables) {
+            self.host_index(RootType::Other(super::shader::USER_TABLE_KEPT), slot, 0);
+        }
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
@@ -3254,6 +3266,13 @@ impl<'a> Lower<'a> {
     /// computes when it binds (`root` says what, an `Other` code of
     /// `shader.rs`), placed after the layout's own dwords.
     fn host_word(&mut self, root: RootType, slot: u8, dword: u32) -> V {
+        let index = self.host_index(root, slot, dword);
+        self.user_at(index)
+    }
+
+    /// The user-data index of [`Self::host_word`]'s dword, given one if it
+    /// has none yet (nothing loads it).
+    fn host_index(&mut self, root: RootType, slot: u8, dword: u32) -> u32 {
         let known = self
             .user_reads
             .values()
@@ -3285,7 +3304,7 @@ impl<'a> Lower<'a> {
                 index
             }
         };
-        self.user_at(index)
+        index
     }
 
     /// User-data dword `index`, loaded in the entry block.
@@ -7878,6 +7897,12 @@ impl<'a> Lower<'a> {
                 if let Some(&h) = self.handles.get(&key) {
                     return Ok(h);
                 }
+                // A table's constant buffer read through a slot of its own.
+                if let Some(index) = self.table_cbv(*load, *first, sampler, props) {
+                    let h = self.s.heap_handle_at(self.cur, index, false, false, props, false);
+                    self.handles.insert(key, h);
+                    return Ok(h);
+                }
                 let index = self.heap_index(*load, *first, sampler)?;
                 let (index, bounded) = self.raw_twin(src, index, sampler, props);
                 // A waterfall loop's load at the first lane's offset reads
@@ -8348,7 +8373,96 @@ impl<'a> Lower<'a> {
             .i32((offset as i32 as u32).wrapping_add(4 * u32::from(first)));
         at = self.s.m.bin(c, Bin::Add, at, k);
         let shift = self.s.m.i32(if sampler { 4 } else { 5 });
+        if !sampler {
+            // Each lane at its own place.
+            self.note_table_read(a, first, false);
+        }
         Ok(self.s.m.bin(c, Bin::LShr, at, shift))
+    }
+
+    /// With [`super::shader::table_cbvs_apart`]: the user-data dword holding
+    /// the heap slot the host makes for the constant buffer the scalar load
+    /// at `load` reads (dwords `first..`), if that is one a table holds at a
+    /// fixed place its used-resource entry names: `props` a constant
+    /// buffer's, no index the code computes, no waterfall loop, no SGPR
+    /// offset. `None` for everything else, which goes through the table's
+    /// base as before.
+    fn table_cbv(&mut self, load: Site, first: u8, sampler: bool, props: (u32, u32)) -> Option<V> {
+        const CONSTANT: u32 = 13;
+        if sampler || props.0 & 0xFF != CONSTANT || !super::shader::table_cbvs_apart() {
+            return None;
+        }
+        // The structure builder's programs (a spilled user-data table) keep
+        // their root signature as it is: it is near its 64 dwords.
+        if crate::spill::is_spilled(self.x.native) || self.x.res.waterfall.loads.contains(&load) {
+            return None;
+        }
+        let a = *self.scalar.get(&load)?;
+        if a.dynamic.is_some() || a.offset % 4 != 0 {
+            return None;
+        }
+        let rp = *self.x.native.layout.get(a.param)?;
+        if rp.root != RootType::Table {
+            return None;
+        }
+        let li: &Inst = &self.x.p.blocks[load.0].insts[load.1];
+        if !matches!(&li.fields, Fields::Smem { soffset: Operand::Scalar { code: NULL, .. }, .. }) {
+            return None;
+        }
+        let dword = a.offset / 4 + u32::from(first);
+        let cbv = self.x.native.used.iter().any(|u| {
+            u.root == RootType::Table
+                && u.user_data == rp.user_data
+                && u.table_offset_dwords == dword
+                && u.kind == ResourceType::Cbv
+        });
+        if !cbv {
+            return None;
+        }
+        Some(self.host_word(RootType::Other(super::shader::USER_TABLE_CBV), rp.slot, dword))
+    }
+
+    /// With [`super::shader::table_cbvs_apart`]: a heap index computed from
+    /// a table's base at `a` (dwords `first..`; `fixed`: at that place in
+    /// every lane, nothing added at run time). The host makes a table that
+    /// holds a constant buffer afresh only when the code may reach through
+    /// its base something it does not mirror in place for a table without
+    /// one: a constant buffer (whose bytes are not on 256), or a slot no
+    /// used-resource entry names (the host mirrors those alone). Such a
+    /// table is kept ([`Self::kept_tables`]).
+    fn note_table_read(&mut self, a: Address, first: u8, fixed: bool) {
+        // (A spilled program reads none apart: the host makes its tables as
+        // before, `victory-gpu`'s `TablePlan` knows it by the same test.)
+        if !super::shader::table_cbvs_apart() || crate::spill::is_spilled(self.x.native) {
+            return;
+        }
+        let Some(&rp) = self.x.native.layout.get(a.param) else {
+            return;
+        };
+        if rp.root != RootType::Table {
+            return;
+        }
+        let entries = || {
+            self.x
+                .native
+                .used
+                .iter()
+                .filter(move |u| u.root == RootType::Table && u.user_data == rp.user_data)
+        };
+        if !entries().any(|u| u.kind == ResourceType::Cbv) {
+            return;
+        }
+        let dword = (a.offset / 4).wrapping_add(u32::from(first));
+        let named = fixed
+            && a.dynamic.is_none()
+            && a.offset % 4 == 0
+            && entries()
+                .filter(|u| u.table_offset_dwords <= dword)
+                .max_by_key(|u| u.table_offset_dwords)
+                .is_some_and(|u| u.kind != ResourceType::Cbv && u.table_offset_dwords / 8 == dword / 8);
+        if !named {
+            self.kept_tables.insert(rp.slot);
+        }
     }
 
     /// The heap index of the descriptor at dword `first` of what the scalar
@@ -8383,9 +8497,15 @@ impl<'a> Lower<'a> {
             .m
             .i32((*offset as u32).wrapping_add(4 * u32::from(first)));
         addr = self.s.m.bin(c, Bin::Add, addr, k);
-        if !matches!(soffset, Operand::Scalar { code: NULL, .. }) {
+        let plain = matches!(soffset, Operand::Scalar { code: NULL, .. });
+        if !plain {
             let so = self.operand(li, soffset)?;
             addr = self.s.m.bin(c, Bin::Add, addr, so);
+        }
+        if !sampler {
+            // (A waterfall loop's load reads each lane's own entry.)
+            let fixed = plain && !self.x.res.waterfall.loads.contains(&load);
+            self.note_table_read(a, first, fixed);
         }
         let shift = self.s.m.i32(if sampler { 4 } else { 5 });
         Ok(self.s.m.bin(c, Bin::LShr, addr, shift))
@@ -13899,6 +14019,70 @@ mod tests {
             }]
         };
         lower_with(&words, layout(), used()).unwrap();
+    }
+
+    /// A table at s0 with a constant buffer at dword 0 and a raw buffer UAV
+    /// at dword 8; the program stores dword 0 of the constant buffer into
+    /// the UAV, whose descriptor it loads from byte `uav_at` of the table.
+    fn table_cbv_program(uav_at: u32, apart: bool) -> Lowered {
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0 (the CBV)
+            0xF408_0302,
+            0xFA00_0000 | uav_at, // s_load_dwordx4 s[12:15], s[4:5], uav_at
+            0xF420_0404,
+            0xFA00_0000, // s_buffer_load_dword s16, s[8:11], 0
+            0x7E02_0210, // v_mov_b32 v1, s16
+            0xE070_0000,
+            0x8003_0100, // buffer_store_dword v1, off, s[12:15], 0
+            S_ENDPGM,
+        ];
+        let entry = |kind, table_offset_dwords| UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        };
+        let used = vec![entry(ResourceType::Cbv, 0), entry(ResourceType::Uav, 8)];
+        let here = &super::super::shader::TABLE_CBVS_APART_HERE;
+        here.set(Some(apart));
+        let lowered = lower_with(&words, vec![root(RootType::Table, 0, 0)], used);
+        here.set(None);
+        let lowered = lowered.unwrap();
+        #[cfg(windows)]
+        if let Ok(mut v) = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut lowered.dxil.clone()).unwrap_or_else(|e| panic!("apart {apart}, UAV at {uav_at:#x}: {e}"));
+        }
+        lowered
+    }
+
+    #[test]
+    fn a_tables_constant_buffer_is_read_through_a_slot_of_its_own() {
+        use super::super::shader::{USER_TABLE_CBV, USER_TABLE_KEPT};
+        let kinds = |l: &Lowered| -> Vec<(RootType, u8, u32)> {
+            l.user_data.iter().map(|u| (u.root, u.slot, u.dword)).collect()
+        };
+        // Off: the table's base, as before.
+        let off = table_cbv_program(0x20, false);
+        assert_eq!(kinds(&off), vec![(RootType::Table, 0, 0)]);
+        // On: the constant buffer's own dword beside the base, which the UAV
+        // at a slot its entry names is still read through.
+        let on = table_cbv_program(0x20, true);
+        assert_eq!(kinds(&on), vec![(RootType::Table, 0, 0), (RootType::Other(USER_TABLE_CBV), 0, 0)]);
+        assert_ne!(on.dxil, off.dxil);
+        // A descriptor the code loads where no entry names one (dword 16):
+        // the table is kept, made afresh by the host as before.
+        let kept = table_cbv_program(0x40, true);
+        assert!(kinds(&kept).contains(&(RootType::Other(USER_TABLE_KEPT), 0, 0)), "{:?}", kinds(&kept));
+        assert!(kinds(&kept).contains(&(RootType::Other(USER_TABLE_CBV), 0, 0)));
     }
 
     /// Tables of 2D textures at s0 and samplers at s1.

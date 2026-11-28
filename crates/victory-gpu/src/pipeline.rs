@@ -221,17 +221,19 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         _ => None,
     });
     let stores_by_address = programs.is_empty() || programs.iter().any(stores_by_address);
-    let used = programs
+    let program = programs
         .into_iter()
         .find(|p| {
             matches!(
                 p.stage,
                 HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
             )
-        })
-        .map(|p| p.used)
-        .unwrap_or_default();
-    let tables = crate::draw::TablePlan::new(&used, &host.root_indexed_views);
+        });
+    // (The translator reads no table's constant buffer apart in a spilled
+    // program: `victory_shader::emit::table_cbvs_apart`.)
+    let spilled = program.as_ref().is_some_and(victory_shader::spill::is_spilled);
+    let used = program.map(|p| p.used).unwrap_or_default();
+    let tables = crate::draw::TablePlan::new(&used, &host.root_indexed_views, &host.user_data, spilled);
     Ok(Translated {
         host,
         threads,

@@ -103,6 +103,20 @@ pub const USER_ROOT_ADDRESS: u32 = 0x104;
 /// the group's width. Asked for by the structure builder's programs
 /// ([`crate::spill::is_spilled`]).
 pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
+/// `RootType::Other` code of a user-data dword the host computes, with
+/// [`table_cbvs_apart`]: the view heap slot of the constant buffer at dword
+/// `dword` of the descriptor table of root parameter `slot`, a slot the host
+/// makes for that constant buffer alone (its bytes copied at submission, as
+/// for a table made afresh). The shader reads that constant buffer there
+/// instead of at the table's base plus its offset.
+pub const USER_TABLE_CBV: u32 = 0x107;
+/// `RootType::Other` code of a user-data dword nothing reads, with
+/// [`table_cbvs_apart`]: the table of root parameter `slot` holds a constant
+/// buffer the shader may reach through the table's base (an index it
+/// computes, a descriptor chosen by control flow, a slot the used-resource
+/// list does not name), so the host must make that table afresh as before.
+/// The host writes 0.
+pub const USER_TABLE_KEPT: u32 = 0x108;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
@@ -212,6 +226,36 @@ pub fn constants_raw() -> bool {
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("VICTORY_PORT_CBV").is_ok_and(|v| v.trim() == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// For a test's thread alone: [`table_cbvs_apart`].
+    pub(crate) static TABLE_CBVS_APART_HERE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether the constant buffers of descriptor tables are read through heap
+/// slots of their own (`VICTORY_TABLE_CBV_APART=1`; off by default, and off
+/// with renderer port 5, [`constants_raw`], which reads them otherwise).
+///
+/// The console takes constant buffers on 16 bytes, the host on 256, so the
+/// host copies their bytes at submission and makes every table that holds
+/// one afresh for each draw, all of its slots: 7,071 tables of 62,639 slots
+/// a frame (run v1), some 134 ms a frame of the threads that translate the
+/// title's lists (profile r3). With this on a shader reads each constant
+/// buffer of a table through a user-data dword of its own
+/// ([`USER_TABLE_CBV`]): the host makes one slot for it, and the rest of
+/// the table is read where the title has it, as for a table without one. A
+/// table whose constant buffer the shader may reach otherwise is marked
+/// ([`USER_TABLE_KEPT`]) and made afresh as before. Part of the
+/// translation: the shader cache keys on the switch.
+pub fn table_cbvs_apart() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TABLE_CBVS_APART_HERE.get() {
+        return on && !constants_raw();
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_TABLE_CBV_APART").is_ok_and(|v| v.trim() == "1")) && !constants_raw()
 }
 
 /// See [`RAW_VIEWS`]: where shaders translated now read the buffers they pick (0: in place).

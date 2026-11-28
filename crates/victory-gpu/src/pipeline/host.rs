@@ -360,6 +360,10 @@ pub(crate) struct Stage {
     pub(crate) shader: Arc<Shader>,
     /// The root parameter of its user data, and its size in dwords.
     pub(crate) user_data: Option<(u32, u32)>,
+    /// That parameter is a root constant buffer, not root constants: the
+    /// root signature would not fit in 64 dwords otherwise
+    /// ([`USER_DATA_BY_VIEW`]).
+    pub(crate) user_view: bool,
     /// Root parameters of its root views: (title root parameter, ours).
     pub(crate) root_cbvs: Vec<(u8, u32)>,
     pub(crate) root_srvs: Vec<(u8, u32)>,
@@ -482,6 +486,7 @@ impl HostPipeline {
             let mut stage = Stage {
                 shader: shader.clone(),
                 user_data: None,
+                user_view: false,
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
@@ -593,6 +598,9 @@ impl HostPipeline {
                 });
             }
             bound.push(stage);
+        }
+        if victory_shader::emit::table_cbvs_apart() {
+            fit_user_data(&mut params, &mut bound);
         }
         let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
             Ok(root) => root,
@@ -1017,6 +1025,74 @@ fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
     }
     // SAFETY: a translation's own bytes, alive while its shader is.
     unsafe { std::slice::from_raw_parts(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength) }.to_vec()
+}
+
+/// Host pipelines whose user data went into a root constant buffer to fit
+/// ([`fit_user_data`]), since the start.
+pub(crate) static USER_DATA_BY_VIEW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// With constant buffers of tables read apart
+/// (`victory_shader::emit::table_cbvs_apart`), which takes a user-data dword
+/// each: a root signature past its 64 dwords (root constants a dword each,
+/// root views two, tables one) has the user data of its stages, the
+/// largest first, as root constant buffers (two dwords) until it fits,
+/// rather than be refused. The shader reads its user data as a constant
+/// buffer either way; `draw::State::bind` puts the values into upload
+/// memory of the list. Not a stage whose single dword a dispatch sets on
+/// its own (`USER_DISPATCH_THREADS_X`).
+fn fit_user_data(params: &mut [D3D12_ROOT_PARAMETER1], stages: &mut [Stage]) {
+    const MOST: u32 = 64;
+    let cost = |params: &[D3D12_ROOT_PARAMETER1], stages: &[Stage]| -> u32 {
+        params
+            .iter()
+            .enumerate()
+            .map(|(i, p)| match p.ParameterType {
+                D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS => stages
+                    .iter()
+                    .find(|s| s.user_data.is_some_and(|(param, _)| param as usize == i))
+                    .map_or(MOST, |s| s.user_data.map_or(0, |(_, dwords)| dwords)),
+                D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE => 1,
+                _ => 2,
+            })
+            .sum()
+    };
+    let mut total = cost(params, stages);
+    let mut moved = false;
+    while total > MOST {
+        let dispatch = |s: &Stage| {
+            s.translated().host.user_data.iter().any(|u| {
+                u.root == victory_shader::RootType::Other(victory_shader::emit::USER_DISPATCH_THREADS_X)
+            })
+        };
+        let Some(stage) = stages
+            .iter_mut()
+            .filter(|s| !s.user_view && s.user_data.is_some_and(|(_, dwords)| dwords > 2) && !dispatch(s))
+            .max_by_key(|s| s.user_data.map_or(0, |(_, dwords)| dwords))
+        else {
+            break;
+        };
+        let Some((param, dwords)) = stage.user_data else {
+            break;
+        };
+        let p = &mut params[param as usize];
+        *p = D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_CBV,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                    ShaderRegister: 0,
+                    RegisterSpace: USER_DATA_SPACE,
+                    Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                },
+            },
+            ShaderVisibility: p.ShaderVisibility,
+        };
+        stage.user_view = true;
+        total = total - dwords + 2;
+        moved = true;
+    }
+    if moved {
+        USER_DATA_BY_VIEW.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 fn root_signature(

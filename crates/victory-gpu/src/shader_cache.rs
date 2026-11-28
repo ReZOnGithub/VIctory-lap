@@ -139,6 +139,13 @@ fn build() -> [u8; 32] {
         if victory_shader::emit::constants_raw() {
             bytes.extend_from_slice(b"VICTORY_PORT_CBV=1");
         }
+        // Constant buffers of tables read through slots of their own
+        // (`VICTORY_TABLE_CBV_APART=1`): likewise only when on, so the
+        // translations cached without it keep their key. (`draw::TablePlan`
+        // takes every translation of a run to be made with the run's value.)
+        if victory_shader::emit::table_cbvs_apart() {
+            bytes.extend_from_slice(b"VICTORY_TABLE_CBV_APART=1");
+        }
         bytes
     });
     let mut hash = blake3::Hasher::new();

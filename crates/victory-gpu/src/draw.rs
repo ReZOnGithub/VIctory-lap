@@ -31,11 +31,22 @@ pub(crate) struct TablePlan {
     // Direct entries can interleave slots. Preserve their declaration order
     // when recording resource reads, writes, and transitions.
     direct: Vec<(usize, usize)>,
+    /// The constant buffers of tables the shader reads through heap slots
+    /// of their own (`victory_shader::emit::table_cbvs_apart`): root
+    /// parameter, dword in the table, and the user-data dword that takes
+    /// the slot ([`State::table_cbvs`]).
+    cbvs: Vec<(u8, u32, u32)>,
 }
 
 struct TableGroup {
     slot: u8,
     has_cbv: bool,
+    /// The shader reads none of the table's constant buffers through its
+    /// base (they have slots of their own, `TablePlan::cbvs`), nor any slot
+    /// its used-resource entries do not name: with a constant buffer, it is
+    /// read where the title has it, as a table without one is
+    /// (`victory_shader::emit::USER_TABLE_KEPT` says otherwise).
+    apart: bool,
     has_uav: bool,
     max_dword: u32,
     entries: Vec<UsedResource>,
@@ -45,7 +56,29 @@ struct TableGroup {
 }
 
 impl TablePlan {
-    pub(crate) fn new(used: &[UsedResource], indexed: &[RootIndexedView]) -> Self {
+    /// `user_data`: the translation's; `spilled`: a program with a spilled
+    /// user-data table, which reads no constant buffer apart.
+    pub(crate) fn new(
+        used: &[UsedResource],
+        indexed: &[RootIndexedView],
+        user_data: &[victory_shader::emit::UserData],
+        spilled: bool,
+    ) -> Self {
+        use victory_shader::emit::{USER_TABLE_CBV, USER_TABLE_KEPT, table_cbvs_apart};
+        // Translations are keyed by the switch (`shader_cache`): with it on,
+        // every one was made with it on.
+        let apart = table_cbvs_apart() && !spilled;
+        let kept = |slot: u8| {
+            user_data
+                .iter()
+                .any(|u| u.root == RootType::Other(USER_TABLE_KEPT) && u.slot == slot)
+        };
+        let cbvs = user_data
+            .iter()
+            // (Whatever `apart` says: what the shader reads it gets.)
+            .filter(|u| u.root == RootType::Other(USER_TABLE_CBV))
+            .map(|u| (u.slot, u.dword, u.index))
+            .collect();
         let mut slots: Vec<_> = used
             .iter()
             .filter(|u| u.root == RootType::Table)
@@ -58,6 +91,7 @@ impl TablePlan {
             .map(|&slot| TableGroup {
                 slot,
                 has_cbv: false,
+                apart: apart && !kept(slot),
                 has_uav: false,
                 max_dword: 0,
                 entries: Vec::new(),
@@ -84,7 +118,7 @@ impl TablePlan {
             group.by_descriptor.sort_unstable();
             group.by_descriptor.dedup_by_key(|item| item.0);
         }
-        Self { groups, direct }
+        Self { groups, direct, cbvs }
     }
 }
 
@@ -437,6 +471,18 @@ pub(crate) struct State {
     root_srv_slots: std::collections::HashMap<(usize, u64), RootSlot>,
     /// Root UAVs bound as one-view tables in this list, likewise.
     root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
+    /// Constant buffers of tables given slots of their own in this list
+    /// ([`State::table_cbvs`]): (title heap, title address, bytes) → the
+    /// dynamic slot, and the list's count of title writes when its bytes
+    /// were asked for ([`HostList::title_writes`]): a later draw takes the
+    /// same slot only while the list has written no title memory since, so
+    /// it reads the bytes a copy at its own place would.
+    table_cbv_slots: std::collections::HashMap<(usize, u64, u32), (u32, u64), std::hash::BuildHasherDefault<crate::host::AddressHash>>,
+    /// What the last bind gave the constant buffers of tables (root
+    /// parameter, dword in the table, heap slot), for the reports of what a
+    /// draw ran ([`State::host_word`]).
+    #[cfg(feature = "diagnostics")]
+    apart_bound: Vec<(u8, u32, u32)>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
     /// This recording, for [`crate::descriptor::host::HostHeap::make_listed`]
@@ -511,6 +557,7 @@ impl State {
         self.recording = 0;
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
+        self.table_cbv_slots.clear();
         self.tables_gone = true;
     }
 }
@@ -1366,6 +1413,18 @@ impl State {
         if kind == victory_shader::emit::USER_DISPATCH_THREADS_X {
             return 0;
         }
+        // Read by nothing: says the table is made afresh as before.
+        if kind == victory_shader::emit::USER_TABLE_KEPT {
+            return 0;
+        }
+        // `bind` sets it (`State::table_cbvs`); for the reports, what it set.
+        if kind == victory_shader::emit::USER_TABLE_CBV {
+            #[cfg(feature = "diagnostics")]
+            if let Some(&(_, _, index)) = self.apart_bound.iter().find(|a| (a.0, a.1) == (slot, dword)) {
+                return index;
+            }
+            return 0;
+        }
         if kind == USER_ROOT_ADDRESS || kind == USER_ROOT_ADDRESS + 1 {
             return match self.roots_ref(compute).get(usize::from(slot)) {
                 Some(&Root::View(address)) if kind == USER_ROOT_ADDRESS => address as u32,
@@ -1577,6 +1636,8 @@ impl State {
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
+        #[cfg(feature = "diagnostics")]
+        self.apart_bound.clear();
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
         if crate::host::walls_trace() {
@@ -1677,6 +1738,13 @@ impl State {
                 once!("a draw whose descriptor table found no free slots is dropped");
                 return false;
             }
+            // The constant buffers of tables it reads through slots of
+            // their own (`VICTORY_TABLE_CBV_APART=1`).
+            let apart = self.table_cbvs(list, &t.tables, compute);
+            if apart.iter().any(|a| a.1 == u32::MAX) {
+                once!("a draw whose table's constant buffer found no free slot is dropped");
+                return false;
+            }
             if stage.shader.ambient.is_some() || stage.shader.probe.is_some() {
                 self.ambient_tables.clear();
                 self.ambient_tables.extend(made.iter().copied());
@@ -1715,8 +1783,12 @@ impl State {
                 };
                 for u in &t.host.user_data {
                     if let RootType::Other(kind) = u.root {
-                        values[u.index as usize] =
-                            self.host_word(compute, kind, u.slot, u.dword, memory.as_ref());
+                        values[u.index as usize] = match kind {
+                            victory_shader::emit::USER_TABLE_CBV => {
+                                apart.iter().find(|a| a.0 == u.index).map_or(0, |a| a.1)
+                            }
+                            _ => self.host_word(compute, kind, u.slot, u.dword, memory.as_ref()),
+                        };
                         continue;
                     }
                     let fresh = made
@@ -1732,12 +1804,34 @@ impl State {
                     self.user.clear();
                     self.user.extend_from_slice(values);
                 }
-                // SAFETY: an open list; `values` covers the parameter.
-                unsafe {
-                    if compute {
-                        l.SetComputeRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
-                    } else {
-                        l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+                if stage.user_view {
+                    // A root constant buffer for room (`fit_user_data`): the
+                    // values in upload memory the list holds, as they are
+                    // now (root constants are taken at this point too).
+                    let Some((_, gpu, to)) = list.scratch_held(u64::from(dwords) * 4) else {
+                        once!("a draw whose user data found no upload memory is dropped");
+                        return false;
+                    };
+                    // SAFETY: `to` is mapped upload memory of at least
+                    // `dwords` dwords the list holds until it is reset,
+                    // written by nothing else; `values` has `dwords` dwords.
+                    unsafe { std::ptr::copy_nonoverlapping(values.as_ptr(), to.cast::<u32>(), values.len()) };
+                    // SAFETY: an open list; the address is in a live buffer.
+                    unsafe {
+                        if compute {
+                            l.SetComputeRootConstantBufferView(param, gpu);
+                        } else {
+                            l.SetGraphicsRootConstantBufferView(param, gpu);
+                        }
+                    }
+                } else {
+                    // SAFETY: an open list; `values` covers the parameter.
+                    unsafe {
+                        if compute {
+                            l.SetComputeRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+                        } else {
+                            l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+                        }
                     }
                 }
             }
@@ -3437,6 +3531,95 @@ impl State {
         }
     }
 
+    /// The constant buffers of tables a shader reads through slots of their
+    /// own (`TablePlan::cbvs`, `victory_shader::emit::table_cbvs_apart`): by
+    /// user-data dword, the dynamic slot made for each (`u32::MAX`: none
+    /// could be had, the draw must not run). Its bytes are copied at
+    /// submission as those of a table made afresh are ([`constant_slot`]):
+    /// one slot instead of the whole table's, whose other views the shader
+    /// reads where the title has them ([`State::tables`]). Within a list the
+    /// same constant buffer (heap, address, bytes) keeps its slot while the
+    /// list writes no title memory.
+    fn table_cbvs(&mut self, list: &HostList, plan: &TablePlan, compute: bool) -> Few<(u32, u32), 4> {
+        let mut out = Few::default();
+        if plan.cbvs.is_empty() {
+            return out;
+        }
+        let writes = list.title_writes();
+        for &(slot, dword, user) in &plan.cbvs {
+            let index = self.table_cbv(list, compute, slot, dword, writes);
+            #[cfg(feature = "diagnostics")]
+            self.apart_bound.push((slot, dword, index));
+            out.push((user, index));
+        }
+        out
+    }
+
+    /// One of [`State::table_cbvs`]: the slot for the constant buffer at
+    /// dword `dword` of the table in root parameter `slot`; `writes` the
+    /// list's [`HostList::title_writes`]. A record that names no constant
+    /// buffer is made as a table made afresh makes it (any other view in
+    /// place, a null view for none); without a table or a view heap the
+    /// shader reads slot 0, as it read the title's offsets before.
+    fn table_cbv(&mut self, list: &HostList, compute: bool, slot: u8, dword: u32, writes: u64) -> u32 {
+        // The slot the shader read at the table's base plus its offset.
+        let handle = match self.roots_ref(compute).get(usize::from(slot)) {
+            Some(&Root::Table(table)) => Some(table + u64::from(dword / 8) * 32),
+            _ => {
+                once!(slot, "a shader reads a constant buffer of a table the title did not set: a null view");
+                None
+            }
+        };
+        let heap = handle
+            .and_then(|h| self.heap_of(h))
+            .filter(|h| !h.samplers())
+            .or_else(|| (self.heaps[0] != 0).then(|| crate::descriptor::heap(self.heaps[0] as This)));
+        let Some((heap, host)) = heap.and_then(|h| Some((h, h.host()?))) else {
+            once!(slot, "a shader reads a constant buffer of a table without a host view heap");
+            return 0;
+        };
+        let at = std::ptr::from_ref(heap) as usize;
+        let view = handle.and_then(crate::descriptor::view);
+        if let Some(View::Constant(address, size)) = view {
+            let key = (at, address, size);
+            if let Some(&(index, made_at)) = self.table_cbv_slots.get(&key)
+                && made_at == writes
+            {
+                #[cfg(feature = "diagnostics")]
+                APART[2].fetch_add(1, Ordering::Relaxed);
+                return index;
+            }
+            let Some(index) = host.dynamic(1) else {
+                return u32::MAX;
+            };
+            self.dynamic.push((at, index, 1));
+            constant_slot(list, heap, host, address, size, index);
+            self.table_cbv_slots.insert(key, (index, writes));
+            #[cfg(feature = "diagnostics")]
+            APART[1].fetch_add(1, Ordering::Relaxed);
+            return index;
+        }
+        let Some(index) = host.dynamic(1) else {
+            return u32::MAX;
+        };
+        self.dynamic.push((at, index, 1));
+        match view {
+            Some(view) => {
+                host.make_at(index, &view);
+                readable(list, ResourceType::Cbv, &view);
+            }
+            None => {
+                host.make_null(index);
+                if handle.is_some() {
+                    once!(slot, "a table entry without a view");
+                }
+            }
+        }
+        #[cfg(feature = "diagnostics")]
+        APART[1].fetch_add(1, Ordering::Relaxed);
+        index
+    }
+
     /// The descriptors a shader reads through tables. Tables holding a
     /// constant buffer are made afresh for the draw in dynamic slots, with
     /// the constant data copied to upload memory when the list is
@@ -3448,6 +3631,11 @@ impl State {
     /// once: its constant data is copied at submission either way, and the
     /// big tables the world binds would otherwise take hundreds of slots per
     /// draw, wrapping the dynamic slots onto lists not yet submitted.
+    ///
+    /// With `VICTORY_TABLE_CBV_APART=1` a table whose constant buffers the
+    /// shader reads through slots of their own ([`State::table_cbvs`]) is
+    /// not made afresh for them: its other entries are mirrored in the
+    /// title's slots, as a table without a constant buffer's are.
     pub(crate) fn tables(
         &mut self,
         list: &HostList,
@@ -3458,14 +3646,38 @@ impl State {
         let selected_slot = |mask: &[u64; 4], slot: u8| mask[usize::from(slot / 64)] & (1u64 << (slot % 64)) != 0;
         for group in &plan.groups {
             let slot = group.slot;
-            let needs_snapshot = group.has_cbv
-                || match self.roots_ref(compute).get(usize::from(slot)) {
-                    Some(&Root::Table(table)) => self.heap_of(table).is_some_and(|heap| {
-                        heap.host()
-                            .is_some_and(|host| group.needs_snapshot(heap, host.count(), table))
-                    }),
-                    _ => false,
-                };
+            let past = || match self.roots_ref(compute).get(usize::from(slot)) {
+                Some(&Root::Table(table)) => self.heap_of(table).is_some_and(|heap| {
+                    heap.host()
+                        .is_some_and(|host| group.needs_snapshot(heap, host.count(), table))
+                }),
+                _ => false,
+            };
+            // A table whose constant buffers the shader reads through slots
+            // of their own (`table_cbvs`) is read where the title has it, as
+            // one without: unless it has unordered views or views picked by
+            // a root constant (made afresh as before), or reaches past the
+            // host's heap.
+            let in_place = group.has_cbv && group.apart && !group.has_uav && group.indexed.is_empty();
+            let needs_snapshot = if in_place {
+                let past = past();
+                #[cfg(feature = "diagnostics")]
+                APART[if past { 6 } else { 0 }].fetch_add(1, Ordering::Relaxed);
+                past
+            } else {
+                #[cfg(feature = "diagnostics")]
+                if group.has_cbv && victory_shader::emit::table_cbvs_apart() {
+                    let why = if !group.apart {
+                        3
+                    } else if group.has_uav {
+                        4
+                    } else {
+                        5
+                    };
+                    APART[why].fetch_add(1, Ordering::Relaxed);
+                }
+                group.has_cbv || past()
+            };
             if needs_snapshot {
                 fresh[usize::from(slot / 64)] |= 1u64 << (slot % 64);
             }
@@ -3473,7 +3685,12 @@ impl State {
         for &(g, e) in &plan.direct {
             let group = &plan.groups[g];
             if !selected_slot(&fresh, group.slot) {
-                self.table_entry(list, &group.entries[e], compute);
+                let u = &group.entries[e];
+                // (Its own slot, `table_cbvs`: the title's holds bytes on 16.)
+                if group.apart && u.kind == ResourceType::Cbv {
+                    continue;
+                }
+                self.table_entry(list, u, compute);
             }
         }
         let mut made = Few::default();
@@ -3653,12 +3870,13 @@ impl State {
                         if since.elapsed().as_secs() >= 5 {
                             let f = frame.saturating_sub(first_frame).max(1) as f64;
                             tracing::info!(
-                                "tables made afresh per frame: {:.0} ({:.0} slots); {:.0} found made in their list (VICTORY_TABLE_BY_CONTENT {}; VICTORY_TABLE_SEEN=1 also counts those another list made); {}",
+                                "tables made afresh per frame: {:.0} ({:.0} slots); {:.0} found made in their list (VICTORY_TABLE_BY_CONTENT {}; VICTORY_TABLE_SEEN=1 also counts those another list made); {}; {}",
                                 MADE.swap(0, Ordering::Relaxed) as f64 / f,
                                 SLOTS.swap(0, Ordering::Relaxed) as f64 / f,
                                 TABLE_HITS.swap(0, Ordering::Relaxed) as f64 / f,
                                 if table_by_content() { "on" } else { "off" },
-                                template_text(f)
+                                template_text(f),
+                                apart_text(f)
                             );
                             kept_line(f);
                             *g = Some((std::time::Instant::now(), frame));
@@ -3684,13 +3902,14 @@ impl State {
                     let [made, again, slots, frames] = g.2;
                     let f = frames.max(1) as f64;
                     tracing::info!(
-                        "tables made afresh per frame: {:.0} ({:.0} slots), {:.0} of them the same as one another list made in the frame; {:.0} found made in their list (VICTORY_TABLE_BY_CONTENT {}); {}",
+                        "tables made afresh per frame: {:.0} ({:.0} slots), {:.0} of them the same as one another list made in the frame; {:.0} found made in their list (VICTORY_TABLE_BY_CONTENT {}); {}; {}",
                         made as f64 / f,
                         slots as f64 / f,
                         again as f64 / f,
                         TABLE_HITS.swap(0, Ordering::Relaxed) as f64 / f,
                         if table_by_content() { "on" } else { "off" },
-                        template_text(f)
+                        template_text(f),
+                        apart_text(f)
                     );
                     kept_line(f);
                     g.2 = [0; 4];
@@ -4643,29 +4862,7 @@ fn slot_afresh(
     }
     let used = group.entry(k);
     match crate::descriptor::view(table + u64::from(k) * 32) {
-        Some(View::Constant(address, size)) => {
-            // Renderer port 5: title memory in place is the card's to read
-            // where it is; nothing is copied.
-            if crate::port_cbv::in_place_on() {
-                match crate::shadow::find(address, u64::from(size)).filter(|s| s.in_place()) {
-                    Some(shadow) => {
-                        if host.constant_raw_at(index, &shadow.buffer, shadow.gpu(address), size) {
-                            crate::port_cbv::in_place(size);
-                            return None;
-                        }
-                        crate::port_cbv::copied(false);
-                    }
-                    None => crate::port_cbv::copied(true),
-                }
-            }
-            let Some((buffer, gpu, to)) = list.scratch_held(u64::from(size)) else {
-                host.make_null(index);
-                return None;
-            };
-            let slot = (std::ptr::from_ref(heap) as usize, index);
-            list.defer_constants(to, address as *const u8, size as usize, slot);
-            host.constant_at(index, &buffer, gpu, size);
-        }
+        Some(View::Constant(address, size)) => constant_slot(list, heap, host, address, size, index),
         Some(view) => {
             host.make_at(index, &view);
             let kind = used
@@ -4695,6 +4892,70 @@ fn slot_afresh(
         }
     }
     None
+}
+
+/// For the "tables made afresh" line (`VICTORY_TABLE_CBV_APART=1`, see
+/// [`State::table_cbvs`]): tables with a constant buffer read where the title
+/// has them; slots made for constant buffers apart, and found made in the
+/// list; and the tables with one made afresh all the same: the shader may
+/// reach one through the table's base (`USER_TABLE_KEPT`, or a spilled
+/// program), unordered views, views picked by a root constant, past the host
+/// heap.
+#[cfg(feature = "diagnostics")]
+static APART: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+
+/// Beside the "tables made afresh" line, over `f` frames: [`APART`], and the
+/// host pipelines whose user data went into a root constant buffer to fit
+/// (since the start).
+#[cfg(feature = "diagnostics")]
+fn apart_text(f: f64) -> String {
+    if !victory_shader::emit::table_cbvs_apart() {
+        return "constant buffers apart: off".into();
+    }
+    let [read_in_place, made, found, kept, uav, indexed, past] =
+        std::array::from_fn(|i| APART[i].swap(0, Ordering::Relaxed) as f64 / f);
+    format!(
+        "constant buffers apart: {read_in_place:.0} tables read in place, {made:.0} slots made for their constant buffers and {found:.0} found made in the list; made afresh all the same: {kept:.0} read through the base, {uav:.0} with unordered views, {indexed:.0} with views picked by a constant, {past:.0} past the host heap; {} pipelines' user data in a root constant buffer for room",
+        crate::pipeline::host::USER_DATA_BY_VIEW.load(Ordering::Relaxed)
+    )
+}
+
+/// Makes dynamic slot `index` of `host` (`heap`'s) a constant buffer view of
+/// the `size` bytes of title memory at `address` as they are when the list is
+/// submitted: copied then into upload memory of the list's (the host wants
+/// 256-byte alignment, the console 16), or with renderer port 5 shown in
+/// place. A null view if no upload memory can be had. For a table made afresh
+/// ([`slot_afresh`]) and for a constant buffer a shader reads through a slot
+/// of its own ([`State::table_cbvs`]) alike.
+fn constant_slot(
+    list: &HostList,
+    heap: &crate::descriptor::Heap,
+    host: &crate::descriptor::host::HostHeap,
+    address: u64,
+    size: u32,
+    index: u32,
+) {
+    // Renderer port 5: title memory in place is the card's to read where it
+    // is; nothing is copied.
+    if crate::port_cbv::in_place_on() {
+        match crate::shadow::find(address, u64::from(size)).filter(|s| s.in_place()) {
+            Some(shadow) => {
+                if host.constant_raw_at(index, &shadow.buffer, shadow.gpu(address), size) {
+                    crate::port_cbv::in_place(size);
+                    return;
+                }
+                crate::port_cbv::copied(false);
+            }
+            None => crate::port_cbv::copied(true),
+        }
+    }
+    let Some((buffer, gpu, to)) = list.scratch_held(u64::from(size)) else {
+        host.make_null(index);
+        return;
+    };
+    let slot = (std::ptr::from_ref(heap) as usize, index);
+    list.defer_constants(to, address as *const u8, size as usize, slot);
+    host.constant_at(index, &buffer, gpu, size);
 }
 
 /// Beside the "tables made afresh" line, over `f` frames: what the views a

@@ -3558,6 +3558,10 @@ struct Deferred {
     /// With [`list_summary`]: whether the list has a [`Step::Copy`] or a
     /// [`Step::Run`] (it writes title memory on the CPU), for [`joinable`].
     writes_title: bool,
+    /// A number of its own (from [`next_epoch`]) each time the steps
+    /// recorded last write title memory, 0 before it is first asked for:
+    /// what [`HostList::title_writes`] tells.
+    title_writes: u64,
 }
 
 impl Deferred {
@@ -3576,6 +3580,7 @@ impl Deferred {
         self.refreshed.clear();
         self.gpu_written.clear();
         self.filled.clear();
+        self.title_writes = next_epoch();
     }
 }
 
@@ -8840,6 +8845,21 @@ impl HostList {
 
     fn deferred(&self) -> std::sync::MutexGuard<'_, Deferred> {
         self.deferred.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Changes whenever the steps recorded last write title memory (a copy
+    /// into it, a step run on the CPU): bytes of title memory copied at two
+    /// places of the list with the same value in between are the same
+    /// bytes (`draw::State::table_cbvs`).
+    /// (A number of its own from the first ask on, before any write too:
+    /// the state of a title list cut at waits goes on into a new host list,
+    /// whose copies are another list's.)
+    pub(crate) fn title_writes(&self) -> u64 {
+        let mut deferred = self.deferred();
+        if deferred.title_writes == 0 {
+            deferred.title_writes = next_epoch();
+        }
+        deferred.title_writes
     }
 
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.
