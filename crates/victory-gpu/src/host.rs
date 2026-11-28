@@ -3879,6 +3879,22 @@ fn late_most() -> usize {
     })
 }
 
+/// An experiment (`VICTORY_TELL_AT_SEND=1`; off): a submission's
+/// bottom-of-pipe writes are written and the fence signals behind it set
+/// when it is sent to the card, not when the card has run it and what its
+/// shaders wrote has landed. WRONG for anything the title reads back after
+/// such a value: it is only to measure what the title's wait for these
+/// values costs a frame (profile p5: one title thread stands 18 ms of a
+/// 44 ms frame in title+0x4fb0ad0, a monitorx/mwaitx wait for a counter).
+fn tell_at_send() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_TELL_AT_SEND") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TELL_AT_SEND").is_some_and(|v| v == "1"))
+}
+
 /// Whether a submission with bottom-of-pipe writes may fly
 /// (`VICTORY_LATE_WAIT_WRITES=0`: it is settled as soon as it is sent, so
 /// the title is told at once, as before; for telling a title that polls
@@ -4583,7 +4599,7 @@ fn split<T>(lists: Vec<T>, order: Vec<usize>, cut: usize) -> Result<[Run<T>; 2],
 /// air, if there are any, and is set when they are settled. Whether it
 /// did; if not the caller sets the fence now.
 pub(crate) fn late_signal(fence: usize, value: u64) -> bool {
-    if !late() {
+    if !late() || tell_at_send() {
         return false;
     }
     let mut line = line();
@@ -6931,7 +6947,13 @@ impl Host {
                 own: sent.own,
                 texture_back_ranges: sent.texture_back_ranges,
             }));
-            items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
+            if tell_at_send() {
+                for (at, what, bytes) in sent.writes {
+                    what.write(at as *mut u8, bytes);
+                }
+            } else {
+                items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
+            }
             *flying >= late_most()
         };
         LATE_STATS[0].fetch_add(1, Ordering::Relaxed);
@@ -6986,7 +7008,13 @@ impl Host {
                 own: sent.own,
                 texture_back_ranges: sent.texture_back_ranges,
             }));
-            items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
+            if tell_at_send() {
+                for (at, what, bytes) in sent.writes {
+                    what.write(at as *mut u8, bytes);
+                }
+            } else {
+                items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
+            }
         }
         LATE_STATS[0].fetch_add(1, Ordering::Relaxed);
         LINE_MOVED.notify_one();
