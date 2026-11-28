@@ -784,6 +784,13 @@ fn nv_defaults() {
         ("VICTORY_PRELUDE_BESIDE", "1"),
         ("VICTORY_EARLY_RUNS", "1"),
         ("VICTORY_ASK_RUNS_APART", "1"),
+        // The constant buffers of tables read through slots of their own, so
+        // that their tables are read where the title has them: 24.1 fps and
+        // 473 ms of the process a frame with it against 22.9 and 485 without
+        // (runs s2 and s3, the boat), and the sky's clouds are drawn. The
+        // first runs after this is switched make their pipelines again
+        // (black or magenta frames until the library has them).
+        ("VICTORY_TABLE_CBV_APART", "1"),
         // Textures in guarded memory are hashed again every 64th frame, not
         // every 8th, for changes their guard cannot see: 37 MB a frame
         // hashed at the boat, none such found; 4 MB with this, 21.0 to 21.9

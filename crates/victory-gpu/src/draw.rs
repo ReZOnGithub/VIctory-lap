@@ -3786,10 +3786,16 @@ impl State {
                 direct_key = Some(h.0);
             }
         }
-        let direct_known = direct_key.and_then(|key| self.direct_ready.get(&key).copied()).filter(|known| known.0 == list.epoch());
+        let direct_seen = direct_key.and_then(|key| self.direct_ready.get(&key).copied());
+        let direct_known = direct_seen.filter(|known| known.0 == list.epoch());
         #[cfg(feature = "diagnostics")]
         if direct_key.is_some() {
             DIRECT_ONCE[usize::from(direct_known.is_some())].fetch_add(1, Ordering::Relaxed);
+            // (Looked through although the same tables were seen: only the
+            // list's epoch had moved.)
+            if direct_known.is_none() && direct_seen.is_some() {
+                DIRECT_ONCE[2].fetch_add(1, Ordering::Relaxed);
+            }
         }
         if let Some((_, depth)) = direct_known {
             if depth {
@@ -5043,8 +5049,8 @@ static APART: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 /// (since the start).
 #[cfg(feature = "diagnostics")]
 fn apart_text(f: f64) -> String {
-    let [looked, known] = std::array::from_fn(|i| DIRECT_ONCE[i].swap(0, Ordering::Relaxed) as f64 / f);
-    let direct = format!("draws' tables read in place: {looked:.0} looked through, {known:.0} found up to date (VICTORY_DIRECT_ONCE)");
+    let [looked, known, moved] = std::array::from_fn(|i| DIRECT_ONCE[i].swap(0, Ordering::Relaxed) as f64 / f);
+    let direct = format!("draws' tables read in place: {looked:.0} looked through ({moved:.0} of them seen before, the list's epoch moved), {known:.0} found up to date (VICTORY_DIRECT_ONCE)");
     if !victory_shader::emit::table_cbvs_apart() {
         return format!("{direct}; constant buffers apart: off");
     }
@@ -5159,7 +5165,7 @@ fn direct_once() -> bool {
 /// Diagnostics: draws whose tables read in place were looked through, and
 /// those found brought up to date ([`direct_once`]), since the last line.
 #[cfg(feature = "diagnostics")]
-static DIRECT_ONCE: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+static DIRECT_ONCE: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
 fn ready_once() -> bool {
     crate::toggled!("VICTORY_READY_ONCE")
