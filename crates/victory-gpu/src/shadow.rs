@@ -1668,6 +1668,9 @@ struct Workers {
 fn spin(there: impl Fn() -> bool) {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let most = *MOST.get_or_init(|| std::env::var("VICTORY_WIDE_SPIN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0));
+    // (Changing while the title runs, `crate::ab`: 200 us or none.)
+    #[cfg(feature = "diagnostics")]
+    let most = crate::ab::pick("VICTORY_WIDE_SPIN").map_or(most, |on| if on { 200 } else { 0 });
     if most == 0 {
         return;
     }
@@ -1884,7 +1887,15 @@ fn wide_each_ends(n: usize, work: impl Fn(usize) + Send + Sync + 'static) -> [u6
     // (front 0, back n)
     let ends = Arc::new(AtomicU64::new((n as u64) << 32));
     let work = Arc::new(work);
-    let threads = (wide_threads() + 1).min(n);
+    // (`VICTORY_WIDE_FEW`, only as a switch that changes while the title
+    // runs, `crate::ab`: four of the kept threads at most, to see what the
+    // waking of eight costs on a machine whose processors are all taken.)
+    #[cfg(feature = "diagnostics")]
+    let few = crate::ab::pick("VICTORY_WIDE_FEW") == Some(true);
+    #[cfg(not(feature = "diagnostics"))]
+    let few = false;
+    let kept = if few { wide_threads().min(4) } else { wide_threads() };
+    let threads = (kept + 1).min(n);
     // The kept threads' part: from the front.
     let jobs: Vec<Job> = (1..threads)
         .map(|_| {

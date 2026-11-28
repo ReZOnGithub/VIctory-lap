@@ -177,6 +177,11 @@ pub(crate) struct HostHeap {
     /// none): written with the slot's lock held, wherever `kept` is, read
     /// without by [`HostHeap::keep_ref`] (`VICTORY_KEEP_FAST`).
     kept_raw: Box<[std::sync::atomic::AtomicUsize]>,
+    /// Of the dynamic slots, the table template each was made from with
+    /// [`HostHeap::make_from_template`] and shows a view of still
+    /// (`VICTORY_TABLE_TEMPLATES`): there the template's resources are held
+    /// by the slot, in place of `kept` ([`Runs`]).
+    runs: Runs,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Taken)>,
@@ -1473,6 +1478,10 @@ pub(crate) fn slot_story(slot: u32) -> String {
         }
         let kept = host.kept_in(index);
         match kept {
+            // (A slot made from a table template holds the template.)
+            None if host.runs.held(index.wrapping_sub(host.count) as usize) => {
+                text.push_str(", holds a table template's views (VICTORY_TABLE_TEMPLATES)")
+            }
             None => text.push_str(", holds nothing"),
             Some(resource) => {
                 // SAFETY: a resource the slot holds.
@@ -1842,6 +1851,7 @@ impl HostHeap {
             kept: (0..count + extra).map(|_| Mutex::new(None)).collect(),
             kept_some: (0..count + extra).map(|_| std::sync::atomic::AtomicBool::new(false)).collect(),
             kept_raw: (0..count + extra).map(|_| std::sync::atomic::AtomicUsize::new(0)).collect(),
+            runs: Runs::new(if sampler { 0 } else { extra as usize }),
             next: Mutex::new((0, Taken::new(extra as usize))),
             free: std::sync::atomic::AtomicU32::new(extra),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
@@ -2929,7 +2939,10 @@ impl HostHeap {
     ///
     /// With `VICTORY_VIEWS_KEPT` a view made in an earlier recording is used
     /// again if it is still good ([`ListViews`], [`Basis`]).
-    pub(crate) fn make_listed(&self, recording: u64, words: [u32; 3], index: u32) -> Option<Listed> {
+    ///
+    /// Also where the descriptor is in [`ListViews`] and whether it has a
+    /// raw twin there (for a table template, [`TableTemplate`]).
+    pub(crate) fn make_listed(&self, recording: u64, words: [u32; 3], index: u32) -> Option<(Listed, u32, bool)> {
         if self.sampler {
             return None;
         }
@@ -2943,6 +2956,13 @@ impl HostHeap {
             let views = views.as_mut()?;
             if views.recording != recording {
                 views.recording = recording;
+                // (The table templates are of the recording before.)
+                views.changed(TemplateCount::DroppedRecording);
+                for (count, local) in TEMPLATE_COUNTS.iter().zip(&mut views.template_counts) {
+                    if *local > 0 {
+                        count.fetch_add(std::mem::take(local), std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
                 if kept_on {
                     views.new_recording();
                 } else {
@@ -2989,8 +3009,142 @@ impl HostHeap {
                 self.clear_twin(index);
             }
             self.keep_ref(index, made.kept.as_ref());
-            Some(made.listed)
+            Some((made.listed, made.at, made.twin))
         })
+    }
+
+    /// Makes dynamic slots `first..first + n` from table template `t`
+    /// (`VICTORY_TABLE_TEMPLATES`), as far as it has them: each slot that is
+    /// a view of this thread's [`ListViews`] gets its descriptor there, all
+    /// in one copy, and its raw twin, all in another, as
+    /// [`HostHeap::make_listed`] makes one; the other slots (constant
+    /// buffers, views made in place) are the caller's to make. Returns how
+    /// many slots were copied.
+    ///
+    /// The slots copied keep nothing in `kept` (what they kept is let go, as
+    /// a slot made anew lets go of what it showed); each holds a reference
+    /// to the template instead, whose resources are the views' (see
+    /// [`Runs`]): one count on one object a slot, no lock and no reference
+    /// of a resource that eight threads share.
+    ///
+    /// The caller has `t` from [`template_find`] on this thread and has made
+    /// no view in between: the slots of [`ListViews`] it names are what they
+    /// were when it was made.
+    pub(crate) fn make_from_template(&self, first: u32, t: &std::sync::Arc<TableTemplate>) -> u32 {
+        if self.sampler {
+            return 0;
+        }
+        let Some(host) = host() else { return 0 };
+        let source = |at: u32| D3D12_CPU_DESCRIPTOR_HANDLE { ptr: t.start + at as usize * t.step };
+        TEMPLATE_COPY.with(|scratch| {
+            let mut scratch = scratch.borrow_mut();
+            let CopyScratch { to, sizes, from, twin_to, twin_sizes, twin_from } = &mut *scratch;
+            for v in [&mut *to, &mut *from, &mut *twin_to, &mut *twin_from] {
+                v.clear();
+            }
+            sizes.clear();
+            twin_sizes.clear();
+            // Ranges of consecutive slots in the dynamic run, one source
+            // descriptor each.
+            let mut last: Option<u32> = None;
+            let mut last_twin: Option<u32> = None;
+            let mut copied = 0u32;
+            for (k, slot) in (0u32..).zip(t.slots.iter()) {
+                let TemplateSlot::Listed { at, twin, .. } = *slot else {
+                    continue;
+                };
+                let index = first + k;
+                if last.is_some_and(|l| l + 1 == k)
+                    && let Some(size) = sizes.last_mut()
+                {
+                    *size += 1;
+                } else {
+                    to.push(self.cpu(index));
+                    sizes.push(1);
+                }
+                from.push(source(at));
+                last = Some(k);
+                copied += 1;
+                if twin && self.twins.get(index as usize).is_some() {
+                    if last_twin.is_some_and(|l| l + 1 == k)
+                        && let Some(size) = twin_sizes.last_mut()
+                    {
+                        *size += 1;
+                    } else {
+                        twin_to.push(self.cpu(self.raw + index));
+                        twin_sizes.push(1);
+                    }
+                    twin_from.push(source(at + 1));
+                    last_twin = Some(k);
+                }
+            }
+            if copied == 0 {
+                return 0;
+            }
+            // SAFETY: the destinations are slots of our heap (dynamic slots
+            // `first..first + n`, which the caller's list took, and their raw
+            // twins), the sources slots of this thread's heap the card does
+            // not see, which the template names while it is good; the
+            // ranges add up to as many descriptors on both sides.
+            unsafe {
+                host.device.CopyDescriptors(
+                    to.len() as u32,
+                    to.as_ptr(),
+                    Some(sizes.as_ptr()),
+                    from.len() as u32,
+                    from.as_ptr(),
+                    None,
+                    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                );
+                if !twin_to.is_empty() {
+                    host.device.CopyDescriptors(
+                        twin_to.len() as u32,
+                        twin_to.as_ptr(),
+                        Some(twin_sizes.as_ptr()),
+                        twin_from.len() as u32,
+                        twin_from.as_ptr(),
+                        None,
+                        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    );
+                }
+            }
+            // What each slot shows now, as `make_listed` notes it.
+            for (k, slot) in (0u32..).zip(t.slots.iter()) {
+                let TemplateSlot::Listed { twin, .. } = *slot else {
+                    continue;
+                };
+                let index = first + k;
+                #[cfg(feature = "diagnostics")]
+                if let Some(written) = self.written.get(index as usize) {
+                    written.store(crate::host::coarse_ms() as u32, std::sync::atomic::Ordering::Relaxed);
+                }
+                match self.twins.get(index as usize) {
+                    Some(made) if twin => {
+                        #[cfg(feature = "diagnostics")]
+                        if let Some(written) = self.written.get((self.raw + index) as usize) {
+                            written.store(crate::host::coarse_ms() as u32, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        made.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    _ => self.clear_twin(index),
+                }
+                // What `kept` held is let go (nothing to do once a slot
+                // holds nothing there: no lock), and the slot holds the
+                // template.
+                self.keep_locked(index, None);
+                if let Some(at) = index.checked_sub(self.count) {
+                    self.runs.set(at as usize, Some(t));
+                }
+            }
+            copied
+        })
+    }
+
+    /// Dynamic slot `index` shows no template's view any more ([`Runs`]).
+    fn unrun(&self, index: u32) {
+        if let Some(at) = index.checked_sub(self.count) {
+            self.runs.set(at as usize, None);
+        }
     }
 
     /// As [`HostHeap::copy_to`], from the slot `from`, which the card does not
@@ -3046,6 +3200,8 @@ impl HostHeap {
 
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
+        // (Made anew: no template's view any more.)
+        self.unrun(index);
         if self.kept_already(index, resource.as_ref()) {
             return;
         }
@@ -3091,6 +3247,7 @@ impl HostHeap {
     /// [`HostHeap::keep`] of a resource the caller holds: cloned (a COM
     /// reference taken) only if the slot does not hold it already.
     fn keep_ref(&self, index: u32, resource: Option<&ID3D12Resource>) {
+        self.unrun(index);
         if self.kept_already(index, resource) {
             return;
         }
@@ -6508,12 +6665,17 @@ pub(crate) fn views_kept_mode() -> &'static str {
 /// recording, at its first use there; within a recording, as before, it is
 /// not looked at again. Entries no recording used for 4 frames are let go
 /// (they hold their resource), and the map is cleared when its slots are all
-/// taken.
+/// taken ([`list_view_slots`] of them).
+///
+/// The table templates of the thread ([`TableTemplate`]) live here too, as
+/// they name slots of this map; see [`ListViews::changed`] for when they go.
 struct ListViews {
     recording: u64,
     heap: ID3D12DescriptorHeap,
     step: usize,
     start: usize,
+    /// Slots of `heap` ([`list_view_slots`]).
+    slots: u32,
     made: std::collections::HashMap<[u32; 3], ListView, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
     /// With views kept: pairs of slots given back, the next pair never
     /// taken, and the frame entries were last let go in.
@@ -6522,12 +6684,37 @@ struct ListViews {
     swept: u64,
     /// [`VIEWS_KEPT_COUNTS`] of this thread not yet added there.
     counts: [u64; 7],
+    /// One more each time an entry goes, the map is cleared or it is of
+    /// another recording ([`ListViews::changed`]).
+    generation: u64,
+    /// The table templates made in this generation, by what makes a table
+    /// one of theirs ([`TemplateKey`]), with the list epoch their views
+    /// were brought up to date at.
+    templates: std::collections::HashMap<TemplateKey, TemplateEntry, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
+    /// [`TEMPLATE_COUNTS`] of this thread not yet added there.
+    template_counts: [u64; TEMPLATE_COUNTS_LEN],
 }
 
 impl ListViews {
-    const SLOTS: u32 = 8192;
     /// With views kept, the last pair is where `check` makes a view anew.
-    const SCRATCH: u32 = Self::SLOTS - 2;
+    fn scratch(&self) -> u32 {
+        self.slots - 2
+    }
+
+    /// A slot pair that held an entry may hold another one from now on, or
+    /// the entries are of another recording: the table templates, which
+    /// name slots of entries and are of one recording, go (`why`, for
+    /// [`TEMPLATE_COUNTS`]). A template thus never names a slot an entry
+    /// that went had: within a generation no entry goes and no slot is
+    /// given to another view.
+    fn changed(&mut self, why: TemplateCount) {
+        self.generation += 1;
+        if self.templates.is_empty() {
+            return;
+        }
+        self.template_counts[why as usize] += self.templates.len() as u64;
+        retire_templates(self.templates.drain().map(|(_, e)| e));
+    }
 
     /// A pair of slots for a new entry. Views not kept: as before, the next
     /// pair after the entries (none when full). Kept: one given back, a new
@@ -6535,16 +6722,17 @@ impl ListViews {
     fn take(&mut self, kept: bool) -> Option<u32> {
         if !kept {
             let at = 2 * self.made.len() as u32;
-            return (at < Self::SLOTS).then_some(at);
+            return (at < self.slots).then_some(at);
         }
         if let Some(at) = self.free.pop() {
             return Some(at);
         }
-        if self.next >= Self::SCRATCH {
+        if self.next >= self.scratch() {
             self.made.clear();
             self.free.clear();
             self.next = 0;
             self.counts[5] += 1;
+            self.changed(TemplateCount::DroppedCleared);
         }
         let at = self.next;
         self.next += 2;
@@ -6584,13 +6772,14 @@ impl ListViews {
 
     fn new() -> Option<ListViews> {
         let host = host()?;
+        let slots = list_view_slots();
         // SAFETY: plain object creation.
         unsafe {
             let heap: ID3D12DescriptorHeap = host
                 .device
                 .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                     Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                    NumDescriptors: Self::SLOTS,
+                    NumDescriptors: slots,
                     ..Default::default()
                 })
                 .ok()?;
@@ -6601,17 +6790,21 @@ impl ListViews {
                 heap,
                 step,
                 start,
+                slots,
                 made: Default::default(),
                 free: Vec::new(),
                 next: 0,
                 swept: 0,
                 counts: [0; 7],
+                generation: 0,
+                templates: Default::default(),
+                template_counts: [0; TEMPLATE_COUNTS_LEN],
             })
         }
     }
 
     fn slot(&self, i: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
-        debug_assert!(i < Self::SLOTS && !windows::core::Interface::as_raw(&self.heap).is_null());
+        debug_assert!(i < self.slots && !windows::core::Interface::as_raw(&self.heap).is_null());
         D3D12_CPU_DESCRIPTOR_HANDLE { ptr: self.start + i as usize * self.step }
     }
 }
@@ -6635,6 +6828,7 @@ fn listed_again(views: &mut ListViews, recording: u64, words: [u32; 3], mode: Vi
         views.made.remove(&words);
         views.free.push(at);
         views.counts[count] += 1;
+        views.changed(TemplateCount::DroppedView);
     };
     // The record names another view, or none (its resource was released).
     if super::view_at(words[1], words[2]).as_ref() != Some(&made.view) {
@@ -6647,7 +6841,7 @@ fn listed_again(views: &mut ListViews, recording: u64, words: [u32; 3], mode: Vi
     if mode == ViewsKept::Check {
         // Made anew beside it: the same descriptor (and twin), the same
         // resource kept?
-        let scratch = ListViews::SCRATCH;
+        let scratch = views.scratch();
         let fresh = make_twinned(&made.view, views.slot(scratch), Some(views.slot(scratch + 1)));
         let raw = |k: &Kept| k.as_ref().map(windows::core::Interface::as_raw);
         let equal = |a: Option<[u8; 64]>, b: Option<[u8; 64]>| a.is_some() && a == b;
@@ -6697,4 +6891,446 @@ pub(crate) fn note_listed(recording: u64, words: [u32; 3], listed: Listed) {
 /// for every table).
 pub(crate) fn list_views() -> bool {
     crate::toggled!("VICTORY_LIST_VIEWS")
+}
+
+/// Slots of the heap each thread makes the views of its lists' tables in
+/// ([`ListViews`]; `VICTORY_LIST_VIEW_SLOTS`, a pair a view; 8,192 as
+/// before, 32,768 by default).
+///
+/// With 8,192 the maps of the threads that translate the title's lists were
+/// full and cleared 2.4 times a frame at the boat (run u1: 281 clears in a
+/// line of about 115 frames), and every view in them was made anew after
+/// each: 11,226 views a frame made first, against some 2,600 in the same run
+/// while no map was cleared (views new to the frame or to the thread). An
+/// entry lives while some recording used it in the last 4 frames, and the
+/// title names its per-frame buffers by their address, so a new view a
+/// buffer a frame. 32,768 slots are 1 MB of descriptors a thread (32 bytes
+/// each here).
+fn list_view_slots() -> u32 {
+    static SLOTS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *SLOTS.get_or_init(|| {
+        std::env::var("VICTORY_LIST_VIEW_SLOTS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .map_or(32_768, |n| n.clamp(64, 1 << 20) & !1)
+    })
+}
+
+/// Whether a table made afresh may be made from a table template
+/// ([`TableTemplate`]; `VICTORY_TABLE_TEMPLATES`: `0` never, as before;
+/// `check` as on, with every template found checked against the views it
+/// names, [`template_find`]; else on). Also one of the switches that change
+/// while the title runs (`crate::ab`); templates go when it is turned off
+/// ([`templates_off`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TemplateMode {
+    Off,
+    On,
+    Check,
+}
+
+pub(crate) fn table_templates() -> TemplateMode {
+    static MODE: std::sync::OnceLock<TemplateMode> = std::sync::OnceLock::new();
+    let mode = *MODE.get_or_init(|| match std::env::var_os("VICTORY_TABLE_TEMPLATES") {
+        Some(v) if v == "0" => TemplateMode::Off,
+        Some(v) if v == "check" => TemplateMode::Check,
+        _ => TemplateMode::On,
+    });
+    // (Named in `VICTORY_AB`: on, or `check` if the variable says so, in the
+    // phases that have its bit; off in the others.)
+    #[cfg(feature = "diagnostics")]
+    if let Some(bit) = template_bit() {
+        return match (crate::ab::on(bit), mode) {
+            (false, _) => TemplateMode::Off,
+            (true, TemplateMode::Check) => TemplateMode::Check,
+            (true, _) => TemplateMode::On,
+        };
+    }
+    mode
+}
+
+/// The bit of `VICTORY_TABLE_TEMPLATES` among the switches that change while
+/// the title runs, if it is one (`crate::ab`, diagnostics builds).
+#[cfg(feature = "diagnostics")]
+fn template_bit() -> Option<u32> {
+    static BIT: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *BIT.get_or_init(|| crate::ab::bit("VICTORY_TABLE_TEMPLATES"))
+}
+
+/// Whether the switch is one that changes while the title runs: then a
+/// thread's templates are dropped when it finds it off ([`templates_off`]).
+pub(crate) fn table_templates_change() -> bool {
+    #[cfg(feature = "diagnostics")]
+    return template_bit().is_some();
+    #[cfg(not(feature = "diagnostics"))]
+    false
+}
+
+/// What makes a table one of a template's: the title heap (as the address
+/// of its [`super::Heap`]), the slot count, a hash of the records of its
+/// slots but the constant buffers' (and of which slots those are), who
+/// reads it as far as `crate::draw::readable` goes (`reader` in
+/// `crate::draw::State::tables`), and the recording of the list.
+pub(crate) type TemplateKey = (usize, u32, u64, (usize, usize, bool, usize), u64);
+
+/// What a slot of a table template is made from.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum TemplateSlot {
+    /// A view of [`ListViews`]: its descriptor's slot there, whether it has
+    /// a raw twin (in the next), whether it is a texture view, and whether
+    /// the draw reads it (the shader names it).
+    Listed { at: u32, twin: bool, texture: bool, read: bool },
+    /// A constant buffer named whole ([`super::record_is_constant`]): made
+    /// for each table, as before.
+    Constant,
+    /// Made as before, slot by slot (a view made in place, a null one).
+    Again,
+}
+
+/// A table template (`VICTORY_TABLE_TEMPLATES`): how the slots of a table
+/// are made, for a list's tables that differ from one made before in the
+/// list in their constant buffers only.
+///
+/// Measured at the boat (run u1, profile r3): 6,885 tables a frame made
+/// afresh, 60,940 slots, `crate::draw::State::tables` 134 ms a frame of
+/// the eight threads that translate the title's lists (r3 sampled four of
+/// them: 66.8 ms), about 19 microseconds a table: per slot the record read,
+/// two look-ups in [`ListViews`], its descriptor copied alone, its resource
+/// kept under the slot's lock, and what it reads brought up to date. The
+/// tables of the title's consecutive draws hold the same views beside
+/// their own constant buffers. A table made from a template has its views'
+/// descriptors copied in one call, its constant buffers made as before, and
+/// nothing else of its views done again: the template was made in the
+/// same list epoch ([`crate::host::HostList::epoch`]) for the same reader,
+/// which is what lets a list's table found again skip that
+/// (`crate::draw::State::tables`, `ready`).
+///
+/// Invalidation: a template names slots of its thread's [`ListViews`] and
+/// is good only while they hold what they held. It is kept there, made in
+/// one generation of the map ([`ListViews::changed`]: an entry let go, the
+/// map cleared full, another recording) and dropped with it; one whose map
+/// changed while it was made is not kept; its record words are compared
+/// whole before it is used, and its list epoch must be the list's.
+pub(crate) struct TableTemplate {
+    /// The record words of each slot (those of the constant buffers are
+    /// not compared).
+    words: Box<[[u32; 3]]>,
+    pub(crate) slots: Box<[TemplateSlot]>,
+    /// The resource of each [`TemplateSlot::Listed`] view, in order, held
+    /// from the template's first use ([`template_find`]): slots made from
+    /// it hold the template ([`Runs`]).
+    resources: Box<[Kept]>,
+    /// Where this thread's [`ListViews`] descriptors are.
+    start: usize,
+    step: usize,
+    /// Whether a view it reads is of the depth target the draw tests.
+    pub(crate) depth: bool,
+}
+
+/// A template as its thread keeps it: made at this list epoch, in this
+/// generation of [`ListViews`]; holding its views' resources yet.
+struct TemplateEntry {
+    template: std::sync::Arc<TableTemplate>,
+    epoch: u64,
+    generation: u64,
+    owns: bool,
+}
+
+/// At most this many templates a thread: past it they all go.
+const TEMPLATES_MOST: usize = 4096;
+
+/// What [`TEMPLATE_COUNTS`] counts (since the last frame line, all threads).
+#[derive(Clone, Copy)]
+pub(crate) enum TemplateCount {
+    /// Templates made.
+    Built,
+    /// A table made afresh found no template for it.
+    Missed,
+    /// It found one of another list epoch (or records that differ); it is
+    /// made as before and the template made again.
+    Stale,
+    /// Templates dropped: the views were of another recording...
+    DroppedRecording,
+    /// ... the map of views was cleared full ...
+    DroppedCleared,
+    /// ... a view of the map was let go ...
+    DroppedView,
+    /// ... the thread had [`TEMPLATES_MOST`] ...
+    DroppedFull,
+    /// ... the switch was turned off ...
+    DroppedOff,
+    /// ... the map changed while it was made (never kept).
+    DroppedMaking,
+    /// `VICTORY_TABLE_TEMPLATES=check`: templates found that named a view
+    /// otherwise than its map does now, or whose descriptor made anew
+    /// differed (must be 0; the table is then made as before).
+    Disagreed,
+}
+
+pub(crate) const TEMPLATE_COUNTS_LEN: usize = 10;
+
+/// See [`TemplateCount`].
+static TEMPLATE_COUNTS: [std::sync::atomic::AtomicU64; TEMPLATE_COUNTS_LEN] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; TEMPLATE_COUNTS_LEN];
+
+/// See [`TEMPLATE_COUNTS`]; taken (reset to 0). (A thread's counts go
+/// there when its views are of another recording.)
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+pub(crate) fn template_counts() -> [u64; TEMPLATE_COUNTS_LEN] {
+    TEMPLATE_COUNTS.each_ref().map(|c| c.swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Templates let go: those that hold resources go to [`crate::host::retire`]
+/// (slots that showed their views may have let them go meanwhile, with a
+/// submission still under way), the others are dropped.
+fn retire_templates(entries: impl Iterator<Item = TemplateEntry>) {
+    let held: Vec<std::sync::Arc<TableTemplate>> =
+        entries.filter(|e| e.owns && !e.template.resources.is_empty()).map(|e| e.template).collect();
+    if !held.is_empty() {
+        crate::host::retire(held);
+    }
+}
+
+/// This thread's [`ListViews`] generation ([`ListViews::changed`]), if it
+/// has its views yet: a template made from here on is kept only if it is
+/// the same when it is done ([`template_insert`]).
+pub(crate) fn views_generation() -> Option<u64> {
+    LIST_VIEWS.with(|views| views.borrow().as_ref().map(|v| v.generation))
+}
+
+/// The template `key` names on this thread, if it is good for a table of
+/// record words `words` at list epoch `epoch`: of this generation of the
+/// views and of their recording, with the same records but in the constant
+/// buffers' slots (and constant buffers named whole there). With `check`,
+/// each of its views is also compared with its entry in the map now and made
+/// anew beside ([`TemplateCount::Disagreed`]).
+pub(crate) fn template_find(key: &TemplateKey, words: &[[u32; 3]], epoch: u64, check: bool) -> Option<std::sync::Arc<TableTemplate>> {
+    LIST_VIEWS.with(|views| {
+        let mut views = views.borrow_mut();
+        let views = views.as_mut()?;
+        let (generation, recording) = (views.generation, views.recording);
+        let found = {
+            let ListViews { templates, made, template_counts, .. } = &mut *views;
+            let Some(e) = templates.get_mut(key) else {
+                template_counts[TemplateCount::Missed as usize] += 1;
+                return None;
+            };
+            let t = &e.template;
+            let same = e.epoch == epoch
+                && e.generation == generation
+                && recording == key.4
+                && t.words.len() == words.len()
+                && t.slots.iter().zip(t.words.iter().zip(words)).all(|(slot, (was, is))| match slot {
+                    TemplateSlot::Constant => super::record_is_constant(*is),
+                    _ => was == is,
+                });
+            if !same {
+                template_counts[TemplateCount::Stale as usize] += 1;
+                return None;
+            }
+            // Its first use: it holds its views' resources from now on
+            // (each the one its entry holds, which is there: the same
+            // generation).
+            if !e.owns {
+                let mut resources = Vec::new();
+                let mut all = true;
+                for (slot, w) in t.slots.iter().zip(t.words.iter()) {
+                    if let TemplateSlot::Listed { at, .. } = *slot {
+                        match made.get(w) {
+                            Some(m) if m.at == at => resources.push(m.kept.clone()),
+                            _ => all = false,
+                        }
+                    }
+                }
+                match std::sync::Arc::get_mut(&mut e.template) {
+                    Some(t) if all => {
+                        t.resources = resources.into();
+                        e.owns = true;
+                    }
+                    // (Not reached: the generation says the entries are
+                    // there, and nothing holds a template not used yet.)
+                    _ => return None,
+                }
+            }
+            e.template.clone()
+        };
+        if check && !template_good(views, &found) {
+            views.template_counts[TemplateCount::Disagreed as usize] += 1;
+            if let Some(e) = views.templates.remove(key) {
+                retire_templates(std::iter::once(e));
+            }
+            return None;
+        }
+        Some(found)
+    })
+}
+
+/// `VICTORY_TABLE_TEMPLATES=check`: whether each view template `t` names is
+/// the entry of its record in the map now, of this recording, holding the
+/// resource the template holds, and (with views kept, which leaves the
+/// scratch pair free) whether its descriptor and twin made anew there are
+/// the bytes the template copies.
+fn template_good(views: &ListViews, t: &TableTemplate) -> bool {
+    let raw = |k: &Kept| k.as_ref().map(windows::core::Interface::as_raw);
+    let equal = |a: Option<[u8; 64]>, b: Option<[u8; 64]>| a.is_some() && a == b;
+    let mut held = t.resources.iter();
+    for (slot, w) in t.slots.iter().zip(t.words.iter()) {
+        let TemplateSlot::Listed { at, twin, texture, .. } = *slot else {
+            continue;
+        };
+        let Some(kept) = held.next() else {
+            return false;
+        };
+        let Some(m) = views.made.get(w) else {
+            return false;
+        };
+        if m.at != at || m.twin != twin || m.recording != views.recording || m.listed.texture != texture || raw(&m.kept) != raw(kept) {
+            return false;
+        }
+        if views_kept() != ViewsKept::Off {
+            let scratch = views.scratch();
+            let fresh = make_twinned(&m.view, views.slot(scratch), Some(views.slot(scratch + 1)));
+            let same = fresh.as_ref().is_some_and(|fresh| raw(fresh) == raw(&m.kept))
+                && equal(views.bytes(scratch), views.bytes(at))
+                && (!twin || equal(views.bytes(scratch + 1), views.bytes(at + 1)));
+            if !same {
+                return false;
+            }
+        }
+    }
+    held.next().is_none()
+}
+
+/// Keeps a template made on this thread for `key` (see [`TableTemplate`]):
+/// the records `words`, how each slot was made, whether a view it read is
+/// of the tested depth target, and the list epoch after it was made. Only
+/// if the views are still of `generation` ([`views_generation`] before the
+/// table was made) and of the key's recording.
+pub(crate) fn template_insert(key: TemplateKey, words: &[[u32; 3]], slots: Vec<TemplateSlot>, depth: bool, epoch: u64, generation: u64) {
+    LIST_VIEWS.with(|views| {
+        let mut views = views.borrow_mut();
+        let Some(views) = views.as_mut() else { return };
+        if views.generation != generation || views.recording != key.4 || slots.len() != words.len() {
+            views.template_counts[TemplateCount::DroppedMaking as usize] += 1;
+            return;
+        }
+        if views.templates.len() >= TEMPLATES_MOST {
+            views.template_counts[TemplateCount::DroppedFull as usize] += views.templates.len() as u64;
+            retire_templates(views.templates.drain().map(|(_, e)| e));
+        }
+        let template = TableTemplate {
+            words: words.into(),
+            slots: slots.into(),
+            resources: Box::new([]),
+            start: views.start,
+            step: views.step,
+            depth,
+        };
+        views.template_counts[TemplateCount::Built as usize] += 1;
+        let entry = TemplateEntry { template: std::sync::Arc::new(template), epoch, generation, owns: false };
+        if let Some(old) = views.templates.insert(key, entry) {
+            retire_templates(std::iter::once(old));
+        }
+    });
+}
+
+/// The switch is off (`crate::ab`): this thread's templates go, if it has
+/// any. (Slots made from them hold them until they are made anew.)
+pub(crate) fn templates_off() {
+    LIST_VIEWS.with(|views| {
+        if let Ok(mut views) = views.try_borrow_mut()
+            && let Some(views) = views.as_mut()
+            && !views.templates.is_empty()
+        {
+            views.template_counts[TemplateCount::DroppedOff as usize] += views.templates.len() as u64;
+            retire_templates(views.templates.drain().map(|(_, e)| e));
+        }
+    });
+}
+
+/// The copy ranges of [`HostHeap::make_from_template`], kept from table to
+/// table on each thread: destinations and their sizes, sources; of the
+/// descriptors, then of their raw twins.
+#[derive(Default)]
+struct CopyScratch {
+    to: Vec<D3D12_CPU_DESCRIPTOR_HANDLE>,
+    sizes: Vec<u32>,
+    from: Vec<D3D12_CPU_DESCRIPTOR_HANDLE>,
+    twin_to: Vec<D3D12_CPU_DESCRIPTOR_HANDLE>,
+    twin_sizes: Vec<u32>,
+    twin_from: Vec<D3D12_CPU_DESCRIPTOR_HANDLE>,
+}
+
+thread_local! {
+    static TEMPLATE_COPY: std::cell::RefCell<CopyScratch> = std::cell::RefCell::new(CopyScratch::default());
+}
+
+/// The table template each dynamic slot of a heap shows views of, if any
+/// ([`HostHeap::make_from_template`]): for each such slot one reference to
+/// it, as the pointer [`std::sync::Arc::into_raw`] gives (null: none).
+///
+/// Lifetime: a slot made from a template keeps nothing in `kept`; the
+/// template, which holds the resource of each of its views, keeps them for
+/// it until the slot is made anew ([`HostHeap::keep`], [`HostHeap::keep_ref`]
+/// let go of it) or made from another template. That is what `kept` did
+/// for the slot: a slot that still shows a view after its list gave it back
+/// (a shader that indexes past its table) never shows freed memory. The
+/// last reference a slot lets go of hands the template to
+/// [`crate::host::retire`], as `kept` retires what it held, and a template
+/// its thread lets go of is retired too ([`retire_templates`]), so the
+/// resources are let go after the submissions under way then have run.
+/// Readers of `kept` for dynamic slots: [`HostHeap::keep_locked`] (what is
+/// retired when the slot is made anew), [`HostHeap::kept_already`] (whether
+/// a slot holds a resource already: a template's slot holds none in
+/// `kept`), and the device-removed report ([`Runs::held`]).
+struct Runs(Box<[std::sync::atomic::AtomicPtr<TableTemplate>]>);
+
+impl Runs {
+    fn new(n: usize) -> Self {
+        Runs((0..n).map(|_| std::sync::atomic::AtomicPtr::new(std::ptr::null_mut())).collect())
+    }
+
+    /// Dynamic slot `at` (counted from the first) shows views of `to` now
+    /// (`None`: of none); the template it showed before is let go.
+    fn set(&self, at: usize, to: Option<&std::sync::Arc<TableTemplate>>) {
+        use std::sync::atomic::Ordering;
+        let Some(slot) = self.0.get(at) else {
+            return;
+        };
+        // (Most slots: none before, none now; one load.)
+        if to.is_none() && slot.load(Ordering::Acquire).is_null() {
+            return;
+        }
+        let new = to.map_or(std::ptr::null_mut(), |t| std::sync::Arc::into_raw(std::sync::Arc::clone(t)).cast_mut());
+        let old = slot.swap(new, Ordering::AcqRel);
+        Self::let_go(old);
+    }
+
+    /// Whether dynamic slot `at` shows a template's views (device-removed
+    /// report).
+    #[cfg(feature = "diagnostics")]
+    fn held(&self, at: usize) -> bool {
+        self.0.get(at).is_some_and(|slot| !slot.load(std::sync::atomic::Ordering::Acquire).is_null())
+    }
+
+    fn let_go(old: *mut TableTemplate) {
+        if old.is_null() {
+            return;
+        }
+        // SAFETY: a pointer [`Runs::set`] stored from `Arc::into_raw`, one
+        // reference of the template's; the swap that took it out of its
+        // slot gave this thread alone that reference.
+        let old = unsafe { std::sync::Arc::from_raw(old) };
+        if let Some(last) = std::sync::Arc::into_inner(old) {
+            crate::host::retire(last);
+        }
+    }
+}
+
+impl Drop for Runs {
+    fn drop(&mut self) {
+        for slot in self.0.iter() {
+            Self::let_go(slot.swap(std::ptr::null_mut(), std::sync::atomic::Ordering::AcqRel));
+        }
+    }
 }

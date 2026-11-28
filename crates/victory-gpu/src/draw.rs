@@ -14,6 +14,7 @@ use victory_shader::resource::RootIndexedView;
 use victory_shader::{ResourceType, RootType, UsedResource};
 
 use crate::descriptor::View;
+use crate::descriptor::host::{TemplateMode, TemplateSlot};
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -3518,16 +3519,37 @@ impl State {
                 once!(slot, n, "fresh descriptor table exceeds the available span");
                 continue;
             }
-            // The table and what its entries hold (record words).
-            let key = {
+            // Whether a table made afresh here may be made from a template,
+            // or made one of (`VICTORY_TABLE_TEMPLATES`, see
+            // `crate::descriptor::host::TableTemplate`): only where a table
+            // found made in the list may skip what its views read (`once`
+            // below), its views are kept in the list, and it is not big.
+            let templates = crate::descriptor::host::table_templates();
+            if templates == TemplateMode::Off && crate::descriptor::host::table_templates_change() {
+                crate::descriptor::host::templates_off();
+            }
+            let once = ready_once() && selected.is_empty() && !group.has_uav;
+            let list_views = crate::descriptor::host::list_views();
+            let templating = templates != TemplateMode::Off && once && list_views && n <= TEMPLATE_SLOTS_MOST;
+            // The table and what its entries hold (record words); for a
+            // template, the records but the constant buffers', and the
+            // records themselves.
+            let mut words: Few<[u32; 3], 16> = Few::default();
+            let (key, shape) = {
                 let mut h = RecordHash::default();
+                let mut shape = RecordHash::default();
                 for k in 0..n {
                     let at = table + u64::from(k) * 32;
                     // SAFETY: a descriptor slot in title memory.
-                    h.add(unsafe { (at as *const [u32; 3]).read_unaligned() });
+                    let record = unsafe { (at as *const [u32; 3]).read_unaligned() };
+                    h.add(record);
+                    if templating {
+                        words.push(record);
+                        shape.add(if crate::descriptor::record_is_constant(record) { [u32::MAX, 0, 0] } else { record });
+                    }
                 }
                 // With [`table_by_content`]: whatever its address.
-                (if table_by_content() { heap.start } else { table }, n, h.0)
+                ((if table_by_content() { heap.start } else { table }, n, h.0), shape.0)
             };
             // Who reads of it, and as what, as far as [`readable`] goes by it.
             let reader = (std::ptr::from_ref(plan) as usize, plan.direct.len(), STORES.get(), TESTED_DEPTH.get().0);
@@ -3546,7 +3568,6 @@ impl State {
                 }
                 // This reader had it brought up to date, and nothing in the
                 // list changed since: nothing to do again.
-                let once = ready_once() && selected.is_empty() && !group.has_uav;
                 if once
                     && known.epoch == list.epoch()
                     && let Some((_, depth)) = known.ready.iter().find(|(r, _)| *r == reader)
@@ -3593,6 +3614,18 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
+            // A template for it (see `templating`): of this recording, made
+            // at this list epoch for this reader, the same records but the
+            // constant buffers'.
+            let template_key: Option<crate::descriptor::host::TemplateKey> = templating.then(|| {
+                if self.recording == 0 {
+                    self.recording = next_recording();
+                }
+                (std::ptr::from_ref(heap) as usize, n, shape, reader, self.recording)
+            });
+            let template = template_key.as_ref().and_then(|key| {
+                crate::descriptor::host::template_find(key, &words, list.epoch(), templates == TemplateMode::Check)
+            });
             let Some(first) = host.dynamic(n) else {
                 // No room: the draw must not run with the title's own
                 // offsets (slots never made for it); `bind` drops it.
@@ -3620,11 +3653,12 @@ impl State {
                         if since.elapsed().as_secs() >= 5 {
                             let f = frame.saturating_sub(first_frame).max(1) as f64;
                             tracing::info!(
-                                "tables made afresh per frame: {:.0} ({:.0} slots); {:.0} found made in their list (VICTORY_TABLE_BY_CONTENT {}; VICTORY_TABLE_SEEN=1 also counts those another list made)",
+                                "tables made afresh per frame: {:.0} ({:.0} slots); {:.0} found made in their list (VICTORY_TABLE_BY_CONTENT {}; VICTORY_TABLE_SEEN=1 also counts those another list made); {}",
                                 MADE.swap(0, Ordering::Relaxed) as f64 / f,
                                 SLOTS.swap(0, Ordering::Relaxed) as f64 / f,
                                 TABLE_HITS.swap(0, Ordering::Relaxed) as f64 / f,
-                                if table_by_content() { "on" } else { "off" }
+                                if table_by_content() { "on" } else { "off" },
+                                template_text(f)
                             );
                             kept_line(f);
                             *g = Some((std::time::Instant::now(), frame));
@@ -3650,12 +3684,13 @@ impl State {
                     let [made, again, slots, frames] = g.2;
                     let f = frames.max(1) as f64;
                     tracing::info!(
-                        "tables made afresh per frame: {:.0} ({:.0} slots), {:.0} of them the same as one another list made in the frame; {:.0} found made in their list (VICTORY_TABLE_BY_CONTENT {})",
+                        "tables made afresh per frame: {:.0} ({:.0} slots), {:.0} of them the same as one another list made in the frame; {:.0} found made in their list (VICTORY_TABLE_BY_CONTENT {}); {}",
                         made as f64 / f,
                         slots as f64 / f,
                         again as f64 / f,
                         TABLE_HITS.swap(0, Ordering::Relaxed) as f64 / f,
-                        if table_by_content() { "on" } else { "off" }
+                        if table_by_content() { "on" } else { "off" },
+                        template_text(f)
                     );
                     kept_line(f);
                     g.2 = [0; 4];
@@ -3676,111 +3711,91 @@ impl State {
                     host.slot_tabled(title + k);
                 }
             }
-            let list_views = crate::descriptor::host::list_views();
             if self.recording == 0 {
-                static NEXT: AtomicU64 = AtomicU64::new(1);
-                self.recording = NEXT.fetch_add(1, Ordering::Relaxed);
+                self.recording = next_recording();
             }
             let recording = self.recording;
+            // Made from a template: its views' descriptors copied at once,
+            // its constant buffers and the slots it does not have made as
+            // below, and of its views only what depends on where this table
+            // is in the title's heap (its slots are a table's).
+            if let Some(template) = &template {
+                let copied = host.make_from_template(first, template);
+                #[cfg(feature = "diagnostics")]
+                {
+                    TEMPLATE_MADE.fetch_add(1, Ordering::Relaxed);
+                    TEMPLATE_SLOTS.fetch_add(u64::from(copied), Ordering::Relaxed);
+                }
+                #[cfg(not(feature = "diagnostics"))]
+                let _ = copied;
+                for (k, &made_from) in (0..n).zip(template.slots.iter()) {
+                    match made_from {
+                        TemplateSlot::Listed { texture, read, .. } => {
+                            // (As below for a view kept in the list, but
+                            // for its title slot, which is this table's.)
+                            if let Some(title) = title_first
+                                && texture
+                            {
+                                host.texture_slot_tabled(title + k, read);
+                                if read {
+                                    host.mirror_after(list, title + k, table + u64::from(k) * 32);
+                                }
+                            }
+                        }
+                        // (A record that names a constant buffer whole is no
+                        // view kept in the list: made as below.)
+                        TemplateSlot::Constant => {
+                            slot_afresh(list, heap, host, group, &selected, table, title_first, recording, false, k, first + k);
+                        }
+                        TemplateSlot::Again => {
+                            slot_afresh(list, heap, host, group, &selected, table, title_first, recording, list_views, k, first + k);
+                        }
+                    }
+                }
+                if template.depth {
+                    TESTED_DEPTH.set((reader.3, true));
+                }
+                made.push((slot, first * 32));
+                continue;
+            }
+            // Made slot by slot; and noted as a template if it may be one
+            // (see `templating`), with whether a view it read is of the
+            // tested depth target, as a table found made notes it.
+            let generation = template_key.as_ref().and_then(|_| crate::descriptor::host::views_generation());
+            let mut build: Option<Vec<TemplateSlot>> = generation.map(|_| Vec::with_capacity(n as usize));
+            let depth_before = TESTED_DEPTH.get();
+            if build.is_some() {
+                TESTED_DEPTH.set((depth_before.0, false));
+            }
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
-                let index = first + k;
-                // A view this list has made before: its descriptor copied,
-                // and nothing more if nothing changed in the list since.
-                if list_views
-                    && let Some(words) = crate::descriptor::record_at(table + u64::from(k) * 32)
-                    && let Some(mut listed) = host.make_listed(recording, words, index)
-                {
-                    let kind = group
-                        .entry(k)
-                        .map(|u| u.kind)
-                        .or_else(|| selected.binary_search(&k).ok().and(listed.kind));
-                    let was = (listed.ready, listed.tabled);
-                    if let Some(kind) = kind {
-                        let tested = TESTED_DEPTH.get();
-                        if kind == ResourceType::Srv && listed.ready.0 == list.epoch() && listed.ready.1 == tested.0 {
-                            if listed.ready.2 {
-                                TESTED_DEPTH.set((tested.0, true));
-                            }
-                        } else if let Some(view) = crate::descriptor::host::listed_view(recording, words) {
-                            TESTED_DEPTH.set((tested.0, false));
-                            readable(list, kind, &view);
-                            let depth = TESTED_DEPTH.get().1;
-                            TESTED_DEPTH.set((tested.0, tested.1 || depth));
-                            if kind == ResourceType::Srv {
-                                listed.ready = (list.epoch(), tested.0, depth);
-                            }
-                        }
-                    }
-                    if let Some(title) = title_first
-                        && listed.texture
-                        && listed.tabled != Some((title + k, kind.is_some()))
-                    {
-                        listed.tabled = Some((title + k, kind.is_some()));
-                        host.texture_slot_tabled(title + k, kind.is_some());
-                        if kind.is_some() {
-                            host.mirror_after(list, title + k, table + u64::from(k) * 32);
-                        }
-                    }
-                    if was != (listed.ready, listed.tabled) {
-                        crate::descriptor::host::note_listed(recording, words, listed);
-                    }
+                let listed = slot_afresh(list, heap, host, group, &selected, table, title_first, recording, list_views, k, first + k);
+                let Some(slots) = build.as_mut() else {
                     continue;
-                }
-                let used = group.entry(k);
-                match crate::descriptor::view(table + u64::from(k) * 32) {
-                    Some(View::Constant(address, size)) => {
-                        // Renderer port 5: title memory in place is the
-                        // card's to read where it is; nothing is copied.
-                        if crate::port_cbv::in_place_on() {
-                            match crate::shadow::find(address, u64::from(size)).filter(|s| s.in_place()) {
-                                Some(shadow) => {
-                                    if host.constant_raw_at(index, &shadow.buffer, shadow.gpu(address), size) {
-                                        crate::port_cbv::in_place(size);
-                                        continue;
-                                    }
-                                    crate::port_cbv::copied(false);
-                                }
-                                None => crate::port_cbv::copied(true),
-                            }
-                        }
-                        let Some((buffer, gpu, to)) = list.scratch_held(u64::from(size)) else {
-                            host.make_null(index);
-                            continue;
-                        };
-                        let slot = (std::ptr::from_ref(heap) as usize, index);
-                        list.defer_constants(to, address as *const u8, size as usize, slot);
-                        host.constant_at(index, &buffer, gpu, size);
+                };
+                let record = words.get(k as usize).copied();
+                let made_from = match listed {
+                    // (A view the draw reads otherwise than as a shader
+                    // resource is gone through for each table: made as
+                    // before. So is one whose record changed meanwhile.)
+                    Some(l) if Some(l.words) == record && l.kind.is_none_or(|kind| kind == ResourceType::Srv) => {
+                        TemplateSlot::Listed { at: l.at, twin: l.twin, texture: l.texture, read: l.kind.is_some() }
                     }
-                    Some(view) => {
-                        host.make_at(index, &view);
-                        let kind = used.map(|u| u.kind).or_else(|| {
-                            selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
-                        });
-                        if let Some(kind) = kind {
-                            readable(list, kind, &view);
-                        }
-                        // The title's slot is a table's: out of the queue
-                        // of textures picked by index if the draw read it
-                        // (its texture is up to date now), and made in
-                        // place as the texture pass would have made it,
-                        // for a shader that picks it by index all the same.
-                        if let Some(title) = title_first
-                            && crate::descriptor::host::is_texture_view(&view)
-                        {
-                            host.texture_slot_tabled(title + k, kind.is_some());
-                            if kind.is_some() {
-                                host.mirror_after(list, title + k, table + u64::from(k) * 32);
-                            }
-                        }
-                    }
-                    None => {
-                        host.make_null(index);
-                        if used.is_some() {
-                            once!(slot, "a table entry without a view");
-                        }
-                    }
+                    Some(_) => TemplateSlot::Again,
+                    None if record.is_some_and(crate::descriptor::record_is_constant) => TemplateSlot::Constant,
+                    None => TemplateSlot::Again,
+                };
+                slots.push(made_from);
+            }
+            if let (Some(slots), Some(generation), Some(key)) = (build, generation, template_key) {
+                let depth = TESTED_DEPTH.get().1;
+                TESTED_DEPTH.set((depth_before.0, depth_before.1 || depth));
+                // (The list epoch as it is now, as for a table found made:
+                // what this changed itself a table made from it need not do
+                // again.)
+                if slots.iter().any(|s| matches!(s, TemplateSlot::Listed { .. })) {
+                    crate::descriptor::host::template_insert(key, &words, slots, depth, list.epoch(), generation);
                 }
             }
             made.push((slot, first * 32));
@@ -4504,6 +4519,183 @@ struct FreshTable {
 /// Tables found made already in their list, since the last line.
 #[cfg(feature = "diagnostics")]
 static TABLE_HITS: AtomicU64 = AtomicU64::new(0);
+
+/// Tables made from a template (`VICTORY_TABLE_TEMPLATES`) and the slots of
+/// them copied in one call, since the last line.
+#[cfg(feature = "diagnostics")]
+static TEMPLATE_MADE: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "diagnostics")]
+static TEMPLATE_SLOTS: AtomicU64 = AtomicU64::new(0);
+
+/// Tables of more slots are not made from templates (nor made ones of).
+const TEMPLATE_SLOTS_MOST: u32 = 64;
+
+/// A new number for a recording of a list ([`State::recording`]).
+fn next_recording() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// For the "tables made afresh" line, over `f` frames: what table
+/// templates did (`VICTORY_TABLE_TEMPLATES`). The disagreements of `check`
+/// must be 0.
+#[cfg(feature = "diagnostics")]
+fn template_text(f: f64) -> String {
+    let [built, missed, stale, recording, cleared, view, full, off, making, disagreed] =
+        crate::descriptor::host::template_counts();
+    let per = |n: u64| n as f64 / f;
+    let mode = match crate::descriptor::host::table_templates() {
+        TemplateMode::Off => "off",
+        TemplateMode::On => "on",
+        TemplateMode::Check => "check",
+    };
+    format!(
+        "templates (VICTORY_TABLE_TEMPLATES {mode}): {:.0} tables made from one, {:.0} slots of them copied by range; {:.0} made, {:.0} missed (none), {:.0} missed (another epoch or records); dropped: {:.0} another recording, {:.0} views cleared full, {:.0} a view let go, {:.0} too many, {:.0} switched off, {:.0} views changed while made; check disagreements {disagreed}",
+        per(TEMPLATE_MADE.swap(0, Ordering::Relaxed)),
+        per(TEMPLATE_SLOTS.swap(0, Ordering::Relaxed)),
+        per(built),
+        per(missed),
+        per(stale),
+        per(recording),
+        per(cleared),
+        per(view),
+        per(full),
+        per(off),
+        per(making),
+    )
+}
+
+/// A slot [`slot_afresh`] made from a view kept in the list
+/// ([`crate::descriptor::host::HostHeap::make_listed`]): its record words,
+/// where its descriptor is and whether it has a raw twin there, whether it
+/// is a texture view, and as what the draw reads it (none: the shader does
+/// not name it).
+struct ListedSlot {
+    words: [u32; 3],
+    at: u32,
+    twin: bool,
+    texture: bool,
+    kind: Option<ResourceType>,
+}
+
+/// Makes dynamic slot `index` from slot `k` of the title's table at `table`
+/// ([`State::tables`]): a view this list made before copied, and what the
+/// draw reads of it brought up to date unless nothing changed in the list
+/// since; a constant buffer's data copied at submission; any other view
+/// made in place. `title_first`: the title's slot of the table's first, if
+/// its slots are all the host's. `listed`: views are kept in the list.
+#[allow(clippy::too_many_arguments)]
+fn slot_afresh(
+    list: &HostList,
+    heap: &crate::descriptor::Heap,
+    host: &crate::descriptor::host::HostHeap,
+    group: &TableGroup,
+    selected: &[u32],
+    table: u64,
+    title_first: Option<u32>,
+    recording: u64,
+    listed: bool,
+    k: u32,
+    index: u32,
+) -> Option<ListedSlot> {
+    let slot = group.slot;
+    // A view this list has made before: its descriptor copied, and nothing
+    // more if nothing changed in the list since.
+    if listed
+        && let Some(words) = crate::descriptor::record_at(table + u64::from(k) * 32)
+        && let Some((mut listed, at, twin)) = host.make_listed(recording, words, index)
+    {
+        let kind = group
+            .entry(k)
+            .map(|u| u.kind)
+            .or_else(|| selected.binary_search(&k).ok().and(listed.kind));
+        let was = (listed.ready, listed.tabled);
+        if let Some(kind) = kind {
+            let tested = TESTED_DEPTH.get();
+            if kind == ResourceType::Srv && listed.ready.0 == list.epoch() && listed.ready.1 == tested.0 {
+                if listed.ready.2 {
+                    TESTED_DEPTH.set((tested.0, true));
+                }
+            } else if let Some(view) = crate::descriptor::host::listed_view(recording, words) {
+                TESTED_DEPTH.set((tested.0, false));
+                readable(list, kind, &view);
+                let depth = TESTED_DEPTH.get().1;
+                TESTED_DEPTH.set((tested.0, tested.1 || depth));
+                if kind == ResourceType::Srv {
+                    listed.ready = (list.epoch(), tested.0, depth);
+                }
+            }
+        }
+        if let Some(title) = title_first
+            && listed.texture
+            && listed.tabled != Some((title + k, kind.is_some()))
+        {
+            listed.tabled = Some((title + k, kind.is_some()));
+            host.texture_slot_tabled(title + k, kind.is_some());
+            if kind.is_some() {
+                host.mirror_after(list, title + k, table + u64::from(k) * 32);
+            }
+        }
+        if was != (listed.ready, listed.tabled) {
+            crate::descriptor::host::note_listed(recording, words, listed);
+        }
+        return Some(ListedSlot { words, at, twin, texture: listed.texture, kind });
+    }
+    let used = group.entry(k);
+    match crate::descriptor::view(table + u64::from(k) * 32) {
+        Some(View::Constant(address, size)) => {
+            // Renderer port 5: title memory in place is the card's to read
+            // where it is; nothing is copied.
+            if crate::port_cbv::in_place_on() {
+                match crate::shadow::find(address, u64::from(size)).filter(|s| s.in_place()) {
+                    Some(shadow) => {
+                        if host.constant_raw_at(index, &shadow.buffer, shadow.gpu(address), size) {
+                            crate::port_cbv::in_place(size);
+                            return None;
+                        }
+                        crate::port_cbv::copied(false);
+                    }
+                    None => crate::port_cbv::copied(true),
+                }
+            }
+            let Some((buffer, gpu, to)) = list.scratch_held(u64::from(size)) else {
+                host.make_null(index);
+                return None;
+            };
+            let slot = (std::ptr::from_ref(heap) as usize, index);
+            list.defer_constants(to, address as *const u8, size as usize, slot);
+            host.constant_at(index, &buffer, gpu, size);
+        }
+        Some(view) => {
+            host.make_at(index, &view);
+            let kind = used
+                .map(|u| u.kind)
+                .or_else(|| selected.binary_search(&k).ok().and_then(|_| view_kind(&view)));
+            if let Some(kind) = kind {
+                readable(list, kind, &view);
+            }
+            // The title's slot is a table's: out of the queue of textures
+            // picked by index if the draw read it (its texture is up to date
+            // now), and made in place as the texture pass would have made it,
+            // for a shader that picks it by index all the same.
+            if let Some(title) = title_first
+                && crate::descriptor::host::is_texture_view(&view)
+            {
+                host.texture_slot_tabled(title + k, kind.is_some());
+                if kind.is_some() {
+                    host.mirror_after(list, title + k, table + u64::from(k) * 32);
+                }
+            }
+        }
+        None => {
+            host.make_null(index);
+            if used.is_some() {
+                once!(slot, "a table entry without a view");
+            }
+        }
+    }
+    None
+}
 
 /// Beside the "tables made afresh" line, over `f` frames: what the views a
 /// thread keeps across recordings (`VICTORY_VIEWS_KEPT`) and the lock-free

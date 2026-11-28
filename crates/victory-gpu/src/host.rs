@@ -4534,6 +4534,11 @@ fn summary_mismatch(which: usize, what: &str) {
 /// waits is bookkeeping the submitting thread already lives with for every
 /// flight still in the air.
 fn tell_first() -> bool {
+    // (`crate::ab` is of diagnostics builds.)
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_TELL_FIRST") {
+        return on;
+    }
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_TELL_FIRST").is_some_and(|v| v == "1"))
 }

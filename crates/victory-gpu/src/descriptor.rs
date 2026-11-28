@@ -1679,6 +1679,15 @@ pub(crate) fn record_at(handle: u64) -> Option<[u32; 3]> {
     (words[0] == VIEW_TAG).then_some(words)
 }
 
+/// Whether record words `words` name a constant buffer view whole
+/// ([`constant_words`]): what such a record names depends on its words alone,
+/// and it is made for each table (`crate::draw::State::tables`). A constant
+/// buffer view that is a table entry (`VICTORY_VIEW_INLINE=0`, or one that
+/// cannot be named whole) is not told here.
+pub(crate) fn record_is_constant(words: [u32; 3]) -> bool {
+    words[0] == VIEW_TAG && words[2] >> KIND_SHIFT == CONSTANT
+}
+
 /// The view recorded at `handle`, if one is (and its resource is alive).
 pub(crate) fn view(handle: u64) -> Option<View> {
     if handle == 0 {
