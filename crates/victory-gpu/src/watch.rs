@@ -3744,6 +3744,7 @@ fn cover(g: &Guards, from: usize, to: usize, mut claims: Option<&mut Claims>) ->
 /// took it, [`open`] would have opened it. Whether it is read-only now.
 fn protect_alias(g: &Guards, block: usize, claims: Option<&mut Claims>) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+    crate::lazy::guard_would(block, block + 1, false);
     if let Some(claims) = claims
         && !claims.holds(block)
         && !claims.try_one(block)
@@ -3788,6 +3789,8 @@ fn protect_alias(g: &Guards, block: usize, claims: Option<&mut Claims>) -> bool 
 /// [`protect`] for one range, without the other views of its pages.
 fn protect_here(g: &Guards, from: usize, to: usize) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+    // (`VICTORY_LAND_LAZY_VIEWS=1`: counted if a block would be armed.)
+    crate::lazy::guard_would(from, to, false);
     let set = |from: usize, to: usize| {
         let mut old = 0;
         #[cfg(feature = "diagnostics")]
@@ -3914,6 +3917,9 @@ fn open_given(g: &Guards, start: usize, end: usize, given: Option<&[usize]>) -> 
 /// Gives write access back to `blocks`, guarded ones.
 fn unguard(g: &Guards, blocks: &[usize]) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+    for &block in blocks {
+        crate::lazy::guard_would(block, block + 1, true);
+    }
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     // All of them before the first can be written: a write through one is a

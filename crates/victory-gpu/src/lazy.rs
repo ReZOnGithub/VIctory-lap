@@ -277,7 +277,30 @@ mod stat {
     pub(super) const QUERY_US: usize = 46;
     /// Pages made read-only to be compared, and compared bytes.
     pub(super) const COMPARED: usize = 47;
-    pub(super) const EAGER: usize = 48;
+    /// `VICTORY_LAND_LAZY_VIEWS=1`, the dry run of view memory: pieces
+    /// looked at, their 4 KiB pages, bytes compared and differing, pieces with
+    /// no view of ours, skipped while the runtime remaps; 64 KiB pages shown
+    /// at 1, 2, 3 or more addresses; pages whose addresses changed since the
+    /// last look; pages with a write guard on an address; protection calls
+    /// arming and opening would take; guard calls (protecting, opening) that
+    /// met a block that would be armed.
+    pub(super) const V_PIECES: usize = 48;
+    pub(super) const V_PAGES: usize = 49;
+    pub(super) const V_BYTES: usize = 50;
+    pub(super) const V_DIFFER: usize = 51;
+    pub(super) const V_NO_VIEW: usize = 52;
+    pub(super) const V_REMAPPING: usize = 53;
+    pub(super) const V_SHOWN: usize = 54;
+    pub(super) const V_MOVED: usize = 57;
+    pub(super) const V_GUARDED: usize = 58;
+    pub(super) const V_ARM_CALLS: usize = 59;
+    pub(super) const V_OPEN_CALLS: usize = 60;
+    pub(super) const V_GUARD_PROTECT: usize = 61;
+    pub(super) const V_GUARD_OPEN: usize = 62;
+    /// Bytes the landing leaves as they were that changed meanwhile (the
+    /// title's writes between the two looks, not the landing's).
+    pub(super) const V_MEANWHILE: usize = 63;
+    pub(super) const EAGER: usize = 64;
     /// Landings that fetched for pieces of each [`super::Why`].
     pub(super) const CLASS: usize = EAGER + super::WHYS;
     pub(super) const COUNT: usize = CLASS + super::WHYS;
@@ -1490,6 +1513,166 @@ pub(crate) fn forget(at: usize, len: usize, end_of: impl FnOnce(usize) -> usize)
     }
 }
 
+/// Step 1 of landing view memory on touch (`VICTORY_LAND_LAZY_VIEWS=1`, off
+/// by default; only with `VICTORY_LAND_LAZY` on): a dry run. Nothing of view
+/// memory is trapped; for the pieces in view memory, which land as before,
+/// the books a landing on touch would keep are made and checked: every
+/// address the title shows each 64 KiB page at (`crate::inplace::pages_of`),
+/// the view of ours of the same pages to write and read through
+/// (`crate::inplace::beside`), what a landing through it would leave there
+/// against what the eager landing left (must not differ), how often those
+/// addresses change, how many of them carry a write guard, the protection
+/// calls arming and opening them would take, and how often the guards'
+/// own protection calls would meet a block that would be armed.
+///
+/// Why aliases matter: once the title is told, it may read the page at any
+/// address it shows it at, so every one would need the trap; and the
+/// guards protect and open whole 64 KiB blocks of them, which would undo a
+/// trap of 4 KiB pages unless they left trapped pages out.
+pub(crate) fn views_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| on() && std::env::var_os("VICTORY_LAND_LAZY_VIEWS").is_some_and(|v| v == "1"))
+}
+
+/// The 64 KiB blocks that would be armed (dry run), at every address shown,
+/// since the last frame; and which they were, to be cleared.
+static VIEW_WOULD: crate::watch::Bits = crate::watch::Bits::new();
+static VIEW_WOULD_ANY: AtomicBool = AtomicBool::new(false);
+static VIEW_WOULD_LIST: Mutex<(u64, Vec<usize>)> = Mutex::new((0, Vec::new()));
+/// By 64 KiB page: a hash of the addresses it was last seen shown at.
+static VIEW_SHOWN: LazyLock<Mutex<HashMap<usize, u64>>> = LazyLock::new(Mutex::default);
+
+/// A view piece looked at: its place in the landing's pieces, our address of
+/// its first byte, and what a landing through it would leave there.
+/// And what our view showed before the merge.
+pub(crate) type ViewSample = (usize, usize, Vec<u8>, Vec<u8>);
+
+/// The dry run, before the eager merge of `pieces` (fetched to `data`):
+/// for those of copies in view memory (`whys`), about [`SAMPLE_MOST`] a
+/// frame, the books and what a landing through our view would leave.
+pub(crate) fn views_before(pieces: &[(Arc<Shadow>, usize, usize, u64)], whys: &HashMap<u64, Why>, data: usize) -> Vec<ViewSample> {
+    if !views_on() {
+        return Vec::new();
+    }
+    let frame = crate::frame::current();
+    {
+        // The blocks that would have been armed last frame are let go.
+        let mut list = VIEW_WOULD_LIST.lock().unwrap_or_else(|e| e.into_inner());
+        if list.0 != frame {
+            for block in list.1.drain(..) {
+                VIEW_WOULD.clear(block);
+            }
+            list.0 = frame;
+            VIEW_WOULD_ANY.store(false, Ordering::Relaxed);
+        }
+    }
+    static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
+    static TAKEN: AtomicU64 = AtomicU64::new(0);
+    if FRAME.swap(frame, Ordering::Relaxed) != frame {
+        TAKEN.store(0, Ordering::Relaxed);
+    }
+    let mut out = Vec::new();
+    for (i, (shadow, lo, hi, at)) in pieces.iter().enumerate() {
+        if whys.get(&shadow.id()) != Some(&Why::View) || lo >= hi {
+            continue;
+        }
+        let title = shadow.span().0 as usize + lo;
+        let n = hi - lo;
+        let page = title & !(BLOCK - 1);
+        // Under the runtime's word that it changes no mapping meanwhile,
+        // not waited for (the relay is not to wait for a remap).
+        let Some(reading) = crate::watch::title_memory_reading_now() else {
+            count(stat::V_REMAPPING, 1);
+            continue;
+        };
+        let mut shown = crate::inplace::pages_of(page);
+        let ours = crate::inplace::beside(title, n);
+        drop(reading);
+        if shown.is_empty() {
+            shown.push(page);
+        }
+        shown.sort_unstable();
+        {
+            let mut list = VIEW_WOULD_LIST.lock().unwrap_or_else(|e| e.into_inner());
+            for &at in &shown {
+                VIEW_WOULD.set(at / BLOCK);
+                list.1.push(at / BLOCK);
+            }
+            VIEW_WOULD_ANY.store(true, Ordering::Relaxed);
+        }
+        let take = TAKEN.fetch_add(n as u64, Ordering::Relaxed) < SAMPLE_MOST;
+        if !take {
+            continue;
+        }
+        count(stat::V_PIECES, 1);
+        count(stat::V_PAGES, n.div_ceil(PAGE) as u64);
+        count(stat::V_SHOWN + shown.len().clamp(1, 3) - 1, 1);
+        let hash = shown.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &a| (h ^ a as u64).wrapping_mul(0x100_0000_01b3));
+        if VIEW_SHOWN.lock().unwrap_or_else(|e| e.into_inner()).insert(page, hash).is_some_and(|was| was != hash) {
+            count(stat::V_MOVED, 1);
+        }
+        if shown.iter().any(|&at| crate::watch::guarded(at, at + BLOCK)) {
+            count(stat::V_GUARDED, 1);
+        }
+        // Per address: read-only, then no-access, arming; read-write (or the
+        // guard's read-only) opening; one run of pages each (a piece lies in
+        // one block).
+        count(stat::V_ARM_CALLS, 2 * shown.len() as u64);
+        count(stat::V_OPEN_CALLS, shown.len() as u64);
+        let Some(ours) = ours else {
+            count(stat::V_NO_VIEW, 1);
+            continue;
+        };
+        let mut before = vec![0u8; n];
+        // (Our view is never guarded nor changed: it reads as the pages are.)
+        if !crate::host::read_into(ours as *const u8, &mut before) {
+            count(stat::V_NO_VIEW, 1);
+            continue;
+        }
+        // SAFETY: the fetched bytes of the piece, `n` of them; the copy into
+        // them has run, and the next waits for this thread.
+        let would = unsafe { shadow.lazy_predict(*lo, *hi, (data + *at as usize) as *const u8, behind(), &before) };
+        if !would.is_empty() {
+            out.push((i, ours, would, before));
+        }
+    }
+    out
+}
+
+/// The dry run, after the eager merge: our view of each sampled piece is
+/// compared with what a landing through it would have left.
+pub(crate) fn views_after(samples: Vec<ViewSample>) {
+    for (_, ours, would, before) in samples {
+        let mut now = vec![0u8; would.len()];
+        if crate::host::read_into(ours as *const u8, &mut now) {
+            count(stat::V_BYTES, would.len() as u64);
+            let (mut differ, mut meanwhile) = (0u64, 0u64);
+            for ((n, w), b) in now.iter().zip(&would).zip(&before) {
+                if n != w {
+                    // A byte the landing puts, or one the title wrote since
+                    // the first look.
+                    if w != b {
+                        differ += 1;
+                    } else {
+                        meanwhile += 1;
+                    }
+                }
+            }
+            count(stat::V_DIFFER, differ);
+            count(stat::V_MEANWHILE, meanwhile);
+        }
+    }
+}
+
+/// The guards' side of the dry run: a protection call of theirs (`opening`:
+/// to read-write) over blocks `[from, to)`, counted if one would be armed.
+pub(crate) fn guard_would(from: usize, to: usize, opening: bool) {
+    if !VIEW_WOULD_ANY.load(Ordering::Relaxed) || !VIEW_WOULD.any(from, to) {
+        return;
+    }
+    count(if opening { stat::V_GUARD_OPEN } else { stat::V_GUARD_PROTECT }, 1);
+}
+
 /// For the landing line, per frame (diagnostics builds).
 #[cfg(feature = "diagnostics")]
 pub(crate) fn log(frames: f64) {
@@ -1557,6 +1740,31 @@ pub(crate) fn log(frames: f64) {
         classes.join(", "),
         s[stat::LANDINGS_PC],
     );
+    if views_on() {
+        tracing::info!(
+            "landing on touch, view memory dry run (VICTORY_LAND_LAZY_VIEWS=1, nothing trapped) per frame: {:.1} pieces, {:.1} \
+             pages of 4 KiB; through our view {:.0} bytes compared with the eager landing, {:.0} of those it puts differ (must be 0), {:.0} others \
+             changed meanwhile (the title's writes); {:.1} pieces with no view of ours, {:.1} skipped during a remap; 64 KiB pages shown at 1 address {:.1}, at 2 {:.1}, at 3 or more \
+             {:.1}; shown elsewhere than last time {:.1}; under a write guard {:.1}; protection calls arming would take {:.1}, \
+             opening {:.1}; guard calls meeting a block that would be armed: protecting {:.1}, opening {:.1}",
+            s[stat::V_PIECES],
+            s[stat::V_PAGES],
+            s[stat::V_BYTES],
+            s[stat::V_DIFFER],
+            s[stat::V_MEANWHILE],
+            s[stat::V_NO_VIEW],
+            s[stat::V_REMAPPING],
+            s[stat::V_SHOWN],
+            s[stat::V_SHOWN + 1],
+            s[stat::V_SHOWN + 2],
+            s[stat::V_MOVED],
+            s[stat::V_GUARDED],
+            s[stat::V_ARM_CALLS],
+            s[stat::V_OPEN_CALLS],
+            s[stat::V_GUARD_PROTECT],
+            s[stat::V_GUARD_OPEN],
+        );
+    }
     if mode() == Mode::Check {
         tracing::info!(
             "landing on touch, check: at the eager merge {:.0} pieces of armed copies, {:.0} bytes, compared with what a landing \

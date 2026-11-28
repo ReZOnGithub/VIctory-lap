@@ -6640,6 +6640,9 @@ impl Host {
         } else {
             Vec::new()
         };
+        // `VICTORY_LAND_LAZY_VIEWS=1`: the dry run of view memory (nothing
+        // trapped), its books checked against this merge.
+        let view_samples = if lazy == crate::lazy::Mode::Off { Vec::new() } else { crate::lazy::views_before(&pieces, &whys, data) };
         let mut written = 0;
         if land::on() {
             let titles: Vec<(usize, usize)> =
@@ -6684,6 +6687,7 @@ impl Host {
             }
         }
         land::spent(land::stat::CARD, merging);
+        crate::lazy::views_after(view_samples);
         for (i, would) in samples {
             let (shadow, lo, _, _) = &pieces[i];
             let mut title = vec![0u8; would.len()];
