@@ -3809,6 +3809,12 @@ impl HostHeap {
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+        self.mirror_keyed(index, handle, for_draw).map(|(view, _)| view)
+    }
+
+    /// [`HostHeap::mirror`], with the key of the record it read (view index
+    /// and generation): what the view is a function of.
+    pub(crate) fn mirror_keyed(&self, index: u32, handle: u64, for_draw: bool) -> Option<(View, u64)> {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
@@ -3836,7 +3842,7 @@ impl HostHeap {
             && self.quick.get(index as usize).is_some_and(|k| k.load(std::sync::atomic::Ordering::Acquire) == key)
             && let Some(view) = view_at(i, generation)
         {
-            return Some(view);
+            return Some((view, key));
         }
         let held = self.made.lock(index);
         let shown = self.made.get(index).unwrap_or(0);
@@ -3886,7 +3892,7 @@ impl HostHeap {
                     KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     drop(held);
                     self.unmake_stale(index, stale);
-                    return Some(view);
+                    return Some((view, key));
                 }
                 // And of another texture that can stand for it
                 // ([`keep_shown`]): black, then grey for a frame or two is
@@ -3897,7 +3903,7 @@ impl HostHeap {
                     if kept {
                         drop(held);
                         self.unmake_stale(index, stale);
-                        return Some(view);
+                        return Some((view, key));
                     }
                 }
             }
@@ -3917,7 +3923,7 @@ impl HostHeap {
                 if !NEW_PENDING.lock().unwrap_or_else(|e| e.into_inner()).insert(own) {
                     drop(held);
                     self.unmake_stale(index, stale);
-                    return Some(view);
+                    return Some((view, key));
                 }
                 let old = view_at(shown as u32, (shown >> 32) as u32);
                 let kept = old.is_some_and(|old| match kin(&old, &view) {
@@ -3940,7 +3946,7 @@ impl HostHeap {
                 NEW_LATER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 drop(held);
                 self.unmake_stale(index, stale);
-                return Some(view);
+                return Some((view, key));
             }
             #[cfg(feature = "diagnostics")]
             if !self.sampler && is_texture_view(&view) {
@@ -3965,7 +3971,25 @@ impl HostHeap {
             drop(held);
             self.unmake_stale(index, stale);
         }
-        Some(view)
+        Some((view, key))
+    }
+
+    /// What [`HostHeap::mirror`] returns for title slot `index` (its record at
+    /// `handle`) when it returns at once, making and noting nothing: the slot
+    /// is made from that record and stays so. The record's key and its
+    /// view; `None` where `mirror` would go on (it then may make the slot).
+    pub(crate) fn quick_view(&self, index: u32, handle: u64) -> Option<(u64, View)> {
+        if index >= self.count || !quick_mirror() {
+            return None;
+        }
+        // SAFETY: the handle is a descriptor slot in title memory (as in
+        // `mirror`, which reads the same three words).
+        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        let key = u64::from(generation) << 32 | u64::from(i);
+        if tag != VIEW_TAG || !self.quick.get(index as usize).is_some_and(|k| k.load(std::sync::atomic::Ordering::Acquire) == key) {
+            return None;
+        }
+        Some((key, view_at(i, generation)?))
     }
 
     /// Whether slot `index` was made from no record: what [`HostHeap::mirror`]
@@ -4283,6 +4307,106 @@ pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::
     }
     let shadow = crate::shadow::find(address, len)?;
     Some((view_home(shadow, address, len, view_elements(view)?), address, len))
+}
+
+/// What says that [`buffer_copy`] of a view gives the same again, with no
+/// more to do than it did ([`buffer_copy_noted`], [`CopyNote::holds`]).
+pub(crate) struct CopyNote {
+    /// The copy [`crate::shadow::find`] found, where the view's copy is
+    /// another one (of the view's own bytes, `view_home`): looked at without
+    /// a hold on it, which would keep a window from being let go.
+    base: Option<std::sync::Weak<crate::shadow::Shadow>>,
+    /// For a window outside buffers that the ask found: the count of the
+    /// buffers' changes before the ask ([`crate::shadow::buffers_count`]),
+    /// and the ask (address, end), which the window notes again.
+    window: Option<(u64, u64, u64)>,
+}
+
+impl CopyNote {
+    /// Whether [`buffer_copy`] of the view gives `copy` (what it gave when
+    /// the note was made) again now. When it does, the window it would ask
+    /// notes the ask as if it had been made.
+    ///
+    /// The copy found by the view's range is the one [`crate::shadow::find`]
+    /// finds again for the same ask while it is not displaced (and, for a
+    /// window, the buffers did not change). What `view_home` makes of it then
+    /// is the same: the copy's offsets do not change, and a copy of the
+    /// view's own bytes stays in its table while something holds it, as the
+    /// pass does (`copy`, kept by slot).
+    pub(crate) fn holds(&self, copy: &std::sync::Arc<crate::shadow::Shadow>) -> bool {
+        if copy.displaced() {
+            return false;
+        }
+        let upgraded;
+        let base = match &self.base {
+            None => copy,
+            Some(weak) => match weak.upgrade() {
+                Some(base) => {
+                    upgraded = base;
+                    &upgraded
+                }
+                None => return false,
+            },
+        };
+        if base.displaced() {
+            return false;
+        }
+        if let Some((count, from, to)) = self.window {
+            if crate::shadow::buffers_count() != count {
+                return false;
+            }
+            base.asked_again(from, to);
+        }
+        true
+    }
+}
+
+/// [`buffer_copy`], with a note of what makes it give the same again
+/// ([`CopyNote`]); `None` for the note where nothing short of asking again
+/// says that: an ask without a length (the windows' tails), an ask of the
+/// whole buffer that found nothing, or a view that wants a copy of its own
+/// bytes and got none.
+pub(crate) fn buffer_copy_noted(view: &View) -> Option<((std::sync::Arc<crate::shadow::Shadow>, u64, u64), Option<CopyNote>)> {
+    let (address, len) = buffer_range(view)?;
+    if len == 0 {
+        return None;
+    }
+    // (Before the ask: a change of the buffers during it shows.)
+    let count = crate::shadow::buffers_count();
+    let mut sure = true;
+    let mut found = None;
+    if view_extent()
+        && let Some((base, width)) = buffer_extent(view)
+        && address >= base
+        && address - base < width.max(1)
+    {
+        match crate::shadow::find(base, width) {
+            Some(shadow) => found = Some((shadow, base, width)),
+            None => sure = false,
+        }
+    }
+    let (shadow, asked, asked_len) = match found {
+        Some(found) => found,
+        None => (crate::shadow::find(address, len)?, address, len),
+    };
+    let kind = view_elements(view)?;
+    // As `view_home`, saying whether a copy of the view's own bytes was
+    // wanted and none was had.
+    let home = match shadow.offset_in(address).map(|_| shadow.offset(address)) {
+        Some(offset) if wants_exact(offset, kind) => match crate::shadow::exact(address, len) {
+            Some(exact) => exact,
+            None => {
+                sure = false;
+                shadow.clone()
+            }
+        },
+        _ => shadow.clone(),
+    };
+    let note = (sure && asked_len > 1).then(|| CopyNote {
+        base: (!std::sync::Arc::ptr_eq(&home, &shadow)).then(|| std::sync::Arc::downgrade(&shadow)),
+        window: shadow.is_window().then(|| (count, asked, asked.saturating_add(asked_len.max(1)))),
+    });
+    Some(((home, address, len), note))
 }
 
 /// [`buffer_range`] of an unordered access view of memory at `base`.

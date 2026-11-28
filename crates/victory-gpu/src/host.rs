@@ -10147,13 +10147,21 @@ fn split_line(frames: f64) {
         shared[2] * (crate::watch::PAGE >> 10) as f64 / 1024.0,
         shared[3],
     );
+    let n: Vec<f64> = crate::draw::HEAP_NOTED.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
         "the pass over the heap's views per frame: {:.1} ms looking at slots, {:.1} their copies' spans and refreshes, {:.1} textures; the \
-         first two beside the recording (VICTORY_HEAP_PASS_ASIDE), {:.1} ms waited for at the lists' close",
+         first two beside the recording (VICTORY_HEAP_PASS_ASIDE), {:.1} ms waited for at the lists' close; of the slots, {:.0} taken from \
+         what the pass kept of them, {:.0} looked at by the pass itself, {:.0} left to draws' tables (VICTORY_HEAP_PASS_NOTED: {}), check \
+         disagreements {:.0}",
         h[0],
         h[1],
         h[2],
         aside::WAITED.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames,
+        n[0],
+        n[1],
+        n[2],
+        crate::draw::heap_pass_noted_name(),
+        n[3] * frames,
     );
 }
 
