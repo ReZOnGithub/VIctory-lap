@@ -166,10 +166,6 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
-    /// Whether a lookup that found this copy may find another one now: set
-    /// once, never cleared ([`Shadow::displaced`]). For the answers the heap
-    /// buffer pass keeps per slot (`descriptor::host::buffer_copy_noted`).
-    displaced: std::sync::atomic::AtomicBool,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -3536,11 +3532,7 @@ pub(crate) fn let_go_idle() {
                 .collect();
             window_victims(&entries, keep)
         };
-        victims
-            .into_iter()
-            .filter_map(|i| map.remove(&eligible[i].1))
-            .inspect(|s| s.displace())
-            .collect()
+        victims.into_iter().filter_map(|i| map.remove(&eligible[i].1)).collect()
     };
     if !gone.is_empty() {
         let (went, bytes) = (gone.len(), gone.iter().map(|s| s.len).sum::<u64>());
@@ -3713,47 +3705,6 @@ impl Shadow {
             changes_only: Default::default(),
             mapped: false,
             place: None,
-            displaced: std::sync::atomic::AtomicBool::new(false),
-        }
-    }
-
-    /// Whether a lookup that found this copy may find another one now: the
-    /// title buffer it is of went or gave it up, a buffer was made over it,
-    /// or (a window outside buffers, or a copy of a view's own bytes) it left
-    /// its table. A copy not displaced is what [`find`] finds again for the
-    /// same ask, as long as the ask found it in [`BUFFERS`]; for a window,
-    /// also as long as [`buffers_count`] is what it was ([`BUFFERS`] did not
-    /// change, so the ask goes to the windows again).
-    pub(crate) fn displaced(&self) -> bool {
-        self.displaced.load(Ordering::Acquire)
-    }
-
-    /// See [`Shadow::displaced`]. Under the lock of the table it leaves, or
-    /// of [`BUFFERS`] for a buffer made over it.
-    fn displace(&self) {
-        self.displaced.store(true, Ordering::Release);
-    }
-
-    /// Whether this is a window of title memory outside buffers.
-    pub(crate) fn is_window(&self) -> bool {
-        self.window
-    }
-
-    /// What [`loose`] notes of a window it hands out for a sized ask of
-    /// `[address, end)`, for an ask answered without it (the heap buffer
-    /// pass's kept answers): when it was last asked for, which keeps it from
-    /// being let go while slots still read it ([`let_go_idle`]), and the
-    /// lowest and highest address asked.
-    pub(crate) fn asked_again(&self, address: u64, end: u64) {
-        let now = crate::host::moment();
-        if self.used.load(Ordering::Relaxed) != now {
-            self.used.store(now, Ordering::Relaxed);
-        }
-        if self.asked[0].load(Ordering::Relaxed) > address {
-            self.asked[0].fetch_min(address, Ordering::Relaxed);
-        }
-        if self.asked[1].load(Ordering::Relaxed) < end {
-            self.asked[1].fetch_max(end, Ordering::Relaxed);
         }
     }
 
@@ -6022,56 +5973,18 @@ fn buffers_read() -> std::sync::RwLockReadGuard<'static, BTreeMap<(u64, usize), 
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    let mut map = buffers();
-    // An ask of `[address, end)` that found the copy of a buffer `E` in the
-    // map ([`lookup`]: the first from `address` down, among 64, that reaches
-    // `end`) finds another one now only if the new buffer starts between
-    // `E`'s start and `address`, inside `E` then: such an `E` starts in the
-    // new buffer, or is one of the 64 that start below it and reach into
-    // it. Their copies are displaced (under the map's lock, which every
-    // lookup takes). An ask that went to the windows sees the count of
-    // changes the map's lock just made ([`buffers_count`]).
-    let end = start.saturating_add(len.max(1));
-    for (_, entry) in map.range((start, 0)..(end, 0)) {
-        if let Some(shadow) = &entry.shadow {
-            shadow.displace();
-        }
-    }
-    for (_, entry) in map.range(..(start, 0)).rev().take(65) {
-        if entry.end > start
-            && let Some(shadow) = &entry.shadow
-        {
-            shadow.displace();
-        }
-    }
-    let old = map.insert(
+    buffers().insert(
         (start, resource),
         Entry {
             end: start + len,
             shadow: None,
         },
     );
-    if let Some(shadow) = old.and_then(|e| e.shadow) {
-        shadow.displace();
-    }
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    let mut map = buffers();
-    // (An ask that found another buffer finds it still: what lay between
-    // it and the ask is fewer, and none of it reached far enough.)
-    if let Some(shadow) = map.remove(&(start, resource)).and_then(|e| e.shadow) {
-        shadow.displace();
-    }
-}
-
-/// How often [`BUFFERS`] was taken to be changed: a window outside buffers
-/// that an ask found is what the same ask finds again while this stays
-/// what it was before that ask, and the window is not displaced
-/// ([`Shadow::displaced`]).
-pub(crate) fn buffers_count() -> u64 {
-    BUFFERS_CHANGED.load(Ordering::SeqCst)
+    buffers().remove(&(start, resource));
 }
 
 /// The title buffer holding `address`, as (start, length), without making
@@ -6105,14 +6018,14 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
         if loose_cache() && !keys.is_empty() {
             loose_changed();
         }
-        gone.extend(keys.into_iter().filter_map(|key| map.remove(&key)).inspect(|s| s.displace()));
+        gone.extend(keys.into_iter().filter_map(|key| map.remove(&key)));
     }
     {
         // As `lookup` finds a buffer: among the 256 that start below.
         let mut map = buffers();
         for (_, entry) in map.range_mut(..(end, 0)).rev().take(256) {
             if entry.end > at && entry.shadow.as_ref().is_some_and(|s| s.place.is_some()) {
-                gone.extend(entry.shadow.take().inspect(|s| s.displace()));
+                gone.extend(entry.shadow.take());
             }
         }
     }
@@ -6836,7 +6749,7 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
                 })
                 .map(|(k, _)| *k)
                 .collect();
-            let gone: Vec<_> = idle.iter().filter_map(|k| map.remove(k)).inspect(|(s, _)| s.displace()).collect();
+            let gone: Vec<_> = idle.iter().filter_map(|k| map.remove(k)).collect();
             PRUNE_AT.store((map.len() * 2).max(MANY), Ordering::Relaxed);
             drop(guard);
             // Their buffers are kept for the next views ([`EXACT_POOL`]):

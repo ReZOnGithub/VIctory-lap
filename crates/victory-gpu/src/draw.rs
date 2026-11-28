@@ -669,74 +669,6 @@ pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "diagnostics")]
 pub(crate) static HEAP_SPLIT: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
-/// Of the slots of the passes, since the last frame line: those whose copy
-/// and range were taken from what the pass kept of them ([`heap_pass_noted`]),
-/// those it looked at itself, those left to draws' tables; and the slots
-/// where the two ways disagreed (`VICTORY_HEAP_PASS_NOTED=check`).
-pub(crate) static HEAP_NOTED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
-
-/// How the heap buffer pass answers a slot written since the last pass.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Noted {
-    /// Each by `mirror` and `buffer_copy`, as before.
-    Off,
-    /// From what it kept of the slot, where that says it is what those
-    /// would give ([`SlotNote`]).
-    On,
-    /// Both, counting where they differ; the first one's answer is used.
-    Check,
-}
-
-/// Whether the heap buffer pass takes a slot's copy and range from what it
-/// kept of the slot, where nothing it depends on changed since
-/// (`VICTORY_HEAP_PASS_NOTED=1`; `=check`: both ways, the old one's answer
-/// used, slots where they differ counted; off by default).
-///
-/// Every slot the pass makes, its own `mirror` notes as written (the slot's
-/// stride and kind change there), and the next pass looked at it again:
-/// `mirror` found it made and gave the view back, and `buffer_copy` found
-/// the same copy by the same ask. Of the 14.3 ms a frame "looking at slots"
-/// (run e1, the boat, 25,000 to 40,000 slots a pass), those second looks are
-/// a part; the records the title copies in itself reach the pass as views
-/// nobody made (the sync of the records leaves a buffer view's slot for a
-/// draw or this pass: `HostHeap::mirror` with `for_draw` off), so the pass
-/// makes them, and no one else had their copy in hand.
-///
-/// A kept answer is used only where `mirror` would return at once with
-/// the same record (`HostHeap::quick_view`), and the copy and the copy its
-/// view's range found are not displaced (`crate::shadow::Shadow::displaced`;
-/// a window outside buffers: and the title's buffers did not change since,
-/// `crate::shadow::buffers_count`). The slots of this pass's sixteenth are
-/// looked at as before.
-fn heap_pass_noted() -> Noted {
-    static MODE: std::sync::OnceLock<Noted> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var("VICTORY_HEAP_PASS_NOTED").as_deref() {
-        Ok("1") => Noted::On,
-        Ok("check") => Noted::Check,
-        _ => Noted::Off,
-    })
-}
-
-/// [`heap_pass_noted`] as the frame line says it.
-#[cfg(feature = "diagnostics")]
-pub(crate) fn heap_pass_noted_name() -> &'static str {
-    match heap_pass_noted() {
-        Noted::Off => "off",
-        Noted::On => "on",
-        Noted::Check => "check",
-    }
-}
-
-/// What the heap buffer pass kept of a slot beside its copy and range
-/// ([`heap_pass_noted`]): the record (view index and generation) the view
-/// was of, whether it is an unordered view, and what says the copy is
-/// still the one its view's range finds.
-struct SlotNote {
-    key: u64,
-    written: bool,
-    copy: crate::descriptor::host::CopyNote,
-}
-
 /// Passes after which every buffer slot of the heap was looked at again.
 const HEAP_ROUND: u64 = 16;
 
@@ -788,17 +720,13 @@ fn sweep_per_heap() -> bool {
 pub(crate) struct BufferSweep {
     passes: u64,
     ranges: HeapRanges<std::sync::Arc<crate::shadow::Shadow>>,
-    /// By slot, beside `ranges`: what says the slot's range there is still
-    /// what a look would find ([`heap_pass_noted`]). Set wherever `ranges`
-    /// is by a look; good only while `ranges` has the slot.
-    notes: Vec<Option<SlotNote>>,
     // Last refresh frame and covered interval for throttled, unwatched copies.
     unwatched: std::collections::HashMap<u64, (u64, u64, u64)>,
 }
 
 impl Default for BufferSweep {
     fn default() -> Self {
-        Self { passes: 0, ranges: HeapRanges::default(), notes: Vec::new(), unwatched: Default::default() }
+        Self { passes: 0, ranges: HeapRanges::default(), unwatched: Default::default() }
     }
 }
 
@@ -1088,7 +1016,7 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     // released resource goes stale without a write, and a slot written
     // before its memory had a host copy is only made then.
     let mut kept = host.buffer_sweep.lock().unwrap_or_else(|e| e.into_inner());
-    let BufferSweep { passes, ranges, notes, unwatched } = &mut *kept;
+    let BufferSweep { passes, ranges, unwatched } = &mut *kept;
     let changed = host.buffer_changes();
     let all = *passes == 0 || (*passes % HEAP_ROUND == 0 && !heap_spread());
     let slots = if all {
@@ -1121,87 +1049,23 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         }
     }
     let heap = Shared(heap);
-    let mode = heap_pass_noted();
-    type Range = (std::sync::Arc<crate::shadow::Shadow>, u64, u64);
-    // What a slot of the title's shows, looked at: its copy and range, and
-    // whether it is an unordered view; with what says it holds while
-    // nothing it depends on changes (when kept: [`heap_pass_noted`]).
-    let look_at = |index: u32, handle: u64| -> (Option<(Range, bool)>, Option<SlotNote>) {
-        let Some((view, key)) = host.mirror_keyed(index, handle, true) else {
-            return (None, None);
-        };
+    // What a slot of the title's shows: its copy and range, and whether it is
+    // an unordered view.
+    let look = |index: u32| {
+        // A draw's table's: the draw brings what it reads up to date.
+        if host.copied_tabled(index, frame) {
+            return None;
+        }
+        let view = host.mirror(index, heap.handle(index)?, true)?;
         // The copy the slot shows (`buffer_copy`), not the one the
         // view's range alone would find.
-        let (range, note) = if mode == Noted::Off {
-            (crate::descriptor::host::buffer_copy(&view), None)
-        } else {
-            match crate::descriptor::host::buffer_copy_noted(&view) {
-                Some((range, note)) => (Some(range), note),
-                None => (None, None),
-            }
-        };
-        let Some((shadow, address, len)) = range else {
-            return (None, None);
-        };
+        let (shadow, address, len) = crate::descriptor::host::buffer_copy(&view)?;
         #[cfg(feature = "diagnostics")]
         if host.shows(index, &shadow.buffer) == Some(false) {
             HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
         }
         let written = crate::picked::on() && view_kind(&view) == Some(ResourceType::Uav);
-        let note = note.map(|copy| SlotNote { key, written, copy });
-        (Some(((shadow, address, address + len), written)), note)
-    };
-    /// What became of a slot: left to a draw's table, taken from what was
-    /// kept of it (which stays), or looked at (what is kept of it is that).
-    enum Looked {
-        Tabled,
-        Kept(Range, bool),
-        Seen(Option<(Range, bool)>, Option<SlotNote>),
-    }
-    // (Read beside one another; written below, once all have looked.)
-    let (kept_ranges, kept_notes) = (&*ranges, &*notes);
-    let disagreed = std::sync::atomic::AtomicU64::new(0);
-    let look = |index: u32| {
-        // A draw's table's: the draw brings what it reads up to date.
-        if host.copied_tabled(index, frame) {
-            return Looked::Tabled;
-        }
-        let Some(handle) = heap.handle(index) else {
-            return Looked::Seen(None, None);
-        };
-        // What was kept of the slot, if `mirror` would give back the view it
-        // was made from at once, and the copy is the one its range finds.
-        // (A slot of this pass's sixteenth was forgotten in `ranges`.)
-        if mode != Noted::Off
-            && let Some(Some(note)) = kept_notes.get(index as usize)
-            && let Some(Some(range)) = kept_ranges.0.get(index as usize)
-            && let Some((key, _)) = host.quick_view(index, handle)
-            && key == note.key
-            && note.copy.holds(&range.0)
-        {
-            if mode == Noted::On {
-                return Looked::Kept(range.clone(), note.written);
-            }
-            let (seen, fresh) = look_at(index, handle);
-            let same = seen.as_ref().is_some_and(|((copy, from, to), written)| {
-                std::sync::Arc::ptr_eq(copy, &range.0) && (*from, *to, *written) == (range.1, range.2, note.written)
-            });
-            if !same {
-                disagreed.fetch_add(1, Ordering::Relaxed);
-                static SAID: AtomicU64 = AtomicU64::new(0);
-                if SAID.fetch_add(1, Ordering::Relaxed) < 16 {
-                    tracing::warn!(
-                        index,
-                        kept = format_args!("{:#x}..{:#x} of copy {}", range.1, range.2, range.0.id()),
-                        seen = ?seen.as_ref().map(|((copy, from, to), _)| format!("{from:#x}..{to:#x} of copy {}", copy.id())),
-                        "VICTORY_HEAP_PASS_NOTED=check: a slot's kept copy and range are not what a look finds"
-                    );
-                }
-            }
-            return Looked::Seen(seen, fresh);
-        }
-        let (seen, fresh) = look_at(index, handle);
-        Looked::Seen(seen, fresh)
+        Some(((shadow, address, address + len), written))
     };
     // Some slots at a time, on several threads.
     const AT_A_TIME: usize = 256;
@@ -1224,46 +1088,14 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         }
         let _ = found[n].set(looked);
     });
-    let disagree = disagreed.into_inner();
-    let mut counts = [0u64; 3];
-    for (index, looked) in found.into_iter().filter_map(std::sync::OnceLock::into_inner).flatten() {
-        let (shows, note) = match looked {
-            Looked::Tabled => {
-                counts[2] += 1;
-                (None, None)
-            }
-            Looked::Kept(range, written) => {
-                // As it was, in `ranges` and in `notes`.
-                counts[0] += 1;
-                if written {
-                    unordered.push(range);
-                }
-                continue;
-            }
-            Looked::Seen(shows, note) => {
-                counts[1] += 1;
-                (shows, note)
-            }
-        };
+    for (index, shows) in found.into_iter().filter_map(std::sync::OnceLock::into_inner).flatten() {
         let range = shows.map(|(range, written)| {
             if written {
                 unordered.push(range.clone());
             }
             range
         });
-        if mode != Noted::Off {
-            let at = index as usize;
-            if note.is_some() && notes.len() <= at {
-                notes.resize_with(at + 1, || None);
-            }
-            if let Some(kept) = notes.get_mut(at) {
-                *kept = note.filter(|_| range.is_some());
-            }
-        }
         ranges.set(index, range);
-    }
-    for (sum, n) in HEAP_NOTED.iter().zip([counts[0], counts[1], counts[2], disagree]) {
-        sum.fetch_add(n, Ordering::Relaxed);
     }
     if crate::picked::on() {
         crate::picked::shown(unordered, all);
