@@ -1259,14 +1259,19 @@ impl Staging {
     fn refresh_timed(&self) -> usize {
         let size = self.read;
         let start = self.memory as usize;
+        // `VICTORY_LAND_LAZY`: what shaders wrote into the texture's memory
+        // and is armed to land on touch lands now; the journal has no word
+        // of it yet (the eager landing's write had), so the texture is read
+        // whatever the journal says. One load with nothing armed.
+        let lazy_due = crate::lazy::reader(start, start + size, crate::lazy::For::Texture);
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
         let last = &mut *last;
         let alone = self.once.load(std::sync::atomic::Ordering::Relaxed);
-        if alone && last.hash.is_some() {
+        if alone && last.hash.is_some() && !lazy_due {
             return 0;
         }
         if !alone && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
-            if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
+            if !lazy_due && last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return 0;
             }
             last.asked = now;
@@ -1303,7 +1308,7 @@ impl Staging {
             static HASH_EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
             let hash_every = *HASH_EVERY
                 .get_or_init(|| std::env::var("VICTORY_TEXTURE_HASH_EVERY").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(8));
-            let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
+            let unwritten = !lazy_due && last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
             let frame = crate::frame::current();
             let turn = hash_every != 0

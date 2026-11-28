@@ -522,7 +522,11 @@ impl Memory {
                 .as_ref()
                 .map(|(_, w)| w.binary_search_by_key(&(page as usize), |w| w.0).map_or(0, |i| w[i].1));
             let now = answer.as_ref().map_or(1, |a| a.0);
-            let stale = held.taken == 0 || wrote.is_none_or(|w| w > held.taken);
+            // (`VICTORY_LAND_LAZY`: what is armed there lands now, and the
+            // page is taken whatever the journal says, which has no word of
+            // it yet.)
+            let lazy_due = crate::lazy::reader((page * PAGE) as usize, ((page + 1) * PAGE) as usize, crate::lazy::For::Arena);
+            let stale = lazy_due || held.taken == 0 || wrote.is_none_or(|w| w > held.taken);
             if !stale {
                 continue;
             }

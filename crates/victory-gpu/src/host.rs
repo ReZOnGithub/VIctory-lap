@@ -6429,9 +6429,11 @@ impl Host {
                     self.lazy_land(&first, false);
                 }
                 let failed = crate::lazy::arm(std::mem::take(&mut arms));
-                let extra = if demoted.is_empty() && failed.is_empty() { 0 } else { crate::lazy::beside_bit() };
+                let extra = crate::lazy::why_bits(
+                    &failed.iter().map(|f| f.3).chain((!demoted.is_empty()).then_some(crate::lazy::Why::Beside)).collect::<Vec<_>>(),
+                );
                 pieces.extend(demoted.into_iter().map(|(s, lo, hi, _)| (s, lo, hi, 0)));
-                pieces.extend(failed.into_iter().map(|(s, lo, hi)| (s, lo, hi, 0)));
+                pieces.extend(failed.into_iter().map(|(s, lo, hi, _)| (s, lo, hi, 0)));
                 crate::lazy::landing_fetched(&pieces, &whys, extra);
                 total = 0;
                 for piece in &mut pieces {
@@ -6443,9 +6445,9 @@ impl Host {
                 // What the landing below writes is no-access since an
                 // earlier landing: opened first, not compared (it is about
                 // to be written).
-                let first: Vec<usize> = pieces
+                let first: Vec<crate::lazy::Key> = pieces
                     .iter()
-                    .flat_map(|(s, lo, hi, _)| crate::lazy::blocks_over(s.span().0 as usize + lo, s.span().0 as usize + hi))
+                    .flat_map(|(s, lo, hi, _)| crate::lazy::keys_over(s.span().0 as usize + lo, s.span().0 as usize + hi))
                     .collect();
                 if !first.is_empty() {
                     self.lazy_land(&first, false);
@@ -6714,7 +6716,7 @@ impl Host {
     /// memory. A flight still in the air that writes a block is not waited
     /// for (as the eager fetch, this may bring some of its bytes; its own
     /// landing arms the block again).
-    pub(crate) fn lazy_land(&self, blocks: &[usize], compare: bool) {
+    pub(crate) fn lazy_land(&self, blocks: &[crate::lazy::Key], compare: bool) {
         use crate::lazy;
         if lazy::serving(true) {
             // (Within one: left to it.)
@@ -6870,8 +6872,8 @@ impl Host {
                 // `VICTORY_LAND_LAZY`: what they write that is armed lands
                 // first (the merge writes title memory at its address).
                 if crate::lazy::any() {
-                    let blocks: Vec<usize> =
-                        back.iter().flat_map(|(_, r)| r.iter().flat_map(|&(a, e)| crate::lazy::blocks_over(a, e))).collect();
+                    let blocks: Vec<crate::lazy::Key> =
+                        back.iter().flat_map(|(_, r)| r.iter().flat_map(|&(a, e)| crate::lazy::keys_over(a, e))).collect();
                     if !blocks.is_empty() {
                         crate::lazy::for_us(crate::lazy::For::Relay, blocks.len() as u64);
                         self.lazy_land(&blocks, false);
@@ -6913,8 +6915,8 @@ impl Host {
                     // `VICTORY_LAND_LAZY`: texture read-backs write title
                     // memory; what is armed there lands first.
                     if crate::lazy::any() {
-                        let blocks: Vec<usize> =
-                            flight.texture_back_ranges.iter().flat_map(|&(a, e)| crate::lazy::blocks_over(a, e)).collect();
+                        let blocks: Vec<crate::lazy::Key> =
+                            flight.texture_back_ranges.iter().flat_map(|&(a, e)| crate::lazy::keys_over(a, e)).collect();
                         if !blocks.is_empty() {
                             crate::lazy::for_us(crate::lazy::For::Relay, blocks.len() as u64);
                             self.lazy_land(&blocks, false);

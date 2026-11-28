@@ -4345,15 +4345,45 @@ impl Shadow {
                 note_stale(3);
                 return true;
             }
-            // `VICTORY_LAND_LAZY`: a page to compare that is no-access (the
-            // title wrote it before what shaders wrote there was armed)
-            // would fault on the threads below, which the relay, waiting for
-            // this lock, cannot serve. The flights are settled, and the
-            // refresh after that lands it first (`crate::lazy::before_refresh`).
-            // Looked at under the lock: arming takes it shared.
-            if crate::lazy::any() && pieces.iter().any(|&(_, lo, hi)| crate::lazy::trapped_over(lo, hi)) {
-                note_stale(4);
-                return true;
+            // `VICTORY_LAND_LAZY`: a page to compare that is no-access would
+            // fault on the threads below, which the relay, waiting for this
+            // lock, cannot serve. One of this copy's own holds nothing the
+            // copy lacks (armed only so, `crate::lazy::arm`; the journal's
+            // mark is our landing's write or from before the copy took it):
+            // left out, looked at again next time. One of another copy's:
+            // the flights are settled, and the refresh after that lands it
+            // first. Looked at under the lock: arming takes it shared.
+            if crate::lazy::any() {
+                let mut other = false;
+                let mut kept = Vec::with_capacity(pieces.len());
+                for &(i, lo, hi) in &pieces {
+                    let (own, others) = crate::lazy::trapped_whose(self, lo, hi);
+                    other |= others;
+                    if !own {
+                        kept.push((i, lo, hi));
+                        continue;
+                    }
+                    // By 4 KiB: the parts not armed are compared as ever; an
+                    // empty piece stands for the rest, so that the page is
+                    // not noted taken and is looked at again next time.
+                    let mut at = lo;
+                    while at < hi {
+                        let next = ((at / KERNEL_PAGE + 1) * KERNEL_PAGE).min(hi);
+                        if !crate::lazy::trapped_whose(self, at, next).0 {
+                            match kept.last_mut() {
+                                Some(last) if last.0 == i && last.2 == at => last.2 = next,
+                                _ => kept.push((i, at, next)),
+                            }
+                        }
+                        at = next;
+                    }
+                    kept.push((i, hi, hi));
+                }
+                pieces = kept;
+                if other {
+                    note_stale(4);
+                    return true;
+                }
             }
             let t = under_ns(2, t);
             // A piece of a page in the range, compared and put in: the runs
@@ -5494,7 +5524,7 @@ impl Shadow {
     /// copy (one `VirtualQuery`, and a look through the copies).
     pub(crate) fn lazy_fit(&self, big_enough: bool) -> (Result<(), crate::lazy::Why>, u8) {
         use crate::lazy::Why;
-        if self.card.is_none() || self.window || self.mapped || self.place.is_some() {
+        if self.card.is_none() || self.mapped || self.place.is_some() || self.window && !crate::lazy::windows_on() {
             return (Err(Why::Kind), 0);
         }
         if !big_enough {
@@ -5513,6 +5543,33 @@ impl Shadow {
             return (Err(Why::Shared), kinds);
         }
         (Ok(()), kinds)
+    }
+
+    /// `VICTORY_LAND_LAZY`, arming, the pages `[from, to)` (title addresses)
+    /// read-only by now: whether title memory there, as far as this copy
+    /// holds it, is what the copy's CPU side holds, so that the copy has
+    /// nothing to take from those pages while they are armed. A page that
+    /// cannot be read is not.
+    pub(crate) fn lazy_clean(&self, from: usize, to: usize) -> bool {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (from.max(start), to.min(end));
+        if from >= to {
+            return true;
+        }
+        thread_local! {
+            static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        TITLE.with_borrow_mut(|title| {
+            title.resize(to - from, 0);
+            if !crate::host::read_into(from as *const u8, title) {
+                return false;
+            }
+            // SAFETY: inside the CPU side's mapping (`[from, to)` is inside
+            // the buffer); what writes it meanwhile writes title bytes,
+            // which are these.
+            let held = unsafe { std::slice::from_raw_parts(self.data.add(from - start).cast_const(), to - from) };
+            held == &title[..]
+        })
     }
 
     /// The kinds of other copies that hold title memory of `[first, last)`:

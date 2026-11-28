@@ -4273,23 +4273,6 @@ fn came_back(at: usize, write: bool) -> bool {
     false
 }
 
-/// Whether `at` is in a committed private page that allows the access now
-/// (`write`, or a read), for a fault at a page [`crate::lazy`] had armed and
-/// has opened since.
-fn lazy_opened(at: usize, write: bool) -> bool {
-    use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, PAGE_READONLY, PAGE_READWRITE, VirtualQuery,
-    };
-    // SAFETY: plain data filled in by the query.
-    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-    // SAFETY: a valid out pointer of the right size.
-    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
-    n != 0
-        && info.State == MEM_COMMIT
-        && info.Type == MEM_PRIVATE
-        && (info.Protect == PAGE_READWRITE || (!write && info.Protect == PAGE_READONLY))
-}
-
 /// Whether `at` is in a committed page of a view that can be read.
 fn readable_view(at: usize) -> bool {
     use windows_sys::Win32::System::Memory::{
@@ -4541,9 +4524,17 @@ pub(crate) fn install() {
         };
         // `VICTORY_LAND_LAZY`: a page made no-access until what shaders
         // wrote there lands, read or written (by the title, or a copy of
-        // ours): landed, and the access goes again. Nothing is armed, and
-        // this is one load, with the switch off.
-        if r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION as NTSTATUS && r.NumberParameters >= 2 && crate::lazy::any() {
+        // ours): landed, and the access goes again; or one landed between
+        // the fault and this look, that allows the access now (run z3 ended
+        // on such a write of the title's, passed on as unhandled), which goes
+        // again too (`crate::lazy::touched`). Only at blocks ever armed: a
+        // page asked about at every fault (1bab9780) put a `VirtualQuery`
+        // in front of each guard fault of the title's. With the switch off
+        // this is one load.
+        if r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION as NTSTATUS
+            && r.NumberParameters >= 2
+            && crate::lazy::fault_seen(r.ExceptionInformation[1])
+        {
             match crate::lazy::touched(r.ExceptionInformation[1], r.ExceptionInformation[0] == WRITE, ours.is_some()) {
                 crate::lazy::Touch::Again => return EXCEPTION_CONTINUE_EXECUTION,
                 crate::lazy::Touch::Fail => {
@@ -4553,21 +4544,6 @@ pub(crate) fn install() {
                 }
                 crate::lazy::Touch::Not => {}
             }
-        }
-        // A page of ours that was no-access when the access was made and is
-        // open by now: the relay landed it for another thread (or for a
-        // reader of ours) between the fault and this look, and nothing is
-        // armed there any more. The access goes again. Run z3 ended on such
-        // a write of the title's: "no access" at the fault, "read-write" at
-        // the look, passed on as unhandled. (A page that allows the access
-        // cannot fault again for it, so this cannot loop.)
-        if crate::lazy::on()
-            && r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION as NTSTATUS
-            && r.NumberParameters >= 2
-            && ours.is_none()
-            && lazy_opened(r.ExceptionInformation[1], r.ExceptionInformation[0] == WRITE)
-        {
-            return EXCEPTION_CONTINUE_EXECUTION;
         }
         if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS
             || r.NumberParameters < 2
