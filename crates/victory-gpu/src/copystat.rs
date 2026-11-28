@@ -995,6 +995,13 @@ fn log_memory() {
         view_misses,
         view_wrong
     );
+    let [within_hits, within_none, within_wrong] = crate::shadow::within_counts();
+    tracing::info!(
+        "memory, buffers asked for: by the buffer an ask lies in (VICTORY_FIND_WITHIN) {} answers given, {} asks it had none for since the start; {} that were not the map's (=check; must be 0)",
+        within_hits,
+        within_none,
+        within_wrong
+    );
     let [loose_hits, loose_refused] = crate::shadow::loose_cache_counts();
     tracing::info!(
         "memory, windows outside buffers asked for: per-thread cache (VICTORY_LOOSE_CACHE=1) {} answers given, {} refused (window let go or windows changed) since the start",

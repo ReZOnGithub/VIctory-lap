@@ -5967,6 +5967,140 @@ fn remember(address: u64, len: u64, changed: u64, shadow: &Arc<Shadow>) {
     });
 }
 
+/// How [`lookup`] uses what a thread remembers of the buffers its asks lay in
+/// ([`WITHIN`]).
+#[derive(Clone, Copy, PartialEq)]
+enum Within {
+    Off,
+    On,
+    /// The map answers; what [`WITHIN`] would have said is compared with it.
+    Check,
+}
+
+/// An ask that lies in a buffer the thread was answered with before is
+/// answered from that, without the map (`VICTORY_FIND_WITHIN=0`: not; on by
+/// default; `=check`: the map answers, and the answers that differ are
+/// counted: none of some 160 million asks in run f1).
+///
+/// [`FOUND`] knows an ask only by its exact address and bytes. The buffer
+/// views of the title's draws name other addresses every frame, inside the
+/// same few buffers: in profile p6 the map's lock and its nodes were 6.8 ms a
+/// frame of the translating threads, and the look in [`FOUND`] before it 6.5.
+/// With it two thirds of the asks that [`FOUND`] does not know are answered
+/// so, and [`lookup`] with what it calls takes 17.0 ms a frame for 19.7
+/// (profile p7).
+fn find_within() -> Within {
+    static MODE: std::sync::OnceLock<Within> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var_os("VICTORY_FIND_WITHIN") {
+        Some(v) if v == "0" => Within::Off,
+        Some(v) if v == "check" => Within::Check,
+        _ => Within::On,
+    })
+}
+
+/// An answer of the map's, with what makes it the map's answer for other asks
+/// too. The map's answer for an ask of bytes `[a, e)` is the first entry,
+/// going down from the last that starts at or before `a`, whose end is `e` or
+/// more. For the entry found for one ask:
+///
+/// - `start`: where the entry starts. It is among those looked at for every
+///   `a` at or past it.
+/// - `next`: where the first entry starts that starts past that ask's
+///   address (none: the end of all addresses). For an `a` below it, the
+///   entries looked at before this one are among those that were looked at
+///   before it then.
+/// - `skipped`: the highest end among those (0: none). All of them are
+///   passed over again for every `e` above it.
+/// - `end`: the entry's end. It is taken for every `e` up to it.
+///
+/// So for `start <= a < next` and `skipped < e <= end` the map gives this
+/// entry, while the map is as it was (`changed`, the count of
+/// [`BUFFERS_CHANGED`] then). At most as many entries are passed over as
+/// then, fewer than the 64 the look stops at.
+struct WithinFound {
+    start: u64,
+    next: u64,
+    skipped: u64,
+    end: u64,
+    changed: u64,
+    shadow: std::sync::Weak<Shadow>,
+}
+
+/// The answers a thread remembers so ([`find_within`]), one for each 64 KiB
+/// page of title memory an ask began in, by a hash of the page. (A list of
+/// the last eight answered a third of the asks, run f1: the title's views
+/// lie in thousands of buffers.)
+const WITHIN_MOST: usize = 4096;
+
+/// Where [`WITHIN`] keeps the answer for asks that begin in `address`'s page.
+fn within_at(address: u64) -> usize {
+    ((address >> 16).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 52) as usize % WITHIN_MOST
+}
+
+thread_local! {
+    /// The buffers [`lookup`] last answered this thread with out of
+    /// [`BUFFERS`], by the page the ask began in ([`WithinFound`],
+    /// [`within_at`]).
+    static WITHIN: std::cell::RefCell<Vec<Option<WithinFound>>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Answers given, asks not answered and (with `=check`) answers that were
+    /// not the map's, on this thread, not yet added to [`WITHIN_COUNTS`].
+    static WITHIN_LOCAL: std::cell::Cell<[u32; 3]> = const { std::cell::Cell::new([0; 3]) };
+}
+
+/// [`WITHIN`]'s answers given, asks it had no answer for, and answers that
+/// were not the map's (`VICTORY_FIND_WITHIN=check`; must be 0), since the
+/// start.
+static WITHIN_COUNTS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// See [`WITHIN_COUNTS`].
+#[cfg(feature = "diagnostics")]
+pub(crate) fn within_counts() -> [u64; 3] {
+    WITHIN_COUNTS.each_ref().map(|c| c.load(Ordering::Relaxed))
+}
+
+/// Counts for [`WITHIN_COUNTS`], added in batches (no shared line per ask).
+fn within_count(which: usize) {
+    WITHIN_LOCAL.with(|local| {
+        let mut counts = local.get();
+        counts[which] += 1;
+        if counts.iter().sum::<u32>() >= 1024 || which == 2 {
+            for (sum, n) in WITHIN_COUNTS.iter().zip(counts) {
+                sum.fetch_add(u64::from(n), Ordering::Relaxed);
+            }
+            counts = [0; 3];
+        }
+        local.set(counts);
+    });
+}
+
+/// What this thread remembers for an ask of the bytes from `address` to
+/// `end`, if the map is as it was ([`WithinFound`]).
+fn within(address: u64, end: u64) -> Option<Arc<Shadow>> {
+    let changed = BUFFERS_CHANGED.load(Ordering::SeqCst);
+    let shadow = WITHIN.with(|w| {
+        let w = w.borrow();
+        w.get(within_at(address))?
+            .as_ref()
+            .filter(|f| f.changed == changed && f.start <= address && address < f.next && f.skipped < end && end <= f.end)
+            .and_then(|f| f.shadow.upgrade())
+    })?;
+    // (As [`found`]: a copy let go meanwhile is not handed out.)
+    std::sync::atomic::fence(Ordering::SeqCst);
+    (BUFFERS_CHANGED.load(Ordering::SeqCst) == changed).then_some(shadow)
+}
+
+/// Remembers an answer of the map's to an ask that began at `address`, for
+/// [`within`].
+fn remember_within(address: u64, found: WithinFound) {
+    WITHIN.with(|w| {
+        let mut w = w.borrow_mut();
+        if w.is_empty() {
+            w.resize_with(WITHIN_MOST, || None);
+        }
+        w[within_at(address)] = Some(found);
+    });
+}
+
 fn buffers_read() -> std::sync::RwLockReadGuard<'static, BTreeMap<(u64, usize), Entry>> {
     BUFFERS.read().unwrap_or_else(|e| e.into_inner())
 }
@@ -6106,20 +6240,77 @@ pub(crate) fn peek(address: u64, len: u64) -> Option<Arc<Shadow>> {
 }
 
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
+    let within_mode = find_within();
+    // (`=check`: what it would have said, for the map's answer below.)
+    let said = match within_mode {
+        Within::Check => address.checked_add(len.max(1)).and_then(|end| within(address, end)),
+        _ => None,
+    };
+    let checked = |shadow: &Arc<Shadow>| {
+        if let Some(said) = &said
+            && !Arc::ptr_eq(said, shadow)
+        {
+            within_count(2);
+            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !SAID.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    address = format_args!("{address:#x}"),
+                    len,
+                    said = said.id,
+                    map = shadow.id,
+                    "VICTORY_FIND_WITHIN=check: the buffer an ask lay in before is not the map's answer for it"
+                );
+            }
+        }
+    };
     let quick = quick_find();
     if quick && let Some(shadow) = found(address, len) {
+        checked(&shadow);
         return Some(shadow);
     }
     let end = address.checked_add(len.max(1))?;
+    if within_mode == Within::On {
+        if let Some(shadow) = within(address, end) {
+            within_count(0);
+            return Some(shadow);
+        }
+        within_count(1);
+    } else if within_mode == Within::Check {
+        within_count(usize::from(said.is_none()));
+    }
     {
         let map = buffers_read();
-        match map.range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end) {
+        // The first entry, going down, whose end is the ask's or more; and
+        // the highest end among those passed over on the way ([`WithinFound`]).
+        let mut skipped = 0u64;
+        let hit = map.range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| {
+            let takes = e.end >= end;
+            if !takes {
+                skipped = skipped.max(e.end);
+            }
+            takes
+        });
+        match hit {
             // The copy is made already (nearly always).
-            Some((_, Entry { shadow: Some(shadow), .. })) => {
+            Some((key, Entry { shadow: Some(shadow), end: entry_end })) => {
+                // (Nobody changes the map while this lock is held.)
+                let changed = BUFFERS_CHANGED.load(Ordering::SeqCst);
                 if quick {
-                    // (Nobody changes the map while this lock is held.)
-                    remember(address, len, BUFFERS_CHANGED.load(Ordering::SeqCst), shadow);
+                    remember(address, len, changed, shadow);
                 }
+                if within_mode != Within::Off {
+                    use std::ops::Bound::{Excluded, Unbounded};
+                    let next = map.range((Excluded((address, usize::MAX)), Unbounded)).next().map_or(u64::MAX, |(k, _)| k.0);
+                    remember_within(address, WithinFound {
+                        start: key.0,
+                        next,
+                        skipped,
+                        end: *entry_end,
+                        changed,
+                        shadow: Arc::downgrade(shadow),
+                    });
+                }
+                checked(shadow);
                 return Some(shadow.clone());
             }
             Some(_) => {}
