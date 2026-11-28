@@ -4522,7 +4522,8 @@ fn summary_mismatch(which: usize, what: &str) {
 /// and the fence signals behind its flights, in their order, each after the
 /// read-backs of the flights before it) before it tidies what is only ours
 /// of those flights: the plans' lists and memory given back, the tables'
-/// slots (`VICTORY_TELL_FIRST=0` turns it off; on by default).
+/// slots (`VICTORY_TELL_FIRST=1`; off by default: measured slower, 19.7 and
+/// 20.5 fps with it against 21.3 and 21.6 without, runs t3, t5 and t4, t6).
 ///
 /// The title's processor waits for these values some twenty times a frame
 /// and writes the next value a queue of its own waits for, so what stands
@@ -4534,7 +4535,7 @@ fn summary_mismatch(which: usize, what: &str) {
 /// flight still in the air.
 fn tell_first() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TELL_FIRST").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TELL_FIRST").is_some_and(|v| v == "1"))
 }
 
 /// Whether a bottom-of-pipe write of `list` meets `wait`.
