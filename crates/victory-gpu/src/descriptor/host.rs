@@ -204,6 +204,10 @@ pub(crate) struct HostHeap {
     /// 45), under the lock all of them need. (A free run that lies across
     /// the place the search starts from is seen by neither.)
     too_long: std::sync::atomic::AtomicU32,
+    /// This heap among all made: what a thread's chunk of dynamic slots is
+    /// known by ([`DYN_LOCAL`]), so that one of a heap that is gone is never
+    /// taken for one of a heap made since at the same address.
+    serial: usize,
     /// View heaps: the bytes per element of the buffer view at each title
     /// slot, for shaders that pick a buffer by an index they compute
     /// (`victory_shader::emit::SLOT_STRIDES`): an upload buffer of
@@ -1904,6 +1908,7 @@ impl HostHeap {
             next: Mutex::new((0, Taken::new(extra as usize))),
             free: std::sync::atomic::AtomicU32::new(extra),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
+            serial: HEAP_SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             strides,
             buffers: Slots::new(count as usize),
             changed: Slots::new(count as usize),
@@ -2007,17 +2012,102 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     unsafe { host.device.CreateSampler(&desc, at) };
 }
 
+/// Whether a thread takes the dynamic slots of small tables out of a chunk
+/// of [`DYN_CHUNK`] it took for itself (`VICTORY_DYN_CHUNKS=0`: every table
+/// searched for under the slots' lock, as before; on by default).
+///
+/// Every table made afresh searched the slots' bitmap from a cursor, slot by
+/// slot, under one lock for all threads: 9,646 tables a frame and 14.9 ms a
+/// frame of the translating threads in it at the boat, with none refused
+/// (run b1). A chunk is taken by the same search, once for some 200 tables;
+/// the slots of a table are given back one table at a time as before, into
+/// the same bitmap, so what a list holds and until when does not change.
+/// What is left of a chunk when a table does not fit goes back at once. A
+/// thread keeps at most 2,047 slots it has not used, per heap.
+fn dyn_chunks() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DYN_CHUNKS").is_none_or(|v| v != "0"))
+}
+
+/// The dynamic slots a thread takes at a time ([`dyn_chunks`]). Tables of
+/// more than half of it are searched for on their own.
+const DYN_CHUNK: u32 = 2048;
+
+/// Numbers the heaps ([`HostHeap::serial`]); 0 is none.
+static HEAP_SERIAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+
+thread_local! {
+    /// This thread's chunks of dynamic slots ([`dyn_chunks`]), for the four
+    /// heaps it last took any of: the heap's serial, the next slot and how
+    /// many are left.
+    static DYN_LOCAL: std::cell::RefCell<[(usize, u32, u32); 4]> = const { std::cell::RefCell::new([(0, 0, 0); 4]) };
+}
+
 impl HostHeap {
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.
     pub(crate) fn dynamic(&self, n: u32) -> Option<u32> {
+        // Small tables come out of a chunk this thread took for itself
+        // ([`dyn_chunks`]): no lock and no search.
+        if !dyn_chunks() || self.sampler || n == 0 || n > DYN_CHUNK / 2 || self.dynamic < DYN_CHUNK * 8 {
+            return self.dynamic_searched(n, false);
+        }
+        let found = DYN_LOCAL.with(|local| {
+            let mut local = local.borrow_mut();
+            let at = match local.iter().position(|c| c.0 == self.serial) {
+                Some(at) => at,
+                None => {
+                    // (The oldest goes: what is left of its chunk stays taken
+                    // in its heap, 2,047 slots at most.)
+                    local.rotate_right(1);
+                    local[0] = (self.serial, 0, 0);
+                    0
+                }
+            };
+            let (_, next, left) = local[at];
+            if left >= n {
+                local[at] = (self.serial, next + n, left - n);
+                return Some(next);
+            }
+            // What is left of the chunk in hand goes back: nothing was made
+            // in it.
+            if left > 0 {
+                self.release(next, left);
+            }
+            match self.dynamic_searched(DYN_CHUNK, true) {
+                Some(first) => {
+                    local[at] = (self.serial, first + n, DYN_CHUNK - n);
+                    Some(first)
+                }
+                None => {
+                    local[at] = (self.serial, 0, 0);
+                    None
+                }
+            }
+        });
+        match found {
+            Some(first) => {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::DynamicAsked, 1);
+                Some(first)
+            }
+            // No chunk to be had: the table's own slots, searched for.
+            None => self.dynamic_searched(n, false),
+        }
+    }
+
+    /// [`HostHeap::dynamic`] by a search of the slots under their lock.
+    /// `quiet`: for a chunk ([`dyn_chunks`]), whose refusal is no table's.
+    fn dynamic_searched(&self, n: u32, quiet: bool) -> Option<u32> {
         if self.sampler || n == 0 || n > self.dynamic {
             return None;
         }
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::DynamicAsked, 1);
+        if !quiet {
+            crate::copystat::add(crate::copystat::C::DynamicAsked, 1);
+        }
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let (next, taken) = &mut *guard;
         let enough = self.free.load(std::sync::atomic::Ordering::Relaxed) >= n
@@ -2056,12 +2146,16 @@ impl HostHeap {
             if enough {
                 self.too_long.fetch_min(n as u32, std::sync::atomic::Ordering::Relaxed);
             }
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
+            if !quiet {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
+            }
             #[cfg(feature = "diagnostics")]
             {
                 use crate::copystat::{C, add};
-                add(C::DynamicRefused, 1);
+                if !quiet {
+                    add(C::DynamicRefused, 1);
+                }
                 add(C::DynamicNs, started.elapsed().as_nanos() as u64);
             }
             return None;
