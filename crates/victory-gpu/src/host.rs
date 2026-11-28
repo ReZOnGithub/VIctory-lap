@@ -1418,7 +1418,7 @@ type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
 /// many levels the views made in the heap sync of this same submission show.
 fn prelude_beside() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| send_beside() && std::env::var_os("VICTORY_PRELUDE_BESIDE").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| send_beside() && (submit_stages() || std::env::var_os("VICTORY_PRELUDE_BESIDE").is_some_and(|v| v == "1")))
 }
 
 /// What a prelude records, worked out on the submitting thread
@@ -2557,7 +2557,48 @@ fn send_beside() -> bool {
 /// `upq`, which goes to the queue from here.
 fn send_sync_beside() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| send_beside() && !upq::on() && std::env::var_os("VICTORY_SEND_SYNC_BESIDE").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| {
+        send_beside() && !upq::on() && (submit_stages() || std::env::var_os("VICTORY_SEND_SYNC_BESIDE").is_some_and(|v| v == "1"))
+    })
+}
+
+/// Whether a submission is prepared in two stages (`VICTORY_SUBMIT_STAGES=1`;
+/// off): the submitting thread does what reads title memory or decides from
+/// it in the submission's order (the asking, the refreshes, the lists' steps,
+/// the title's bytes under flights' writes, the steps done on the card) and
+/// takes the bytes that go up ([`send::take`]); the sending thread turns what
+/// was taken into the card's work behind it, in the same order: the list that
+/// brings copies in the card's memory up to date with its hash passes
+/// ([`SyncJob`]), the compare ([`CheckJob`]), the preludes
+/// ([`PreludeRecord`]) and `ExecuteCommandLists`. It turns on
+/// [`send_sync_beside`], [`sync_record_beside`] and [`prelude_beside`], and
+/// bounds the sending thread's line ([`stages_depth`]).
+///
+/// Of the submitting thread's 28-30 ms a frame at the title's boat mission,
+/// some 5 ms are such work and 1.5 ms its wait for the sending thread's line
+/// before the sync list (profile r3: `card_before` 8.8 ms, 3.5 of them the
+/// driver, 1.5 `send_flush`). The sync and compare lists recorded there
+/// (runs n4/n9) took 5.1 ms a frame off that thread's preparing, but the
+/// frame rate stayed (22.2 and 21.9 fps): the thread then stood 5.5 ms a
+/// frame more at waits for memory values (0.4 in run r2), values that come
+/// once the submission before has run and landed. Such a chain is as long
+/// with either thread doing the second stage; what this gains is the
+/// submissions that do not wait for the one before.
+fn submit_stages() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| send_beside() && std::env::var_os("VICTORY_SUBMIT_STAGES").is_some_and(|v| v == "1"))
+}
+
+/// With [`submit_stages`]: how many submissions' sends may wait in the
+/// sending thread's line before the submitting thread waits for room
+/// (`VICTORY_SUBMIT_STAGES_DEPTH`, 4 unless set, at least 1). The line was
+/// unbounded: a second stage slower than the first then only grows it, and
+/// every flush ([`send_flush`]) and the present wait for all of it.
+fn stages_depth() -> u64 {
+    static N: OnceLock<u64> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_SUBMIT_STAGES_DEPTH").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(4).max(1)
+    })
 }
 
 /// Whether, with [`send_sync_beside`], that list is recorded on the sending
@@ -2576,7 +2617,9 @@ fn send_sync_beside() -> bool {
 fn sync_record_beside() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        send_sync_beside() && !upcheck::on() && std::env::var_os("VICTORY_SYNC_RECORD_BESIDE").is_some_and(|v| v == "1")
+        send_sync_beside()
+            && !upcheck::on()
+            && (submit_stages() || std::env::var_os("VICTORY_SYNC_RECORD_BESIDE").is_some_and(|v| v == "1"))
     })
 }
 
@@ -2767,7 +2810,15 @@ fn flush_small() -> usize {
 }
 
 /// A send for the sending thread.
-struct Sending(Box<dyn FnOnce()>);
+struct Sending {
+    send: Box<dyn FnOnce()>,
+    /// A submission's own lists ([`send_submission`]): counted for
+    /// [`stages_depth`].
+    submission: bool,
+    /// When it was given (diagnostics: how long it stood in the line).
+    #[cfg(feature = "diagnostics")]
+    given: std::time::Instant,
+}
 // SAFETY: D3D12 queues, lists and fences are free-threaded; the lists are
 // closed and nothing resets them before the fence signalled behind them has
 // passed. A prelude recorded here (`PreludeRecord`) is recorded by this
@@ -2775,18 +2826,88 @@ struct Sending(Box<dyn FnOnce()>);
 // before it records that prelude itself (`HostList::prelude_due`).
 unsafe impl Send for Sending {}
 
-/// The sending thread's line: how many sends were given and how many are done.
+/// The sending thread's line.
+struct SendLine {
+    sends: std::collections::VecDeque<Sending>,
+    /// How many sends were given and how many are done.
+    given: u64,
+    done: u64,
+    /// Of them a submission's own lists ([`send_submission`]): given, done.
+    submissions: (u64, u64),
+}
+
 struct Sender {
-    line: Mutex<(std::collections::VecDeque<Sending>, u64, u64)>,
+    line: Mutex<SendLine>,
     more: std::sync::Condvar,
     done: std::sync::Condvar,
 }
+
+/// Where a thread waits for the sending thread ([`send_flush`], and the room
+/// of [`send_room`]), for the diagnostics of the frame line.
+#[derive(Clone, Copy)]
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+pub(crate) enum Flush {
+    /// `Host::card_before`, before the sync list goes to the queue from the
+    /// submitting thread (not with [`send_sync_beside`]).
+    CardBefore,
+    /// The relay's fetch of pieces on the drawing queue (the landing thread;
+    /// not with `VICTORY_RELAY_COPY=1`, whose fetch goes to a copy queue).
+    Fetch,
+    /// `Host::card_back`'s fetch, for a submission that is waited for.
+    CardBack,
+    /// A submission that is waited for (`Host::submit` not sent ahead).
+    Waited,
+    /// A prelude recorded at submission while a record of it waits in the
+    /// line.
+    Prelude,
+    /// `Host::queue`: tile mappings, in the queue's order.
+    Queue,
+    /// The present.
+    Present,
+    /// The timeline's stamps, `upcheck`.
+    Other,
+    /// Room in the line ([`stages_depth`]): no flush, a bound.
+    Room,
+}
+
+#[cfg(feature = "diagnostics")]
+impl Flush {
+    const COUNT: usize = 9;
+    const NAMES: [&'static str; Self::COUNT] = [
+        "before the sync list",
+        "the relay's fetch",
+        "a waited submission's fetch",
+        "a waited submission",
+        "a prelude",
+        "tile mappings",
+        "the present",
+        "stamps and upcheck",
+        "room in the line",
+    ];
+}
+
+/// Since the last frame line (diagnostics): microseconds threads waited for
+/// the sending thread, by where ([`Flush`]).
+#[cfg(feature = "diagnostics")]
+static SEND_WAITS: [std::sync::atomic::AtomicU64; Flush::COUNT] = [const { std::sync::atomic::AtomicU64::new(0) }; Flush::COUNT];
+
+/// Since the last frame line (diagnostics): microseconds the sending thread
+/// ran sends; microseconds submissions' own sends stood in the line before
+/// their turn, and how many there were; the most sends, and the most
+/// submissions' sends, in the line at once.
+#[cfg(feature = "diagnostics")]
+static SENDING: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 fn sender() -> &'static Sender {
     static SENDER: OnceLock<Sender> = OnceLock::new();
     static STARTED: std::sync::Once = std::sync::Once::new();
     let sender = SENDER.get_or_init(|| Sender {
-        line: Mutex::new((std::collections::VecDeque::new(), 0, 0)),
+        line: Mutex::new(SendLine {
+            sends: std::collections::VecDeque::new(),
+            given: 0,
+            done: 0,
+            submissions: (0, 0),
+        }),
         more: std::sync::Condvar::new(),
         done: std::sync::Condvar::new(),
     });
@@ -2798,17 +2919,33 @@ fn sender() -> &'static Sender {
                 let job = {
                     let mut line = sender.line.lock().unwrap_or_else(|e| e.into_inner());
                     loop {
-                        if let Some(job) = line.0.pop_front() {
+                        if let Some(job) = line.sends.pop_front() {
                             break job;
                         }
                         line = sender.more.wait(line).unwrap_or_else(|e| e.into_inner());
                     }
                 };
+                let submission = job.submission;
+                #[cfg(feature = "diagnostics")]
+                let began = std::time::Instant::now();
+                #[cfg(feature = "diagnostics")]
+                if submission {
+                    SENDING[1].fetch_add((began - job.given).as_micros() as u64, Ordering::Relaxed);
+                    SENDING[2].fetch_add(1, Ordering::Relaxed);
+                }
                 {
                     let _sending = crate::timeline::span("sending, beside");
-                    (job.0)();
+                    (job.send)();
                 }
-                sender.line.lock().unwrap_or_else(|e| e.into_inner()).2 += 1;
+                #[cfg(feature = "diagnostics")]
+                SENDING[0].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+                {
+                    let mut line = sender.line.lock().unwrap_or_else(|e| e.into_inner());
+                    line.done += 1;
+                    if submission {
+                        line.submissions.1 += 1;
+                    }
+                }
                 sender.done.notify_all();
             }
         });
@@ -2818,34 +2955,108 @@ fn sender() -> &'static Sender {
 
 /// Gives `send` to the sending thread.
 fn send_later(send: Box<dyn FnOnce()>) {
+    send_given(send, false);
+}
+
+/// Gives `send`, a submission's own lists, to the sending thread: counted for
+/// [`stages_depth`] ([`send_room`]).
+fn send_submission(send: Box<dyn FnOnce()>) {
+    send_given(send, true);
+}
+
+fn send_given(send: Box<dyn FnOnce()>, submission: bool) {
     let sender = sender();
     {
         let mut line = sender.line.lock().unwrap_or_else(|e| e.into_inner());
-        line.0.push_back(Sending(send));
-        line.1 += 1;
+        line.sends.push_back(Sending {
+            send,
+            submission,
+            #[cfg(feature = "diagnostics")]
+            given: std::time::Instant::now(),
+        });
+        line.given += 1;
+        if submission {
+            line.submissions.0 += 1;
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            SENDING[3].fetch_max(line.sends.len() as u64, Ordering::Relaxed);
+            SENDING[4].fetch_max(line.submissions.0 - line.submissions.1, Ordering::Relaxed);
+        }
     }
     sender.more.notify_one();
 }
 
 /// Returns when every send given to the sending thread is on the queue.
-pub(crate) fn send_flush() {
+/// `at`: the caller's place, for the diagnostics.
+pub(crate) fn send_flush(at: Flush) {
     if !send_beside() {
         return;
     }
     let sender = sender();
     let mut line = sender.line.lock().unwrap_or_else(|e| e.into_inner());
-    let given = line.1;
+    let given = line.given;
     // The time waited, all callers together (diagnostics): what longer sends
     // (`prelude_beside`) cost the threads that need the line empty.
     #[cfg(feature = "diagnostics")]
-    let waiting = (line.2 < given).then(std::time::Instant::now);
-    while line.2 < given {
+    let waiting = (line.done < given).then(std::time::Instant::now);
+    while line.done < given {
         line = sender.done.wait(line).unwrap_or_else(|e| e.into_inner());
     }
     #[cfg(feature = "diagnostics")]
     if let Some(waiting) = waiting {
-        crate::copystat::add(crate::copystat::C::SendFlushWaitUs, waiting.elapsed().as_micros() as u64);
+        let us = waiting.elapsed().as_micros() as u64;
+        crate::copystat::add(crate::copystat::C::SendFlushWaitUs, us);
+        SEND_WAITS[at as usize].fetch_add(us, Ordering::Relaxed);
     }
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = at;
+}
+
+/// With [`submit_stages`]: returns when fewer than [`stages_depth`]
+/// submissions' own sends wait in the sending thread's line. Called by the
+/// submitting thread before it gives the next. The sends it waits for take
+/// no lock it holds: it waited for the whole line under the submission lock
+/// before (`Host::card_before` without [`send_sync_beside`]).
+fn send_room() {
+    let sender = sender();
+    let most = stages_depth();
+    let mut line = sender.line.lock().unwrap_or_else(|e| e.into_inner());
+    if line.submissions.0 - line.submissions.1 < most {
+        return;
+    }
+    #[cfg(feature = "diagnostics")]
+    let waiting = std::time::Instant::now();
+    while line.submissions.0 - line.submissions.1 >= most {
+        line = sender.done.wait(line).unwrap_or_else(|e| e.into_inner());
+    }
+    #[cfg(feature = "diagnostics")]
+    SEND_WAITS[Flush::Room as usize].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
+}
+
+/// The sending thread's part of a frame line (diagnostics): what it ran, how
+/// long a submission's sends stood in its line, how deep the line got, and
+/// where other threads waited for it. Empty if nothing was sent beside.
+#[cfg(feature = "diagnostics")]
+fn stages_text(frames: f64) -> String {
+    let [busy, stood, stood_n, most, most_submissions] = [0, 1, 2, 3, 4].map(|i| SENDING[i].swap(0, Ordering::Relaxed));
+    let waits: Vec<u64> = SEND_WAITS.iter().map(|w| w.swap(0, Ordering::Relaxed)).collect();
+    if busy == 0 && waits.iter().all(|&w| w == 0) {
+        return String::new();
+    }
+    let ms = |us: u64| us as f64 / 1e3 / frames;
+    let waited: Vec<String> =
+        waits.iter().zip(Flush::NAMES).filter(|(w, _)| **w > 0).map(|(&w, name)| format!("{:.2} {name}", ms(w))).collect();
+    format!(
+        "; the sending thread ran {:.1} ms (VICTORY_SUBMIT_STAGES is {}), a submission's sends stood {:.2} ms in its line \
+         before their turn, at most {most} sends and {most_submissions} submissions' in it at once (bound {}); waited for it, \
+         ms: {}",
+        ms(busy),
+        if submit_stages() { "on" } else { "off" },
+        if stood_n > 0 { stood as f64 / 1e3 / stood_n as f64 } else { 0.0 },
+        if submit_stages() { stages_depth().to_string() } else { "none".to_string() },
+        if waited.is_empty() { "nothing".to_string() } else { waited.join(", ") },
+    )
 }
 
 /// Whether the copies the next submissions in the line refresh are brought
@@ -5564,7 +5775,7 @@ impl Host {
         // `send_sync_beside` what goes to the queue here goes by that
         // thread as well, in its order.)
         if !send_sync_beside() {
-            send_flush();
+            send_flush(Flush::CardBefore);
         }
         // With the relay: the order of the queue is held from here until
         // what is taken is on the queue, and the taking is numbered.
@@ -5609,6 +5820,9 @@ impl Host {
         // (`sync_record_beside`: the memory the sends come from, kept by the
         // plan while the sending thread records the sends.)
         let mut kept_sends = None;
+        // (`sync_record_beside`: the copies the plan keeps; their ranges go
+        // to the sending thread with the job, not copied.)
+        let mut synced: Option<Vec<Arc<crate::shadow::Shadow>>> = None;
         if !dirty.is_empty() && sync_record_beside() {
             let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list to bring host copies in the card's memory up to date"));
@@ -5616,11 +5830,15 @@ impl Host {
             let _recording = crate::timeline::span("copies in the card's memory: the list, given");
             let (memory, sends) = own.take().map(send::Own::record_parts).unzip();
             kept_sends = memory;
+            let sides = dirty.iter().map(|(shadow, _)| shadow.card_sides().map(|(staging, before, _)| (staging.clone(), before))).collect();
+            synced = Some(dirty.iter().map(|(shadow, _)| shadow.clone()).collect());
             let job = SyncJob {
                 list: sync.clone(),
-                dirty: dirty.clone(),
-                sides: dirty.iter().map(|(shadow, _)| shadow.card_sides().map(|(staging, before, _)| (staging.clone(), before))).collect(),
-                whole: whole.clone(),
+                // (Tens of thousands of ranges a frame: moved, not cloned.
+                // Nothing below reads them but the plan's copies.)
+                dirty: std::mem::take(&mut dirty),
+                sides,
+                whole: std::mem::take(&mut whole),
                 root: work.root.clone(),
                 pso: work.pso.clone(),
                 differs: work.differs.0.clone(),
@@ -5773,7 +5991,7 @@ impl Host {
         let mut plan = CardPlan {
             ranges: Vec::new(),
             check: None,
-            _synced: dirty.into_iter().map(|(shadow, _)| shadow).collect(),
+            _synced: synced.unwrap_or_else(|| dirty.into_iter().map(|(shadow, _)| shadow).collect()),
             lists: used,
             sent_as,
             looks,
@@ -6204,7 +6422,7 @@ impl Host {
                 let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
                 // (The sends counted so far are on the queue, not in the
                 // sending thread's line.)
-                send_flush();
+                send_flush(Flush::Fetch);
                 self.queue.ExecuteCommandLists(&lists);
                 let after = *order;
                 drop(order);
@@ -6499,7 +6717,7 @@ impl Host {
                         list.CopyBufferRegion(fetched, at, &plan.ranges[i].shadow.buffer, lo as u64, (hi - lo) as u64);
                     }
                     list.Close()?;
-                    send_flush();
+                    send_flush(Flush::CardBack);
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     self.card_sent();
                     *submitted += 1;
@@ -7232,7 +7450,13 @@ impl Host {
                 let mut lists = std::mem::take(&mut lists);
                 let records = std::mem::take(&mut records);
                 let check_job = check_job.take();
-                send_later(Box::new(move || {
+                // (`submit_stages`: a few submissions ahead at most; what
+                // this one sends up was taken, so the wait holds nothing of
+                // the next one's.)
+                if submit_stages() {
+                    send_room();
+                }
+                send_submission(Box::new(move || {
                     let Some(host) = host() else { return };
                     // The preludes left to this thread (`prelude_beside`):
                     // recorded and closed before the lists go to the queue.
@@ -7325,7 +7549,7 @@ impl Host {
         };
         #[cfg(not(feature = "diagnostics"))]
         let groups = [(&lists[..], ())];
-        send_flush();
+        send_flush(Flush::Waited);
         submitting(2, runs.len());
         for (_i, &(group, _kind)) in groups.iter().enumerate() {
             *submitted += 1;
@@ -8301,7 +8525,7 @@ impl HostList {
         // A record of this list's prelude still waits on the sending thread:
         // it runs and is sent before this one resets the list.
         if !defer && self.prelude_due.load(Ordering::Acquire) > 0 {
-            send_flush();
+            send_flush(Flush::Prelude);
         }
         // With `defer`: the textures the list's own transitions name.
         let mut keep = Vec::new();
@@ -10857,7 +11081,7 @@ impl Host {
     /// in order with the lists (`crate::tiles`: a texture's levels are
     /// given memory ahead of the list that uploads them).
     pub(crate) fn queue(&self) -> &ID3D12CommandQueue {
-        send_flush();
+        send_flush(Flush::Queue);
         &self.queue
     }
 
@@ -11168,11 +11392,17 @@ impl Meter {
             {
                 let [passes, pieces, compares, syncs, checks] =
                     [0, 1, 2, 3, 4].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
-                if passes + compares > 0.0 {
+                // The sending thread's part (`submit_stages`): what it ran,
+                // its line, and who waited for it where.
+                #[cfg(feature = "diagnostics")]
+                let stages = stages_text(frames);
+                #[cfg(not(feature = "diagnostics"))]
+                let stages = "";
+                if passes + compares > 0.0 || !stages.is_empty() {
                     tracing::info!(
                         "our passes over copies in the card's memory per frame: {passes:.0} hash passes over {pieces:.0} pieces after \
                          ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}), {compares:.0} compare passes; recorded \
-                         on the sending thread {syncs:.1} sync lists, {checks:.1} compare lists (VICTORY_SYNC_RECORD_BESIDE)",
+                         on the sending thread {syncs:.1} sync lists, {checks:.1} compare lists (VICTORY_SYNC_RECORD_BESIDE){stages}",
                         if rehash_runs() { "on" } else { "off" }
                     );
                 }
@@ -11726,7 +11956,7 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
-            send_flush();
+            send_flush(Flush::Present);
             // Frame generation: the frame's markers, constants and tags.
             let presenting = crate::streamline::present_begins(
                 frame,

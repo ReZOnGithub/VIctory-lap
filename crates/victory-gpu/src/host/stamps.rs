@@ -170,7 +170,7 @@ mod tests {
             // SAFETY: closed lists; the fence and event are the host's, under
             // its lock.
             unsafe {
-                super::send_flush();
+                super::send_flush(super::Flush::Other);
                 host.queue.ExecuteCommandLists(&[Some(ahead), Some(behind)]);
                 host.queue.Signal(&host.fence, *submitted).unwrap();
                 host.fence.SetEventOnCompletion(*submitted, host.event).unwrap();
